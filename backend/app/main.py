@@ -4,9 +4,12 @@ from typing import Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends
 
 from app.api.routes import domains_router, mailboxes_router, tenants_router, wizard_router, stats_router
+from app.db.session import get_db_session
 from app.core.config import get_settings
 from app.db.session import engine
 from app.services.powershell.setup import ensure_powershell_modules, check_powershell_available
@@ -120,3 +123,44 @@ async def root() -> dict[str, Any]:
 async def health_check() -> dict[str, str]:
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/health/db", tags=["health"])
+async def health_check_db(db: AsyncSession = Depends(get_db_session)) -> dict:
+    """Health check with database verification and data counts."""
+    try:
+        # Test raw connection
+        result = await db.execute(text("SELECT 1"))
+        db_connected = result.scalar() == 1
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "database": "disconnected",
+            "error": str(e)
+        }
+    
+    # Count existing records
+    try:
+        from app.models.domain import Domain
+        from app.models.tenant import Tenant
+        from app.models.batch import SetupBatch
+        
+        batch_count = await db.scalar(select(func.count()).select_from(SetupBatch))
+        domain_count = await db.scalar(select(func.count()).select_from(Domain))
+        tenant_count = await db.scalar(select(func.count()).select_from(Tenant))
+        
+        return {
+            "status": "healthy",
+            "database": "connected",
+            "data": {
+                "batches": batch_count,
+                "domains": domain_count,
+                "tenants": tenant_count
+            }
+        }
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "database": "connected",
+            "error": f"Could not count records: {str(e)}"
+        }
