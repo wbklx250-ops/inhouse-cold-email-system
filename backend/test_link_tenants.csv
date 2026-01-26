@@ -1,0 +1,2 @@
+tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_email,domain_name
+Linked Tenant Test,mt-link-001,linkedtenant.onmicrosoft.com,admin@linkedtenant.onmicrosoft.com,LinkPass123!,LightningBase,user@linkedtenant.onmicrosoft.com,test2-bulk.com

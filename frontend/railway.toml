@@ -1,0 +1,14 @@
+# Railway Configuration - Frontend (Next.js)
+# Place this in frontend/railway.toml
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/"
+healthcheckTimeout = 60
+startCommand = "node server.js"
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+numReplicas = 1

@@ -1,0 +1,30 @@
+# =================================================================
+# Docker Compose - Cold Email Platform
+# =================================================================
+# 
+# NOTE: This project uses Neon Serverless PostgreSQL (https://neon.tech)
+# No local PostgreSQL container is needed!
+#
+# The docker-compose file is kept for potential future services
+# (e.g., Redis for caching, local development tools, etc.)
+#
+# =================================================================
+
+version: "3.9"
+
+services:
+  # PostgreSQL is hosted on Neon - no local container needed
+  # 
+  # To add your Neon database:
+  # 1. Create a free account at https://neon.tech
+  # 2. Create a new project
+  # 3. Copy the connection string to backend/.env
+  #
+  # Example DATABASE_URL:
+  # postgresql+asyncpg://username:password@ep-xxxxx.us-east-2.aws.neon.tech/dbname?sslmode=require
+
+  # Placeholder for future services:
+  # redis:
+  #   image: redis:7-alpine
+  #   ports:
+  #     - "6379:6379"

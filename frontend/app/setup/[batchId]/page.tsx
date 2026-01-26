@@ -1,0 +1,1998 @@
+"use client";
+
+import { useState, useEffect, useRef } from "react";
+import { useParams, useRouter } from "next/navigation";
+
+interface WizardStatus {
+  batch_id: string;
+  batch_name: string;
+  current_step: number;
+  step_name: string;
+  can_proceed: boolean;
+  status: string;
+  domains_total: number;
+  zones_created: number;
+  zones_pending: number;
+  ns_propagated: number;
+  ns_pending: number;
+  redirects_configured: number;
+  tenants_total: number;
+  tenants_linked: number;
+  tenants_m365_verified: number;
+  tenants_dkim_enabled: number;
+  mailboxes_total: number;
+  mailboxes_pending: number;
+  mailboxes_ready: number;
+}
+
+interface StepResult {
+  success: boolean;
+  message: string;
+  details?: Record<string, any>;
+}
+
+interface NameserverGroup {
+  nameservers: string[];
+  domain_count: number;
+  domains: string[];
+  propagated_count?: number;
+  pending_count?: number;
+}
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+async function fetchStatus(batchId: string): Promise<WizardStatus> {
+  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/status`);
+  if (!res.ok) throw new Error("Failed to fetch status");
+  return res.json();
+}
+
+async function postStep(batchId: string, endpoint: string, formData?: FormData): Promise<StepResult> {
+  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}${endpoint}`, {
+    method: "POST",
+    body: formData,
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Request failed" }));
+    throw new Error(error.detail || "Request failed");
+  }
+  return res.json();
+}
+
+export default function BatchWizard() {
+  const params = useParams();
+  const router = useRouter();
+  const batchId = params.batchId as string;
+
+  const [status, setStatus] = useState<WizardStatus | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [activeStep, setActiveStep] = useState(1);
+
+  useEffect(() => {
+    if (batchId) loadStatus();
+  }, [batchId]);
+
+  const loadStatus = async () => {
+    try {
+      setLoading(true);
+      const data = await fetchStatus(batchId);
+      setStatus(data);
+      setActiveStep(data.current_step);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600"></div>
+      </div>
+    );
+  }
+
+  if (error) {
+    return (
+      <div className="min-h-screen bg-gray-50 flex items-center justify-center">
+        <div className="bg-red-50 border border-red-200 rounded-lg p-6 max-w-md text-center">
+          <p className="text-red-800 font-medium mb-4">Error: {error}</p>
+          <button onClick={() => router.push("/setup")} className="text-blue-600 hover:underline">
+            ← Back to Batches
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50">
+      <div className="bg-white shadow">
+        <div className="max-w-4xl mx-auto px-4 py-6">
+          <button
+            onClick={() => router.push("/setup")}
+            className="text-blue-600 hover:underline text-sm mb-2 inline-block"
+          >
+            ← All Batches
+          </button>
+          <h1 className="text-2xl font-bold text-gray-900">{status?.batch_name}</h1>
+          <p className="text-gray-600 mt-1">
+            Step {activeStep} of 6 • {status?.status === "completed" ? "Completed" : "In Progress"}
+          </p>
+        </div>
+      </div>
+
+      <div className="max-w-4xl mx-auto px-4 py-6">
+        <StepProgress currentStep={activeStep} />
+      </div>
+
+      <div className="max-w-4xl mx-auto px-4 pb-12">
+        <div className="bg-white rounded-lg shadow-lg p-8">
+          {activeStep === 1 && <Step1Domains batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 2 && <Step2Zones batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(4)} />}
+          {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(6)} />}
+          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 7 && <StepComplete batchId={batchId} status={status} />}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ============== STEP COMPONENTS ==============
+// These are the same as before, but pass batchId to postStep()
+
+function StepProgress({ currentStep }: { currentStep: number }) {
+  const steps = [
+    { num: 1, name: "Domains" },
+    { num: 2, name: "Zones" },
+    { num: 3, name: "Nameservers" },
+    { num: 4, name: "Tenants" },
+    { num: 5, name: "Email Setup" },
+    { num: 6, name: "Mailboxes" },
+  ];
+
+  return (
+    <div className="flex items-center justify-between">
+      {steps.map((step, i) => (
+        <div key={step.num} className="flex items-center">
+          <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm
+            ${currentStep > step.num ? "bg-green-500 text-white" : ""}
+            ${currentStep === step.num ? "bg-blue-600 text-white" : ""}
+            ${currentStep < step.num ? "bg-gray-200 text-gray-500" : ""}`}>
+            {currentStep > step.num ? "✓" : step.num}
+          </div>
+          <span className="ml-2 text-sm font-medium hidden sm:inline">{step.name}</span>
+          {i < steps.length - 1 && <div className="w-8 lg:w-16 h-1 mx-2 bg-gray-200" />}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Step1Domains({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<StepResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleImport = async () => {
+    if (!file) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await postStep(batchId, "/step1/import-domains", formData);
+      setResult(res);
+      onComplete();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Import failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const downloadTemplate = () => {
+    // Updated template with redirect column for per-domain redirects
+    const csv = `domain,redirect,registrar
+coldreach.io,https://google.com,porkbun
+outbound-mail.co,https://example.com,porkbun
+salesflow.net,https://company-website.com,porkbun`;
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "domains_template.csv";
+    a.click();
+  };
+
+  if (status && status.domains_total > 0) {
+    return (
+      <div className="text-center py-8">
+        <div className="text-6xl mb-4">✅</div>
+        <h2 className="text-xl font-bold">Domains Imported!</h2>
+        <p className="text-gray-600 mt-2">{status.domains_total} domains ready</p>
+        <button onClick={onComplete} className="mt-6 px-6 py-3 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700">
+          Continue →
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-bold">Step 1: Upload Your Domains</h2>
+        <p className="text-gray-600 mt-2">Upload a CSV file with your cold email domains.</p>
+      </div>
+
+      <div className="border-2 border-dashed border-gray-300 rounded-lg p-12 text-center hover:border-blue-500 cursor-pointer"
+        onClick={() => fileInputRef.current?.click()}>
+        <input type="file" ref={fileInputRef} className="hidden" accept=".csv" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        <div className="text-5xl mb-4">📄</div>
+        <p className="text-lg font-medium">{file ? file.name : "Drag & drop CSV here"}</p>
+        <button type="button" onClick={(e) => { e.stopPropagation(); downloadTemplate(); }} className="mt-4 text-blue-600 underline">
+          Download Template
+        </button>
+      </div>
+
+      {/* CSV Format Info */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+        <p className="text-blue-800 font-medium">📋 CSV Format</p>
+        <div className="mt-2 text-sm text-blue-700 font-mono bg-white rounded p-2 overflow-x-auto">
+          <pre>{`domain,redirect,registrar
+coldreach.io,https://google.com,porkbun
+outbound-mail.co,https://example.com,porkbun`}</pre>
+        </div>
+        <p className="text-xs text-blue-600 mt-2">
+          Include a <strong>redirect</strong> column to specify where each domain should redirect. Leave empty if no redirect needed.
+        </p>
+      </div>
+
+      {error && <div className="bg-red-50 border border-red-200 rounded-lg p-4"><p className="text-red-800">{error}</p></div>}
+      {result && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <p className="text-green-800">✅ {result.message}</p>
+          {result.details?.with_redirect !== undefined && (
+            <p className="text-sm text-green-700 mt-1">
+              {result.details.with_redirect} domain(s) have redirect URLs configured
+            </p>
+          )}
+        </div>
+      )}
+
+      <button onClick={handleImport} disabled={!file || loading}
+        className="w-full py-4 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300">
+        {loading ? "Importing..." : "Import Domains →"}
+      </button>
+    </div>
+  );
+}
+
+// Continue with Step2Zones, Step3Propagation, Step4Tenants, Step5M365, Step6Mailboxes, StepComplete
+// Each one follows the same pattern: pass batchId to postStep(batchId, "/stepX/...", formData)
+
+function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [autoProgressed, setAutoProgressed] = useState(false);
+
+  const handleCreate = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step2/create-zones`, {
+        method: "POST"
+      });
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Request failed" }));
+        throw new Error(err.detail || "Request failed");
+      }
+      
+      const data = await res.json();
+      console.log("DEBUG Step2Zones: Full response:", data);
+      setResult(data);
+      
+      // Check if we can auto-progress to Step 3
+      if (data.can_progress) {
+        console.log("DEBUG Step2Zones: can_progress=true, auto-advancing to Step 3");
+        setAutoProgressed(true);
+        // Refresh status which will update current_step
+        onComplete();
+      } else {
+        onComplete(); // Refresh status anyway
+      }
+    } catch (e) {
+      console.error("DEBUG Step2Zones: Error:", e);
+      setError(e instanceof Error ? e.message : "Failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const nsGroups: NameserverGroup[] = result?.details?.nameserver_groups || [];
+
+  // Check if zones are already created (from a previous session)
+  const zonesAlreadyCreated = status && status.zones_created > 0 && status.zones_pending === 0;
+  
+  // Check if we have existing zones that need verification/continuation
+  const hasExistingZones = status && status.zones_created > 0;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-bold text-gray-900">Step 2: Create Cloudflare Zones</h2>
+        <p className="text-gray-600 mt-2">
+          {hasExistingZones 
+            ? `Verifying ${status?.zones_created} existing zones and configuring DNS records.`
+            : `This will create DNS zones and automatically configure redirects for all ${status?.domains_total || 0} domains.`
+          }
+        </p>
+      </div>
+      
+      {/* Show status summary */}
+      {status && (
+        <div className="grid grid-cols-3 gap-4 text-center">
+          <div className="bg-green-50 p-4 rounded-lg">
+            <p className="text-3xl font-bold text-green-600">{status.zones_created}</p>
+            <p className="text-sm text-gray-600">Zones Ready</p>
+          </div>
+          <div className="bg-yellow-50 p-4 rounded-lg">
+            <p className="text-3xl font-bold text-yellow-600">{status.zones_pending}</p>
+            <p className="text-sm text-gray-600">Pending</p>
+          </div>
+          <div className="bg-blue-50 p-4 rounded-lg">
+            <p className="text-3xl font-bold text-blue-600">{status.redirects_configured}</p>
+            <p className="text-sm text-gray-600">Redirects Ready</p>
+          </div>
+        </div>
+      )}
+      
+      {/* Auto-progressed message */}
+      {autoProgressed && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <p className="text-green-800 font-medium">
+            ✅ All zones verified! Automatically advancing to Step 3...
+          </p>
+        </div>
+      )}
+      
+      {!result && !autoProgressed ? (
+        <>
+          {error && <div className="bg-red-50 border border-red-200 p-4 rounded-lg text-red-800">{error}</div>}
+          
+          {/* Info box for existing zones */}
+          {hasExistingZones && (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <p className="text-blue-800">
+                <strong>💡 Existing zones detected!</strong> Click below to verify zones and DNS records. 
+                Already configured items will be skipped.
+              </p>
+            </div>
+          )}
+          
+          <button onClick={handleCreate} disabled={loading}
+            className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg disabled:bg-gray-300 hover:bg-blue-700">
+            {loading ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                {hasExistingZones ? "Verifying Zones & DNS..." : "Creating Zones & Redirects..."} (this may take a few minutes)
+              </span>
+            ) : hasExistingZones ? (
+              "Verify Zones & Configure DNS →"
+            ) : (
+              "Create Cloudflare Zones →"
+            )}
+          </button>
+        </>
+      ) : result && !autoProgressed ? (
+        <div className="space-y-6">
+          {/* Success summary */}
+          <div className={`border rounded-lg p-4 ${result.success ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'}`}>
+            <p className={`font-medium ${result.success ? 'text-green-800' : 'text-yellow-800'}`}>
+              {result.success ? '✅' : '⚠️'} {result.message}
+            </p>
+            <div className="mt-2 text-sm text-gray-700">
+              <p>• Total domains: {result.details?.total || 0}</p>
+              {(result.details?.zones_created || 0) > 0 && (
+                <p className="text-green-700">• New zones created: {result.details.zones_created}</p>
+              )}
+              {(result.details?.zones_already_existed || 0) > 0 && (
+                <p className="text-blue-700">• Existing zones verified: {result.details.zones_already_existed}</p>
+              )}
+              {(result.details?.dns_verified || 0) > 0 && (
+                <p className="text-green-700">• DNS records verified: {result.details.dns_verified}</p>
+              )}
+              {(result.details?.redirects_configured || 0) > 0 && (
+                <p className="text-green-700">• Redirects configured: {result.details.redirects_configured}</p>
+              )}
+              {(result.details?.zones_failed || 0) > 0 && (
+                <p className="text-red-600">• Zones failed: {result.details.zones_failed}</p>
+              )}
+            </div>
+            
+            {/* Show errors if any */}
+            {result.details?.errors?.length > 0 && (
+              <details className="mt-3">
+                <summary className="text-red-600 cursor-pointer text-sm">
+                  Show {result.details.errors.length} error(s)
+                </summary>
+                <ul className="mt-2 text-xs text-red-600 space-y-1">
+                  {result.details.errors.map((err: any, i: number) => (
+                    <li key={i}>{err.domain}: {err.error}</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+          </div>
+
+          {/* Nameserver groups */}
+          {nsGroups.length > 0 && (
+            <>
+              <div>
+                <h3 className="font-bold text-gray-900 mb-2">
+                  📋 Update These Nameservers at Porkbun
+                </h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Copy the nameservers below and update them at your domain registrar.
+                  Domains are grouped by their assigned nameservers.
+                </p>
+              </div>
+
+              {nsGroups.map((g, i) => (
+                <div key={i} className="border rounded-lg p-4 bg-gray-50">
+                  <div className="flex justify-between items-start">
+                    <div className="flex-1">
+                      <p className="font-bold text-lg">{g.domain_count} domain{g.domain_count !== 1 ? 's' : ''}</p>
+                      <div className="mt-2 space-y-1">
+                        <p className="text-sm font-mono bg-white px-2 py-1 rounded border">
+                          NS1: {g.nameservers[0] || 'N/A'}
+                        </p>
+                        <p className="text-sm font-mono bg-white px-2 py-1 rounded border">
+                          NS2: {g.nameservers[1] || 'N/A'}
+                        </p>
+                      </div>
+                      <details className="mt-2">
+                        <summary className="text-sm text-gray-600 cursor-pointer">Show domains</summary>
+                        <ul className="mt-1 text-xs text-gray-500">
+                          {g.domains.map((d, j) => (
+                            <li key={j}>{d}</li>
+                          ))}
+                        </ul>
+                      </details>
+                    </div>
+                    <button 
+                      onClick={() => {
+                        navigator.clipboard.writeText(g.nameservers.join("\n"));
+                        alert("Nameservers copied to clipboard!");
+                      }}
+                      className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
+                    >
+                      📋 Copy NS
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+
+          {nsGroups.length === 0 && !result.can_progress && (
+            <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+              <p className="text-yellow-800">
+                ⚠️ No nameservers returned. Check the Cloudflare dashboard to verify zones were created.
+              </p>
+            </div>
+          )}
+
+          {/* Next step - show different based on can_progress */}
+          {result.can_progress ? (
+            <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+              <p className="text-green-800">
+                <strong>✅ All zones ready!</strong> You can now proceed to Step 3 to monitor nameserver propagation.
+              </p>
+            </div>
+          ) : (
+            <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+              <p className="text-blue-800">
+                <strong>Next:</strong> Update nameservers at Porkbun for each group above, 
+                then click continue to monitor propagation.
+              </p>
+            </div>
+          )}
+
+          <button 
+            onClick={onComplete} 
+            className={`w-full py-4 text-white text-lg font-bold rounded-lg ${
+              result.can_progress 
+                ? 'bg-green-600 hover:bg-green-700' 
+                : 'bg-blue-600 hover:bg-blue-700'
+            }`}
+          >
+            {result.can_progress 
+              ? "Continue to Nameserver Verification →" 
+              : "I've Updated Nameservers → Continue"
+            }
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: string; status: WizardStatus | null; onComplete: () => void; onNext: () => void }) {
+  const [checking, setChecking] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [continuing, setContinuing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [lastChecked, setLastChecked] = useState<Date | null>(null);
+  const [autoCheckEnabled, setAutoCheckEnabled] = useState(true);
+  const [nsGroups, setNsGroups] = useState<NameserverGroup[]>([]);
+  const [nsLoading, setNsLoading] = useState(true);
+
+  // Fetch nameserver groups on mount
+  useEffect(() => {
+    const fetchNsGroups = async () => {
+      try {
+        setNsLoading(true);
+        const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/nameserver-groups`);
+        if (res.ok) {
+          const data = await res.json();
+          setNsGroups(data.nameserver_groups || []);
+        }
+      } catch (e) {
+        console.error("Failed to fetch nameserver groups:", e);
+      } finally {
+        setNsLoading(false);
+      }
+    };
+    fetchNsGroups();
+  }, [batchId]);
+
+  // Auto-check every 15 minutes
+  useEffect(() => {
+    if (!autoCheckEnabled) return;
+    
+    // Initial check after 5 seconds
+    const initialTimeout = setTimeout(() => {
+      handleCheck(true);
+    }, 5000);
+
+    // Then check every 15 minutes
+    const interval = setInterval(() => {
+      handleCheck(true);
+    }, 15 * 60 * 1000); // 15 minutes
+
+    return () => {
+      clearTimeout(initialTimeout);
+      clearInterval(interval);
+    };
+  }, [batchId, autoCheckEnabled]);
+
+  const handleCheck = async (isAutoCheck = false) => {
+    if (checking) return;
+    setChecking(true);
+    setError(null);
+    
+    try {
+      const res = await postStep(batchId, "/step3/check-propagation");
+      setLastChecked(new Date());
+      onComplete(); // Refresh status
+      
+      // If auto-advanced, the status will reflect it
+      if (res.details?.auto_advanced) {
+        // Status refresh will show step 4
+        console.log("Auto-advanced to Step 4!");
+      }
+    } catch (e) {
+      if (!isAutoCheck) {
+        setError(e instanceof Error ? e.message : "Check failed");
+      }
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const handleContinueAnyway = async () => {
+    setContinuing(true);
+    setError(null);
+    try {
+      await postStep(batchId, "/step3/continue-anyway");
+      onComplete();
+      onNext();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to continue");
+    } finally {
+      setContinuing(false);
+    }
+  };
+
+  const handleRetryRedirects = async () => {
+    setRetrying(true);
+    setError(null);
+    try {
+      await postStep(batchId, "/step3/retry-redirects");
+      onComplete();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Retry failed");
+    } finally {
+      setRetrying(false);
+    }
+  };
+
+  const allPropagated = status && status.ns_pending === 0 && status.ns_propagated > 0;
+  const hasFailedRedirects = status && status.redirects_configured < status.domains_total;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-bold text-gray-900">Step 3: Waiting for Nameserver Propagation</h2>
+        <p className="text-gray-600 mt-2">
+          Update nameservers at your registrar (Porkbun), then wait for DNS propagation.
+          This typically takes 1-48 hours.
+        </p>
+      </div>
+
+      {/* Status Grid */}
+      <div className="grid grid-cols-3 gap-4">
+        <div className="bg-green-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-green-600">{status?.ns_propagated || 0}</p>
+          <p className="text-sm text-gray-600">Propagated</p>
+        </div>
+        <div className="bg-yellow-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-yellow-600">{status?.ns_pending || 0}</p>
+          <p className="text-sm text-gray-600">Pending</p>
+        </div>
+        <div className="bg-blue-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-blue-600">{status?.redirects_configured || 0}</p>
+          <p className="text-sm text-gray-600">Redirects Ready</p>
+        </div>
+      </div>
+
+      {/* Nameserver Groups Reference */}
+      {nsLoading ? (
+        <div className="text-center py-4 text-gray-500">Loading nameservers...</div>
+      ) : nsGroups.length > 0 && (
+        <div className="border rounded-lg p-4 bg-gray-50">
+          <h3 className="font-bold text-gray-900 mb-3">📋 Nameservers to Update at Your Registrar</h3>
+          <div className="space-y-3">
+            {nsGroups.map((g, i) => (
+              <div key={i} className="bg-white rounded-lg p-3 border">
+                <div className="flex justify-between items-start">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-2 mb-2">
+                      <span className="font-medium text-gray-900">
+                        {g.domain_count} domain{g.domain_count !== 1 ? 's' : ''}
+                      </span>
+                      {(g.propagated_count || 0) > 0 && (
+                        <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded-full">
+                          ✓ {g.propagated_count} propagated
+                        </span>
+                      )}
+                      {(g.pending_count || 0) > 0 && (
+                        <span className="text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded-full">
+                          ⏳ {g.pending_count} pending
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      <code className="text-xs bg-gray-100 px-2 py-1 rounded">
+                        {g.nameservers[0] || 'N/A'}
+                      </code>
+                      <code className="text-xs bg-gray-100 px-2 py-1 rounded">
+                        {g.nameservers[1] || 'N/A'}
+                      </code>
+                    </div>
+                    <details className="mt-2">
+                      <summary className="text-xs text-gray-500 cursor-pointer">Show domains</summary>
+                      <ul className="mt-1 text-xs text-gray-500 max-h-32 overflow-y-auto">
+                        {g.domains.map((d, j) => (
+                          <li key={j}>{d}</li>
+                        ))}
+                      </ul>
+                    </details>
+                  </div>
+                  <button 
+                    onClick={() => {
+                      navigator.clipboard.writeText(g.nameservers.join("\n"));
+                      alert("Nameservers copied!");
+                    }}
+                    className="px-3 py-1 text-sm bg-blue-600 text-white rounded hover:bg-blue-700"
+                  >
+                    📋 Copy
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Auto-check status */}
+      <div className="bg-gray-50 rounded-lg p-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <p className="font-medium text-gray-900">
+              {autoCheckEnabled ? "🔄 Auto-checking every 15 minutes" : "Auto-check disabled"}
+            </p>
+            {lastChecked && (
+              <p className="text-sm text-gray-500">
+                Last checked: {lastChecked.toLocaleTimeString()}
+              </p>
+            )}
+          </div>
+          <label className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              checked={autoCheckEnabled}
+              onChange={(e) => setAutoCheckEnabled(e.target.checked)}
+              className="rounded"
+            />
+            <span className="text-sm">Auto-check</span>
+          </label>
+        </div>
+      </div>
+
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-red-800">{error}</p>
+        </div>
+      )}
+
+      {/* All propagated message */}
+      {allPropagated && (
+        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+          <p className="text-green-800 font-medium">
+            ✅ All nameservers propagated! You can now continue to Step 4.
+          </p>
+        </div>
+      )}
+
+      {/* Manual check button */}
+      <button
+        onClick={() => handleCheck(false)}
+        disabled={checking}
+        className="w-full py-3 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 disabled:opacity-50"
+      >
+        {checking ? (
+          <span className="flex items-center justify-center gap-2">
+            <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+            Checking...
+          </span>
+        ) : (
+          "🔄 Check Propagation Now"
+        )}
+      </button>
+
+      {/* Retry redirects if some failed */}
+      {hasFailedRedirects && (
+        <button
+          onClick={handleRetryRedirects}
+          disabled={retrying}
+          className="w-full py-3 border-2 border-orange-500 text-orange-600 font-bold rounded-lg hover:bg-orange-50 disabled:opacity-50"
+        >
+          {retrying ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-orange-500"></span>
+              Retrying...
+            </span>
+          ) : (
+            `🔁 Retry Failed Redirects (${(status?.domains_total || 0) - (status?.redirects_configured || 0)} pending)`
+          )}
+        </button>
+      )}
+
+      {/* Continue options */}
+      <div className="border-t pt-6 mt-6">
+        {allPropagated ? (
+          <button
+            onClick={onNext}
+            className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-lg hover:bg-green-700"
+          >
+            Continue to Tenant Setup →
+          </button>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-600 text-center">
+              You can continue to import tenants while waiting for propagation.
+            </p>
+            <button
+              onClick={handleContinueAnyway}
+              disabled={continuing}
+              className="w-full py-3 border-2 border-gray-300 text-gray-700 font-medium rounded-lg hover:bg-gray-50 disabled:opacity-50"
+            >
+              {continuing ? "Continuing..." : "Continue Anyway (Skip Waiting) →"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {/* Info box */}
+      <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
+        <p className="text-blue-800">
+          <strong>💡 Tip:</strong> Propagation can take up to 48 hours. You can safely continue
+          to Step 4 (Import Tenants) while waiting. However, Step 5 (M365 Setup) requires
+          nameservers to be fully propagated.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+interface TenantItem {
+  id: string;
+  name: string;
+  admin_email: string;
+  custom_domain: string | null;
+  first_login_completed: boolean;
+  setup_error: string | null;
+  status: string;
+}
+
+interface Step4Status {
+  tenants_total: number;
+  tenants_first_login_complete: number;
+  tenants_linked: number;
+  domains_total: number;
+  ready_for_step5: boolean;
+}
+
+interface AutomationProgress {
+  completed: number;
+  failed: number;
+  total: number;
+}
+
+function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+  // Import state
+  const [tenantCsv, setTenantCsv] = useState<File | null>(null);
+  const [credentialsTxt, setCredentialsTxt] = useState<File | null>(null);
+  const [importing, setImporting] = useState(false);
+  const [importResult, setImportResult] = useState<any>(null);
+  const [importError, setImportError] = useState<string | null>(null);
+  const csvInputRef = useRef<HTMLInputElement>(null);
+  const txtInputRef = useRef<HTMLInputElement>(null);
+
+  // Link state
+  const [linking, setLinking] = useState(false);
+  const [linkResult, setLinkResult] = useState<any>(null);
+
+  // Automation state
+  const [newPassword, setNewPassword] = useState("");
+  const [maxWorkers, setMaxWorkers] = useState(10);
+  const [automating, setAutomating] = useState(false);
+  const [automationStarted, setAutomationStarted] = useState(false);
+  const [progress, setProgress] = useState<AutomationProgress>({ completed: 0, failed: 0, total: 0 });
+  const [estimatedMinutes, setEstimatedMinutes] = useState(0);
+
+  // Step 4 detailed status
+  const [step4Status, setStep4Status] = useState<Step4Status | null>(null);
+  const [tenants, setTenants] = useState<TenantItem[]>([]);
+  const [loadingTenants, setLoadingTenants] = useState(false);
+
+  // Fetch step4 status on mount and when needed
+  const fetchStep4Status = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/status`);
+      if (res.ok) {
+        const data = await res.json();
+        setStep4Status(data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch step4 status:", e);
+    }
+  };
+
+  // Fetch tenants list
+  const fetchTenants = async () => {
+    try {
+      setLoadingTenants(true);
+      const res = await fetch(`${API_BASE}/api/v1/tenants?batch_id=${batchId}`);
+      if (res.ok) {
+        const data = await res.json();
+        setTenants(data);
+      }
+    } catch (e) {
+      console.error("Failed to fetch tenants:", e);
+    } finally {
+      setLoadingTenants(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchStep4Status();
+    if (status && status.tenants_total > 0) {
+      fetchTenants();
+    }
+  }, [batchId, status?.tenants_total]);
+
+  // Poll progress during automation
+  useEffect(() => {
+    if (!automationStarted) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/progress`);
+        if (res.ok) {
+          const data = await res.json();
+          setProgress(data);
+
+          // Check if automation complete
+          if (data.total > 0 && (data.completed + data.failed) >= data.total) {
+            setAutomating(false);
+            setAutomationStarted(false);
+            fetchStep4Status();
+            fetchTenants();
+            onComplete();
+          }
+        }
+      } catch (e) {
+        console.error("Progress poll error:", e);
+      }
+    }, 2000);
+
+    return () => clearInterval(interval);
+  }, [automationStarted, batchId]);
+
+  // Import tenants
+  const handleImport = async () => {
+    if (!tenantCsv || !credentialsTxt) return;
+    setImporting(true);
+    setImportError(null);
+    try {
+      const formData = new FormData();
+      formData.append("tenant_csv", tenantCsv);
+      formData.append("credentials_txt", credentialsTxt);
+      
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/import-tenants`, {
+        method: "POST",
+        body: formData,
+      });
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Import failed" }));
+        throw new Error(err.detail || "Import failed");
+      }
+      
+      const data = await res.json();
+      setImportResult(data.details);
+      onComplete();
+      fetchStep4Status();
+      fetchTenants();
+    } catch (e) {
+      setImportError(e instanceof Error ? e.message : "Import failed");
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  // Auto-link domains
+  const handleLinkDomains = async () => {
+    setLinking(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/link-domains`, {
+        method: "POST",
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setLinkResult(data.details);
+        onComplete();
+        fetchStep4Status();
+        fetchTenants();
+      }
+    } catch (e) {
+      console.error("Link domains error:", e);
+    } finally {
+      setLinking(false);
+    }
+  };
+
+  // Start automation
+  const handleStartAutomation = async () => {
+    if (!newPassword) return;
+    setAutomating(true);
+    setAutomationStarted(true);
+    setProgress({ completed: 0, failed: 0, total: 0 });
+    
+    try {
+      const formData = new FormData();
+      formData.append("new_password", newPassword);
+      formData.append("max_workers", maxWorkers.toString());
+      
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/start-automation`, {
+        method: "POST",
+        body: formData,
+      });
+      
+      if (res.ok) {
+        const data = await res.json();
+        setProgress(prev => ({ ...prev, total: data.tenants }));
+        setEstimatedMinutes(data.estimated_minutes || Math.round(data.tenants / maxWorkers * 1.5));
+      }
+    } catch (e) {
+      console.error("Start automation error:", e);
+      setAutomating(false);
+      setAutomationStarted(false);
+    }
+  };
+
+  // Download templates
+  const downloadCsvTemplate = () => {
+    const csv = `Company Name,onmicrosoft,Address,Admin Name,Admin Email,Admin Phone,UUID
+Example Corp,examplecorp,123 Main St,John Doe,john@gmail.com,+1234567890,12345678-1234-1234-1234-123456789012`;
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "tenants_template.csv";
+    a.click();
+  };
+
+  const downloadTxtTemplate = () => {
+    const txt = `Username\tPassword
+admin@example.onmicrosoft.com\tTempP@ss123!`;
+    const blob = new Blob([txt], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "credentials_template.txt";
+    a.click();
+  };
+
+  // Calculate progress percentage
+  const progressPercent = progress.total > 0 
+    ? Math.round((progress.completed + progress.failed) / progress.total * 100) 
+    : 0;
+  
+  // Estimated time remaining
+  const remaining = progress.total - progress.completed - progress.failed;
+  const etaMinutes = remaining > 0 ? Math.round(remaining / maxWorkers * 1.5) : 0;
+
+  // Check if all complete
+  const allComplete = step4Status && step4Status.tenants_total > 0 && 
+    step4Status.tenants_first_login_complete === step4Status.tenants_total;
+
+  // Get status icon for a tenant
+  const getStatusIcon = (tenant: TenantItem) => {
+    if (tenant.first_login_completed) {
+      return <span className="text-green-500" title="Completed">🟢</span>;
+    }
+    if (tenant.setup_error) {
+      return <span className="text-red-500" title={tenant.setup_error}>🔴</span>;
+    }
+    if (automating) {
+      return <span className="text-yellow-500 animate-pulse" title="Processing">🟡</span>;
+    }
+    return <span className="text-gray-400" title="Pending">⚪</span>;
+  };
+
+  // Phase 1: Import UI (no tenants yet)
+  if (!status || status.tenants_total === 0) {
+    return (
+      <div className="space-y-6">
+        <div>
+          <h2 className="text-xl font-bold text-gray-900">Step 4: Import Tenants</h2>
+          <p className="text-gray-600 mt-2">
+            Upload your M365 tenant list CSV and credentials TXT file from your reseller.
+          </p>
+        </div>
+
+        {/* File Upload Section */}
+        <div className="grid grid-cols-2 gap-4">
+          {/* Tenant CSV */}
+          <div 
+            className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 cursor-pointer"
+            onClick={() => csvInputRef.current?.click()}
+          >
+            <input 
+              type="file" 
+              ref={csvInputRef} 
+              className="hidden" 
+              accept=".csv" 
+              onChange={(e) => setTenantCsv(e.target.files?.[0] || null)} 
+            />
+            <div className="text-4xl mb-2">📋</div>
+            <p className="font-medium">{tenantCsv ? tenantCsv.name : "Tenant List CSV"}</p>
+            <p className="text-xs text-gray-500 mt-1">Company info, Tenant IDs</p>
+            <button 
+              type="button" 
+              onClick={(e) => { e.stopPropagation(); downloadCsvTemplate(); }}
+              className="mt-2 text-sm text-blue-600 underline"
+            >
+              Download Template
+            </button>
+          </div>
+
+          {/* Credentials TXT */}
+          <div 
+            className="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 cursor-pointer"
+            onClick={() => txtInputRef.current?.click()}
+          >
+            <input 
+              type="file" 
+              ref={txtInputRef} 
+              className="hidden" 
+              accept=".txt" 
+              onChange={(e) => setCredentialsTxt(e.target.files?.[0] || null)} 
+            />
+            <div className="text-4xl mb-2">🔐</div>
+            <p className="font-medium">{credentialsTxt ? credentialsTxt.name : "Credentials TXT"}</p>
+            <p className="text-xs text-gray-500 mt-1">Admin emails + passwords</p>
+            <button 
+              type="button" 
+              onClick={(e) => { e.stopPropagation(); downloadTxtTemplate(); }}
+              className="mt-2 text-sm text-blue-600 underline"
+            >
+              Download Template
+            </button>
+          </div>
+        </div>
+
+        {/* Import Error */}
+        {importError && (
+          <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+            <p className="text-red-800">{importError}</p>
+          </div>
+        )}
+
+        {/* Import Results */}
+        {importResult && (
+          <div className="bg-green-50 border border-green-200 rounded-lg p-4">
+            <p className="text-green-800 font-medium">✅ Import Successful!</p>
+            <div className="mt-2 text-sm text-green-700">
+              <p>• Imported: {importResult.imported} tenants</p>
+              <p>• Skipped (duplicates): {importResult.skipped}</p>
+              {importResult.missing_password > 0 && (
+                <p className="text-orange-600">• Missing passwords: {importResult.missing_password}</p>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Import Button */}
+        <button 
+          onClick={handleImport} 
+          disabled={!tenantCsv || !credentialsTxt || importing}
+          className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+        >
+          {importing ? (
+            <span className="flex items-center justify-center gap-2">
+              <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+              Importing...
+            </span>
+          ) : (
+            "Import Tenants →"
+          )}
+        </button>
+
+        {/* Info */}
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
+          <p className="text-blue-800">
+            <strong>💡 File Formats:</strong>
+          </p>
+          <ul className="mt-2 text-blue-700 list-disc list-inside space-y-1">
+            <li><strong>CSV:</strong> Company Name, onmicrosoft, Address, Admin Name, Admin Email, Admin Phone, UUID</li>
+            <li><strong>TXT:</strong> Tab-separated: Username (tab) Password</li>
+          </ul>
+        </div>
+      </div>
+    );
+  }
+
+  // Phase 2: Tenants imported - show management UI
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-bold text-gray-900">Step 4: Tenant Setup</h2>
+        <p className="text-gray-600 mt-2">
+          Link domains and run first-login automation for all tenants.
+        </p>
+      </div>
+
+      {/* Status Summary */}
+      <div className="grid grid-cols-4 gap-4">
+        <div className="bg-blue-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-blue-600">{status?.tenants_total || 0}</p>
+          <p className="text-sm text-gray-600">Total Tenants</p>
+        </div>
+        <div className="bg-purple-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-purple-600">{status?.tenants_linked || 0}</p>
+          <p className="text-sm text-gray-600">Linked to Domains</p>
+        </div>
+        <div className="bg-green-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-green-600">{step4Status?.tenants_first_login_complete || 0}</p>
+          <p className="text-sm text-gray-600">First Login Done</p>
+        </div>
+        <div className="bg-gray-50 rounded-lg p-4 text-center">
+          <p className="text-3xl font-bold text-gray-600">{status?.domains_total || 0}</p>
+          <p className="text-sm text-gray-600">Available Domains</p>
+        </div>
+      </div>
+
+      {/* Auto Link Section */}
+      {status && status.tenants_linked < status.tenants_total && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-yellow-800">
+                ⚠️ {status.tenants_total - status.tenants_linked} tenants need domains linked
+              </p>
+              <p className="text-sm text-yellow-700 mt-1">
+                Auto-link will assign available domains to tenants in order.
+              </p>
+            </div>
+            <button
+              onClick={handleLinkDomains}
+              disabled={linking}
+              className="px-4 py-2 bg-yellow-600 text-white font-bold rounded-lg hover:bg-yellow-700 disabled:opacity-50"
+            >
+              {linking ? "Linking..." : "🔗 Auto Link Domains"}
+            </button>
+          </div>
+          {linkResult && (
+            <p className="mt-2 text-sm text-green-700">
+              ✅ Linked {linkResult.linked} tenants to domains
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Automation Section */}
+      {!allComplete && (
+        <div className="bg-gray-50 border border-gray-200 rounded-lg p-4 space-y-4">
+          <h3 className="font-bold text-gray-900">🤖 First-Login Automation</h3>
+          <p className="text-sm text-gray-600">
+            Automates password change, MFA enrollment (TOTP), and Security Defaults disable.
+          </p>
+
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                New Password (for all tenants)
+              </label>
+              <input
+                type="text"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                placeholder="StrongP@ssword123!"
+                disabled={automating}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+              />
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Max Workers (parallel browsers)
+              </label>
+              <input
+                type="number"
+                value={maxWorkers}
+                onChange={(e) => setMaxWorkers(Math.max(1, Math.min(20, parseInt(e.target.value) || 10)))}
+                min={1}
+                max={20}
+                disabled={automating}
+                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
+              />
+            </div>
+          </div>
+
+          {!automating && !automationStarted && (
+            <div className="text-sm text-gray-500">
+              Estimated time: ~{Math.round((status?.tenants_total || 0) / maxWorkers * 1.5)} minutes 
+              ({status?.tenants_total} tenants × 1.5 min / {maxWorkers} workers)
+            </div>
+          )}
+
+          <button
+            onClick={handleStartAutomation}
+            disabled={!newPassword || automating || status?.tenants_linked === 0}
+            className="w-full py-3 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+          >
+            {automating ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                Automation Running...
+              </span>
+            ) : (
+              "🚀 Start Automation"
+            )}
+          </button>
+        </div>
+      )}
+
+      {/* Progress Bar */}
+      {automationStarted && progress.total > 0 && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-3">
+          <div className="flex justify-between items-center">
+            <h3 className="font-bold text-blue-900">Automation Progress</h3>
+            <span className="text-blue-700 font-mono">{progressPercent}%</span>
+          </div>
+          
+          {/* Progress bar */}
+          <div className="w-full bg-gray-200 rounded-full h-4 overflow-hidden">
+            <div 
+              className="h-full rounded-full transition-all duration-500 flex"
+              style={{ width: `${progressPercent}%` }}
+            >
+              <div 
+                className="bg-green-500 h-full" 
+                style={{ width: progress.total > 0 ? `${(progress.completed / (progress.completed + progress.failed || 1)) * 100}%` : '100%' }}
+              />
+              <div 
+                className="bg-red-500 h-full" 
+                style={{ width: progress.total > 0 ? `${(progress.failed / (progress.completed + progress.failed || 1)) * 100}%` : '0%' }}
+              />
+            </div>
+          </div>
+
+          {/* Stats */}
+          <div className="flex justify-between text-sm">
+            <span className="text-green-700">✅ {progress.completed} completed</span>
+            <span className="text-red-700">❌ {progress.failed} failed</span>
+            <span className="text-gray-600">⏳ {remaining} remaining</span>
+          </div>
+
+          {remaining > 0 && (
+            <p className="text-sm text-blue-700">
+              Estimated time remaining: ~{etaMinutes} minute{etaMinutes !== 1 ? 's' : ''}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Tenant List */}
+      <div className="border rounded-lg overflow-hidden">
+        <div className="bg-gray-100 px-4 py-2 border-b flex justify-between items-center">
+          <h3 className="font-bold text-gray-900">Tenants</h3>
+          <button 
+            onClick={fetchTenants} 
+            disabled={loadingTenants}
+            className="text-sm text-blue-600 hover:underline"
+          >
+            {loadingTenants ? "Loading..." : "🔄 Refresh"}
+          </button>
+        </div>
+        
+        <div className="max-h-64 overflow-y-auto">
+          {tenants.length === 0 ? (
+            <div className="p-4 text-center text-gray-500">
+              {loadingTenants ? "Loading tenants..." : "No tenants found"}
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  <th className="px-4 py-2 text-left">Status</th>
+                  <th className="px-4 py-2 text-left">Tenant Name</th>
+                  <th className="px-4 py-2 text-left">Admin Email</th>
+                  <th className="px-4 py-2 text-left">Domain</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {tenants.map((tenant) => (
+                  <tr key={tenant.id} className="hover:bg-gray-50">
+                    <td className="px-4 py-2 text-center">{getStatusIcon(tenant)}</td>
+                    <td className="px-4 py-2 font-medium">{tenant.name}</td>
+                    <td className="px-4 py-2 text-gray-600 font-mono text-xs">{tenant.admin_email}</td>
+                    <td className="px-4 py-2">
+                      {tenant.custom_domain ? (
+                        <span className="text-green-600">{tenant.custom_domain}</span>
+                      ) : (
+                        <span className="text-gray-400">Not linked</span>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </div>
+
+      {/* Status Legend */}
+      <div className="flex gap-4 text-sm text-gray-600">
+        <span>⚪ Pending</span>
+        <span>🟡 Processing</span>
+        <span>🟢 Completed</span>
+        <span>🔴 Failed</span>
+      </div>
+
+      {/* Continue Button */}
+      <div className="border-t pt-6">
+        {allComplete ? (
+          <button
+            onClick={async () => {
+              // Call advance API to move to step 5
+              await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/advance`, {
+                method: 'POST'
+              });
+              // Refresh status - this will update activeStep to 5
+              onComplete();
+            }}
+            className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-lg hover:bg-green-700"
+          >
+            ✅ All Tenants Ready - Continue to Email Setup →
+          </button>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-600 text-center">
+              Complete first-login automation for all tenants before continuing.
+            </p>
+            <button
+              disabled
+              className="w-full py-4 bg-gray-300 text-gray-500 text-lg font-bold rounded-lg cursor-not-allowed"
+            >
+              Continue to Email Setup →
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface Step5Status {
+  total: number;
+  not_started: number;
+  domain_added: number;
+  domain_verified: number;
+  dns_configured: number;
+  dkim_cnames_added: number;
+  dkim_enabled: number;
+  errored: number;
+  ready_for_step6: boolean;
+  tenants: Array<{
+    id: string;
+    name: string;
+    domain: string | null;
+    status: string;
+    domain_added: boolean;
+    domain_verified: boolean;
+    dns_configured: boolean;
+    dkim_cnames_added: boolean;
+    dkim_enabled: boolean;
+    error: string | null;
+  }>;
+}
+
+interface AutomationStatus {
+  status: string;
+  total?: number;
+  completed?: number;
+  successful?: number;
+  failed?: number;
+  current_tenant?: string;
+  current_step?: string;
+  error?: string;
+  started_at?: string;
+  completed_at?: string;
+  active_domains?: number;
+  tenant_live_progress?: Array<{
+    tenant_id: string;
+    tenant_name: string;
+    domain: string;
+    live_step: string;
+    live_status: string;
+    live_details: string;
+    active: boolean;
+    timestamp?: number;
+  }>;
+}
+
+function Step5M365({ batchId, status, onComplete, onNext }: { batchId: string; status: WizardStatus | null; onComplete: () => void; onNext: () => void }) {
+  const [automating, setAutomating] = useState(false);
+  const [automationStatus, setAutomationStatus] = useState<AutomationStatus | null>(null);
+  const [step5Status, setStep5Status] = useState<Step5Status | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [isMounted, setIsMounted] = useState(true);
+
+  // Fetch Step 5 detailed status - robust error handling
+  const fetchStep5Status = async (signal?: AbortSignal): Promise<boolean> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step5/status`, { signal });
+      if (!res.ok) {
+        // Non-2xx response - log but don't throw
+        console.warn(`Step5 status returned ${res.status}`);
+        return false;
+      }
+      const data = await res.json();
+      if (isMounted) {
+        setStep5Status(data);
+      }
+      return true;
+    } catch (e) {
+      // AbortError is expected when cleaning up - don't log
+      if (e instanceof Error && e.name === 'AbortError') return false;
+      // Other errors - warn but don't throw
+      console.warn("Step5 status fetch issue:", e instanceof Error ? e.message : "Unknown");
+      return false;
+    }
+  };
+
+  // Fetch automation status - robust error handling
+  const fetchAutomationStatus = async (signal?: AbortSignal): Promise<AutomationStatus | null> => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step5/automation-status`, { signal });
+      if (!res.ok) {
+        // Non-2xx - return null, don't throw
+        return null;
+      }
+      const data = await res.json();
+      if (isMounted) {
+        setAutomationStatus(data);
+      }
+      return data;
+    } catch (e) {
+      // AbortError is expected - ignore
+      if (e instanceof Error && e.name === 'AbortError') return null;
+      // Network errors - return null, don't throw
+      return null;
+    }
+  };
+
+  // Cleanup on unmount
+  useEffect(() => {
+    setIsMounted(true);
+    return () => setIsMounted(false);
+  }, []);
+
+  // Initial load
+  useEffect(() => {
+    const controller = new AbortController();
+    
+    // Stagger initial fetches to avoid race conditions
+    fetchStep5Status(controller.signal);
+    setTimeout(() => fetchAutomationStatus(controller.signal), 500);
+    
+    return () => controller.abort();
+  }, [batchId]);
+
+  // Poll automation status AND tenant status while running (for real-time UI updates)
+  useEffect(() => {
+    if (!automating) return;
+
+    const controller = new AbortController();
+    
+    const poll = async () => {
+      // Stagger fetches - automation status first, then tenant status 1s later
+      const autoStatus = await fetchAutomationStatus(controller.signal);
+      
+      // Wait 1s before fetching tenant status to avoid DB contention
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      if (!controller.signal.aborted) {
+        await fetchStep5Status(controller.signal);  // Updates Add/Ver/DNS/DKIM columns
+      }
+      
+      // Check if automation finished
+      if (autoStatus && (autoStatus.status === "completed" || autoStatus.status === "error")) {
+        setAutomating(false);
+        onComplete();
+      }
+    };
+    
+    // Run immediately, then every 5s (increased from 3s to reduce DB load)
+    poll();
+    const interval = setInterval(poll, 5000);
+
+    return () => {
+      controller.abort();
+      clearInterval(interval);
+    };
+  }, [automating, batchId]);
+
+  // Start automation
+  const handleStartAutomation = async () => {
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step5/start-automation`, {
+        method: "POST"
+      });
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ message: "Failed to start automation" }));
+        throw new Error(err.message || err.detail || "Failed to start");
+      }
+      
+      const data = await res.json();
+      
+      if (data.success) {
+        setAutomating(true);
+        setAutomationStatus({
+          status: "running",
+          total: data.total_tenants,
+          completed: 0,
+          successful: 0,
+          failed: 0
+        });
+      } else {
+        setError(data.message);
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to start automation");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Retry failed tenants
+  const handleRetryFailed = async () => {
+    setLoading(true);
+    setError(null);
+    
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step5/retry-failed`, {
+        method: "POST"
+      });
+      
+      if (res.ok) {
+        setAutomating(true);
+        fetchAutomationStatus();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to retry");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Get status icon for tenant
+  const getStatusIcon = (tenant: Step5Status['tenants'][0]) => {
+    if (tenant.error) return <span title={tenant.error}>🔴</span>;
+    if (tenant.dkim_enabled) return <span title="Complete">🟢</span>;
+    if (tenant.dkim_cnames_added) return <span title="DKIM CNAMEs added">🟡</span>;
+    if (tenant.dns_configured) return <span title="DNS configured">🟡</span>;
+    if (tenant.domain_verified) return <span title="Domain verified">🟡</span>;
+    if (tenant.domain_added) return <span title="Domain added">🟡</span>;
+    return <span title="Not started">⚪</span>;
+  };
+
+  // Calculate progress
+  const progressPercent = automationStatus?.total 
+    ? Math.round(((automationStatus.completed || 0) / automationStatus.total) * 100)
+    : 0;
+
+  const allComplete = step5Status && step5Status.ready_for_step6;
+  const hasErrors = step5Status && step5Status.errored > 0;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-xl font-bold text-gray-900">Step 5: M365 Domain & DKIM Setup</h2>
+        <p className="text-gray-600 mt-2">
+          Automatically add domains to M365, configure DNS records, and enable DKIM signing.
+        </p>
+      </div>
+
+      {/* Status Summary */}
+      <div className="grid grid-cols-4 gap-3">
+        <div className="bg-gray-50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-gray-600">{step5Status?.not_started || 0}</p>
+          <p className="text-xs text-gray-500">Not Started</p>
+        </div>
+        <div className="bg-blue-50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-blue-600">{step5Status?.domain_verified || 0}</p>
+          <p className="text-xs text-gray-500">Verified</p>
+        </div>
+        <div className="bg-green-50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-green-600">{step5Status?.dkim_enabled || 0}</p>
+          <p className="text-xs text-gray-500">DKIM Enabled</p>
+        </div>
+        <div className="bg-red-50 rounded-lg p-3 text-center">
+          <p className="text-2xl font-bold text-red-600">{step5Status?.errored || 0}</p>
+          <p className="text-xs text-gray-500">Errors</p>
+        </div>
+      </div>
+
+      {/* Automation Progress */}
+      {automating && automationStatus && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-3">
+          <div className="flex justify-between items-center">
+            <h3 className="font-bold text-blue-900">🤖 Automation Running</h3>
+            <span className="text-blue-700 font-mono">{progressPercent}%</span>
+          </div>
+          
+          {/* Progress bar */}
+          <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+            <div 
+              className="h-full bg-blue-500 transition-all duration-500"
+              style={{ width: `${progressPercent}%` }}
+            />
+          </div>
+          
+          {/* Stats */}
+          <div className="flex justify-between text-sm">
+            <span className="text-gray-600">
+              {automationStatus.completed || 0} / {automationStatus.total || 0} tenants
+            </span>
+            {automationStatus.current_step && (
+              <span className="text-blue-700">{automationStatus.current_step}</span>
+            )}
+          </div>
+          
+          {automationStatus.successful !== undefined && (
+            <div className="flex gap-4 text-sm">
+              <span className="text-green-700">✅ {automationStatus.successful} successful</span>
+              <span className="text-red-700">❌ {automationStatus.failed || 0} failed</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Completed Message */}
+      {automationStatus?.status === "completed" && !automating && (
+        <div className={`border rounded-lg p-4 ${
+          automationStatus.failed === 0 ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'
+        }`}>
+          <p className={`font-medium ${
+            automationStatus.failed === 0 ? 'text-green-800' : 'text-yellow-800'
+          }`}>
+            {automationStatus.failed === 0 
+              ? '✅ Automation completed successfully!'
+              : `⚠️ Automation completed with ${automationStatus.failed} errors`
+            }
+          </p>
+          <p className="text-sm text-gray-600 mt-1">
+            {automationStatus.successful} tenants configured, {automationStatus.failed || 0} failed
+          </p>
+        </div>
+      )}
+
+      {/* Error Message */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-red-800">{error}</p>
+        </div>
+      )}
+
+      {/* Action Buttons */}
+      {!automating && (
+        <div className="space-y-3">
+          {!allComplete && (
+            <button
+              onClick={handleStartAutomation}
+              disabled={loading || (step5Status?.total === 0)}
+              className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+            >
+              {loading ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                  Starting...
+                </span>
+              ) : (
+                `🚀 Start Automation (${step5Status?.total || 0} tenants)`
+              )}
+            </button>
+          )}
+
+          {hasErrors && (
+            <button
+              onClick={handleRetryFailed}
+              disabled={loading}
+              className="w-full py-3 border-2 border-orange-500 text-orange-600 font-bold rounded-lg hover:bg-orange-50 disabled:opacity-50"
+            >
+              🔁 Retry Failed Tenants ({step5Status?.errored || 0})
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* Tenant List */}
+      {step5Status && step5Status.tenants.length > 0 && (
+        <div className="border rounded-lg overflow-hidden">
+          <div className="bg-gray-100 px-4 py-2 border-b flex justify-between items-center">
+            <h3 className="font-bold text-gray-900">Tenant Status</h3>
+            <button 
+              onClick={() => fetchStep5Status()}
+              className="text-sm text-blue-600 hover:underline"
+            >
+              🔄 Refresh
+            </button>
+          </div>
+          
+          <div className="max-h-64 overflow-y-auto">
+            <table className="w-full text-sm">
+              <thead className="bg-gray-50 sticky top-0">
+                <tr>
+                  <th className="px-3 py-2 text-left w-10">St</th>
+                  <th className="px-3 py-2 text-left">Tenant</th>
+                  <th className="px-3 py-2 text-left">Domain</th>
+                  <th className="px-3 py-2 text-center">Add</th>
+                  <th className="px-3 py-2 text-center">Ver</th>
+                  <th className="px-3 py-2 text-center">DNS</th>
+                  <th className="px-3 py-2 text-center">DKIM</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {step5Status.tenants.map((tenant) => {
+                  // Find live progress for this tenant's domain
+                  const liveProgress = automationStatus?.tenant_live_progress?.find(
+                    p => p.domain === tenant.domain || p.tenant_id === tenant.id
+                  );
+                  const isActive = liveProgress?.active;
+                  
+                  return (
+                    <tr key={tenant.id} className={`hover:bg-gray-50 ${tenant.error ? 'bg-red-50' : ''} ${isActive ? 'bg-blue-50' : ''}`}>
+                      <td className="px-3 py-2 text-center">
+                        {isActive ? (
+                          <span className="inline-block animate-spin text-blue-500" title="Processing">⏳</span>
+                        ) : (
+                          getStatusIcon(tenant)
+                        )}
+                      </td>
+                      <td className="px-3 py-2 font-medium truncate max-w-[120px]" title={tenant.name}>
+                        <div>{tenant.name}</div>
+                        {isActive && liveProgress && (
+                          <div className="text-xs text-blue-600 font-normal animate-pulse truncate" title={`${liveProgress.live_step}: ${liveProgress.live_details}`}>
+                            {liveProgress.live_step}: {liveProgress.live_details}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-gray-600 text-xs truncate max-w-[100px]" title={tenant.domain || ''}>
+                        {tenant.domain || '-'}
+                      </td>
+                      <td className="px-3 py-2 text-center">
+                        {tenant.domain_added ? '✓' : '-'}
+                      </td>
+                      <td className="px-3 py-2 text-center">
+                        {tenant.domain_verified ? '✓' : '-'}
+                      </td>
+                      <td className="px-3 py-2 text-center">
+                        {tenant.dns_configured ? '✓' : '-'}
+                      </td>
+                      <td className="px-3 py-2 text-center">
+                        {tenant.dkim_enabled ? '✓' : tenant.dkim_cnames_added ? '◐' : '-'}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Status Legend */}
+      <div className="flex flex-wrap gap-3 text-xs text-gray-600">
+        <span>⚪ Not started</span>
+        <span>🟡 In progress</span>
+        <span>🟢 Complete</span>
+        <span>🔴 Error</span>
+        <span>✓ Done</span>
+        <span>◐ Partial</span>
+      </div>
+
+      {/* Info Box */}
+      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 text-sm">
+        <p className="text-yellow-800">
+          <strong>⚠️ Prerequisites:</strong>
+        </p>
+        <ul className="mt-2 text-yellow-700 list-disc list-inside space-y-1">
+          <li>Tenants must have completed first login (Step 4)</li>
+          <li>Tenants must have OAuth tokens (from first login)</li>
+          <li>Each tenant needs ~5 minutes (DNS propagation waits)</li>
+        </ul>
+      </div>
+
+      {/* Continue Button */}
+      <div className="border-t pt-6">
+        {allComplete ? (
+          <button
+            onClick={async () => {
+              await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/advance`, {
+                method: 'POST'
+              });
+              onComplete();
+              onNext();
+            }}
+            className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-lg hover:bg-green-700"
+          >
+            ✅ All Tenants Ready - Continue to Mailboxes →
+          </button>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-sm text-gray-600 text-center">
+              Complete M365 and DKIM setup for all tenants before continuing.
+            </p>
+            <button
+              onClick={onNext}
+              className="w-full py-3 border-2 border-gray-300 text-gray-600 font-medium rounded-lg hover:bg-gray-50"
+            >
+              Skip to Mailboxes (Not Recommended) →
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+  const [firstName, setFirstName] = useState("");
+  const [lastName, setLastName] = useState("");
+  const [count, setCount] = useState(50);
+  const [generating, setGenerating] = useState(false);
+  const [creating, setCreating] = useState(false);
+
+  const handleGenerate = async () => {
+    setGenerating(true);
+    const formData = new FormData();
+    formData.append("first_name", firstName);
+    formData.append("last_name", lastName);
+    formData.append("count", count.toString());
+    await postStep(batchId, "/step6/generate-mailboxes", formData);
+    onComplete();
+    setGenerating(false);
+  };
+
+  const handleCreate = async () => {
+    setCreating(true);
+    await postStep(batchId, "/step6/create-mailboxes");
+    onComplete();
+    setCreating(false);
+  };
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-bold">Step 6: Mailboxes</h2>
+      <div className="grid grid-cols-3 gap-4 text-center">
+        <div className="bg-gray-50 p-4 rounded-lg">
+          <p className="text-3xl font-bold">{status?.mailboxes_total || 0}</p>
+          <p className="text-sm">Total</p>
+        </div>
+        <div className="bg-yellow-50 p-4 rounded-lg">
+          <p className="text-3xl font-bold text-yellow-600">{status?.mailboxes_pending || 0}</p>
+          <p className="text-sm">Pending</p>
+        </div>
+        <div className="bg-green-50 p-4 rounded-lg">
+          <p className="text-3xl font-bold text-green-600">{status?.mailboxes_ready || 0}</p>
+          <p className="text-sm">Ready</p>
+        </div>
+      </div>
+
+      <div className="bg-gray-50 p-4 rounded-lg space-y-4">
+        <h3 className="font-bold">Generate Mailboxes</h3>
+        <div className="grid grid-cols-2 gap-4">
+          <input type="text" value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="First Name" className="px-3 py-2 border rounded-lg" />
+          <input type="text" value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="Last Name" className="px-3 py-2 border rounded-lg" />
+        </div>
+        <button onClick={handleGenerate} disabled={!firstName || !lastName || generating}
+          className="w-full py-3 bg-blue-600 text-white font-bold rounded-lg disabled:bg-gray-300">
+          {generating ? "Generating..." : "Generate Mailboxes"}
+        </button>
+      </div>
+
+      <button onClick={handleCreate} disabled={creating || !status?.mailboxes_pending}
+        className="w-full py-3 bg-green-600 text-white font-bold rounded-lg disabled:bg-gray-300">
+        {creating ? "Creating..." : "Create in M365"}
+      </button>
+      <button onClick={() => window.open(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/export-credentials`)}
+        disabled={!status?.mailboxes_total} className="w-full py-3 border-2 border-blue-600 text-blue-600 font-bold rounded-lg">
+        📥 Export Credentials
+      </button>
+    </div>
+  );
+}
+
+function StepComplete({ batchId, status }: { batchId: string; status: WizardStatus | null }) {
+  return (
+    <div className="text-center py-12">
+      <div className="text-6xl mb-6">🎉</div>
+      <h2 className="text-2xl font-bold">Setup Complete!</h2>
+      <p className="text-gray-600 mt-4">{status?.mailboxes_ready || 0} mailboxes ready</p>
+      <a href={`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/export-credentials`}
+        className="inline-block mt-6 px-6 py-3 bg-blue-600 text-white font-bold rounded-lg">
+        📥 Download Credentials
+      </a>
+    </div>
+  );
+}

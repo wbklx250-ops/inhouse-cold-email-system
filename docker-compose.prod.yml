@@ -1,0 +1,67 @@
+# =================================================================
+# Docker Compose - Production Configuration
+# =================================================================
+#
+# Cold Email Platform - Production Deployment
+#
+# NOTE: This project uses Neon Serverless PostgreSQL
+# No local PostgreSQL container is needed!
+#
+# Usage:
+#   docker-compose -f docker-compose.prod.yml up --build
+#
+# =================================================================
+
+version: "3.9"
+
+services:
+  # =================================================================
+  # Backend API Service
+  # =================================================================
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cold-email-backend
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - SECRET_KEY=${SECRET_KEY}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    ports:
+      - "8000:8000"
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # =================================================================
+  # Frontend Next.js Service
+  # =================================================================
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    container_name: cold-email-frontend
+    environment:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    restart: unless-stopped
+
+# =================================================================
+# Notes:
+# - PostgreSQL is hosted on Neon (https://neon.tech) - no container needed
+# - All environment variables should be set in .env.production
+# - For deployment to Railway/Render, use the individual Dockerfiles
+# =================================================================

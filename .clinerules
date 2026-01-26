@@ -1,0 +1,952 @@
+# Cold Email Infrastructure Platform - Cline Rules
+# This file provides persistent context across Cline sessions
+
+## PROJECT OVERVIEW
+
+Building a custom cold email infrastructure platform to manage:
+- 300+ Microsoft 365 tenants  
+- 50 shared mailboxes per tenant = 15,000+ total mailboxes
+- Full automation from domain setup to sending-ready
+- Target cost: $4-6 per tenant via regional resellers
+
+### Business Model
+**1 Domain = 1 M365 Tenant = 50 Shared Mailboxes = 1 Licensed User**
+
+This isolation ensures:
+- Domain reputation is isolated (one bad domain doesn't affect others)
+- Easy to retire/replace problematic domains
+- Clear cost attribution per domain
+
+---
+
+## TECH STACK
+
+| Layer | Technology | Notes |
+|-------|------------|-------|
+| Frontend | Next.js 14+ | App Router, Server Components, TypeScript |
+| Styling | Tailwind CSS 3.x | Utility-first |
+| Backend | Python FastAPI | Async, type hints, Pydantic v2 |
+| ORM | SQLAlchemy 2.x | Async support with mapped_column() |
+| Migrations | Alembic | Database versioning |
+| Database | PostgreSQL 15+ | Primary data store |
+| External APIs | Cloudflare, Microsoft Graph | DNS and M365 management |
+
+### NOT Using (for MVP)
+- Redis/Celery (deferred)
+- Spaceship API (manual domain purchase at Porkbun)
+- PlusVibe integration (Phase 2)
+
+---
+
+## ARCHITECTURE
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                         FRONTEND (Next.js 14)                        │
+│                      Dashboard, Domain/Tenant/Mailbox Pages          │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                          BACKEND API (FastAPI)                       │
+│                     /api/v1/domains, tenants, mailboxes             │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+             ┌───────────┐  ┌───────────┐  ┌───────────┐
+             │ PostgreSQL│  │Cloudflare │  │ Microsoft │
+             │ (Database)│  │   API     │  │ Graph API │
+             └───────────┘  └───────────┘  └───────────┘
+```
+
+---
+
+## CRITICAL: DNS SETUP ORDER
+
+⚠️ **MUST follow this exact order:**
+
+```
+1. User adds domain to platform (manual purchase at Porkbun)
+                    ↓
+2. Platform creates Cloudflare zone → Returns nameservers
+   (e.g., anna.ns.cloudflare.com, bob.ns.cloudflare.com)
+                    ↓
+3. User manually updates nameservers at Porkbun
+                    ↓
+4. User clicks "Confirm" in platform OR waits 2 hours
+                    ↓
+5. Platform verifies Cloudflare zone status is "active"
+                    ↓
+6. Platform creates DNS records (MX, SPF, DMARC)
+```
+
+**❌ WRONG:** Cannot update nameservers before zone exists!
+**❌ WRONG:** Cannot create DNS records before nameservers propagate!
+
+---
+
+## DATA MODELS
+
+### Domain Entity
+```python
+class Domain:
+    id: UUID                          # Primary key
+    name: str                         # "example.com"
+    tld: str                          # ".com"
+    status: DomainStatus              # See statuses below
+    
+    # Cloudflare
+    cloudflare_zone_id: str | None
+    cloudflare_nameservers: list[str] # JSON array
+    cloudflare_zone_status: str       # "pending" or "active"
+    
+    # Status flags
+    nameservers_updated: bool
+    nameservers_updated_at: datetime | None
+    dns_records_created: bool
+    mx_configured: bool
+    spf_configured: bool
+    dmarc_configured: bool
+    
+    # DKIM
+    dkim_cnames_added: bool
+    dkim_enabled: bool
+    dkim_selector1_cname: str | None
+    dkim_selector2_cname: str | None
+    
+    # Relationships
+    tenant_id: UUID | None            # FK to Tenant
+    
+    # Timestamps
+    created_at: datetime
+    updated_at: datetime
+
+class DomainStatus(str, Enum):
+    PURCHASED = "purchased"
+    CF_ZONE_PENDING = "cf_zone_pending"
+    CF_ZONE_ACTIVE = "cf_zone_active"
+    NS_UPDATING = "ns_updating"
+    NS_PROPAGATING = "ns_propagating"
+    DNS_CONFIGURING = "dns_configuring"
+    PENDING_M365 = "pending_m365"
+    PENDING_DKIM = "pending_dkim"
+    ACTIVE = "active"
+    PROBLEM = "problem"
+    RETIRED = "retired"
+```
+
+### Tenant Entity
+```python
+class Tenant:
+    id: UUID
+    microsoft_tenant_id: str          # Microsoft Tenant GUID
+    name: str                         # Display name
+    onmicrosoft_domain: str           # "example.onmicrosoft.com"
+    provider: str                     # Reseller name
+    admin_email: str
+    admin_password: str               # ENCRYPTED
+    licensed_user_email: str
+    status: TenantStatus
+    target_mailbox_count: int         # Default 50
+    mailboxes_created: int
+    mailboxes_configured: int
+    domain_id: UUID | None            # FK to Domain
+    created_at: datetime
+    updated_at: datetime
+
+class TenantStatus(str, Enum):
+    NEW = "new"
+    CONFIGURING = "configuring"
+    ACTIVE = "active"
+    SUSPENDED = "suspended"
+    RETIRED = "retired"
+```
+
+### Mailbox Entity
+```python
+class Mailbox:
+    id: UUID
+    email: str                        # "john@example.com"
+    display_name: str                 # "John Smith"
+    password: str                     # ENCRYPTED
+    tenant_id: UUID                   # FK to Tenant
+    status: MailboxStatus
+    account_enabled: bool
+    password_set: bool
+    upn_fixed: bool
+    delegated: bool
+    warmup_stage: WarmupStage
+    created_at: datetime
+    updated_at: datetime
+
+class MailboxStatus(str, Enum):
+    CREATED = "created"
+    CONFIGURED = "configured"
+    UPLOADED = "uploaded"
+    WARMING = "warming"
+    READY = "ready"
+    SUSPENDED = "suspended"
+
+class WarmupStage(str, Enum):
+    NONE = "none"
+    EARLY = "early"
+    RAMPING = "ramping"
+    MATURE = "mature"
+    COMPLETE = "complete"
+```
+
+---
+
+## API ENDPOINTS
+
+### Domains
+```
+GET    /api/v1/domains                    # List all (paginated)
+POST   /api/v1/domains                    # Add domain → creates CF zone
+GET    /api/v1/domains/{id}               # Get single
+PATCH  /api/v1/domains/{id}               # Update
+DELETE /api/v1/domains/{id}               # Soft delete (retire)
+POST   /api/v1/domains/{id}/confirm-ns    # User confirms NS updated
+POST   /api/v1/domains/{id}/create-dns    # Create MX, SPF, DMARC
+GET    /api/v1/domains/{id}/check-status  # Check propagation
+```
+
+### Tenants
+```
+GET    /api/v1/tenants
+POST   /api/v1/tenants                    # Import tenant
+GET    /api/v1/tenants/{id}
+PATCH  /api/v1/tenants/{id}
+DELETE /api/v1/tenants/{id}
+POST   /api/v1/tenants/bulk-import        # CSV import
+```
+
+### Mailboxes
+```
+GET    /api/v1/mailboxes
+POST   /api/v1/mailboxes                  # Create single
+GET    /api/v1/mailboxes/{id}
+PATCH  /api/v1/mailboxes/{id}
+POST   /api/v1/tenants/{id}/generate-mailboxes  # Generate 50 for tenant
+GET    /api/v1/mailboxes/export           # Export credentials CSV
+```
+
+---
+
+## FILE STRUCTURE
+
+```
+cold-email-platform/
+├── backend/
+│   ├── app/
+│   │   ├── __init__.py
+│   │   ├── main.py                 # FastAPI app entry
+│   │   ├── api/
+│   │   │   ├── __init__.py
+│   │   │   ├── deps.py             # Dependencies (DB session)
+│   │   │   └── routes/
+│   │   │       ├── __init__.py
+│   │   │       ├── domains.py
+│   │   │       ├── tenants.py
+│   │   │       └── mailboxes.py
+│   │   ├── core/
+│   │   │   ├── __init__.py
+│   │   │   ├── config.py           # Settings from env
+│   │   │   └── security.py         # Encryption helpers
+│   │   ├── db/
+│   │   │   ├── __init__.py
+│   │   │   ├── base.py             # Base model
+│   │   │   └── session.py          # Async session
+│   │   ├── models/
+│   │   │   ├── __init__.py
+│   │   │   ├── domain.py
+│   │   │   ├── tenant.py
+│   │   │   └── mailbox.py
+│   │   ├── schemas/
+│   │   │   ├── __init__.py
+│   │   │   ├── domain.py
+│   │   │   ├── tenant.py
+│   │   │   └── mailbox.py
+│   │   └── services/
+│   │       ├── __init__.py
+│   │       └── cloudflare.py       # Cloudflare API client
+│   ├── alembic/                    # Migrations
+│   ├── requirements.txt
+│   └── .env.example
+├── frontend/
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx                # Dashboard
+│   │   ├── domains/
+│   │   │   ├── page.tsx            # List
+│   │   │   ├── new/page.tsx        # Add form
+│   │   │   └── [id]/page.tsx       # Detail
+│   │   ├── tenants/
+│   │   │   ├── page.tsx
+│   │   │   └── [id]/page.tsx
+│   │   └── mailboxes/
+│   │       ├── page.tsx
+│   │       └── [id]/page.tsx
+│   ├── components/
+│   │   ├── layout/
+│   │   │   ├── Sidebar.tsx
+│   │   │   └── Header.tsx
+│   │   └── ui/
+│   │       ├── Card.tsx
+│   │       ├── Badge.tsx
+│   │       ├── Button.tsx
+│   │       └── Table.tsx
+│   ├── lib/
+│   │   └── api.ts                  # API client
+│   └── package.json
+└── docker-compose.yml
+```
+
+---
+
+## CODE STANDARDS
+
+### Python (Backend)
+- Python 3.11+ features
+- **Always use type hints**
+- Use async/await for all DB and HTTP operations
+- Use Pydantic v2 syntax (model_config, not Config class)
+- Use SQLAlchemy 2.x with mapped_column()
+- Use httpx for async HTTP requests
+- Include comprehensive error handling with HTTPException
+
+### TypeScript (Frontend)
+- Strict TypeScript - **no `any` types**
+- Use Next.js 14 App Router patterns
+- Server Components by default, "use client" only when needed
+- Tailwind CSS for all styling
+- Include loading.tsx and error.tsx for each route
+- Make UI responsive
+
+### General Rules
+- **All code must be production-ready** (NO test-only code)
+- **Never truncate code** with "// rest of code here"
+- **Always write complete, working code**
+- Include proper error messages for users
+- Follow RESTful API conventions
+- Use UUIDs for all primary keys
+
+---
+
+## CLOUDFLARE API
+
+### Base URL
+`https://api.cloudflare.com/client/v4`
+
+### Headers
+```
+Authorization: Bearer {CLOUDFLARE_API_TOKEN}
+Content-Type: application/json
+```
+
+### Key Endpoints
+```python
+# Create zone
+POST /zones
+Body: {"name": "example.com", "account": {"id": "{ACCOUNT_ID}"}, "type": "full"}
+Returns: zone_id, name_servers
+
+# Get zone status  
+GET /zones/{zone_id}
+Returns: status ("pending" or "active")
+
+# Create DNS record
+POST /zones/{zone_id}/dns_records
+Body: {"type": "MX", "name": "@", "content": "...", "priority": 0, "proxied": false}
+```
+
+### DNS Records Needed
+| Type | Name | Value | Proxied |
+|------|------|-------|---------|
+| MX | @ | {domain-dashes}.mail.protection.outlook.com | false |
+| TXT | @ | v=spf1 include:spf.protection.outlook.com ~all | N/A |
+| TXT | _dmarc | v=DMARC1; p=none; rua=mailto:dmarc@{domain} | N/A |
+| CNAME | selector1._domainkey | {from M365} | **false** |
+| CNAME | selector2._domainkey | {from M365} | **false** |
+
+---
+
+## ENVIRONMENT VARIABLES
+
+```bash
+# Database
+DATABASE_URL=postgresql+asyncpg://user:pass@localhost:5432/cold_email
+
+# Cloudflare
+CLOUDFLARE_API_TOKEN=xxx
+CLOUDFLARE_ACCOUNT_ID=xxx
+
+# Microsoft (for future M365 integration)
+AZURE_CLIENT_ID=xxx
+AZURE_CLIENT_SECRET=xxx
+AZURE_TENANT_ID=common
+
+# Application
+SECRET_KEY=xxx
+DEBUG=false
+```
+
+---
+
+## DO NOT
+
+❌ Create test-only or placeholder code
+❌ Skip error handling
+❌ Use mock data in production endpoints
+❌ Truncate code files with "// rest..." or "..."
+❌ Assume packages are installed (check requirements.txt)
+❌ Create unnecessary files
+❌ Use `any` type in TypeScript
+❌ Skip type hints in Python
+❌ Update nameservers before creating Cloudflare zone
+❌ Create DNS records before zone is active
+
+
+# Cold Email Infrastructure Platform - Cline Rules
+
+## Project Context
+This is a cold email infrastructure automation platform. It manages 300+ M365 tenants with 50 mailboxes each. The goal is full automation from domain purchase to ready-to-send mailboxes.
+
+## Tech Stack
+- Frontend: Next.js 14, TypeScript, Tailwind CSS
+- Backend: Python FastAPI, async SQLAlchemy, PostgreSQL
+- Automation: Selenium for browser automation, pyotp for TOTP
+- External: Cloudflare API, Microsoft Graph API, Exchange Online PowerShell
+
+## Key Principles
+
+### 1. Automation First
+- Minimize manual steps wherever possible
+- Use Selenium for interactive browser flows
+- Generate PowerShell scripts for M365 operations
+- Platform should add DNS records automatically
+
+### 2. Batch Processing
+- Everything works in batches (domains + tenants grouped)
+- Support parallel processing (multiple simultaneous operations)
+- Track progress per-item and per-batch
+
+### 3. Error Recovery
+- Store errors on individual items (tenant.setup_error)
+- Allow retry of failed items without redoing successful ones
+- Take screenshots on Selenium failures for debugging
+
+### 4. Security Awareness
+- TOTP secrets and passwords will need encryption in production
+- Never log sensitive credentials
+- Use environment variables for API keys
+
+## Code Patterns
+
+### Backend Services
+```python
+# Services are singletons at module level
+class SomeService:
+    async def do_something(self, db: AsyncSession, ...):
+        pass
+
+some_service = SomeService()  # Singleton
+```
+
+### API Endpoints
+```python
+# Use dependency injection for database
+@router.post("/endpoint")
+async def endpoint(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    pass
+```
+
+### Frontend API Calls
+```typescript
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+const response = await fetch(`${API_BASE}/api/v1/endpoint`, {
+    method: "POST",
+    body: formData
+});
+```
+
+## File Naming
+- Models: `backend/app/models/{entity}.py`
+- Services: `backend/app/services/{service_name}.py`
+- Routes: `backend/app/api/routes/{entity}.py`
+- Frontend pages: `frontend/app/{path}/page.tsx`
+
+## Database Migrations
+After model changes:
+```bash
+cd backend
+alembic revision --autogenerate -m "description"
+alembic upgrade head
+```
+
+## Important Business Rules
+
+### Email Generation
+- NO NUMBERS in email addresses (triggers spam filters)
+- Use professional name variations
+- 50 mailboxes per tenant (configurable)
+
+### DNS Records
+- DKIM CNAMEs must be unproxied (orange cloud OFF)
+- MX record priority should be 0
+- SPF must include spf.protection.outlook.com
+
+### Tenant Setup Order
+1. First-login (password + MFA) - MUST be first
+2. Disable Security Defaults - immediately after MFA
+3. Add domain to M365
+4. Verify domain
+5. Add mail DNS
+6. Configure DKIM
+7. Create mailboxes
+8. Delegate mailboxes
+
+## Selenium Automation Notes
+- Use headless mode in production (--headless=new)
+- Add human-like delays between actions
+- Microsoft may change UI - selectors may need updates
+- Extract TOTP secret by clicking "I can't scan the barcode"
+- Store TOTP as backup even though we disable Security Defaults
+
+## Common Issues & Solutions
+
+### "Element not found" in Selenium
+- Increase wait timeout
+- Check if Microsoft changed their UI
+- Add more fallback selectors
+
+### "Rate limited" from Cloudflare
+- Add delays between API calls
+- Process in smaller batches
+
+### "DKIM enable failed"
+- CNAMEs haven't propagated yet
+- Wait 15-30 minutes and retry
+
+### Database migration conflicts
+- Delete alembic/versions/*.py (dev only)
+- Run fresh: alembic revision --autogenerate
+
+## When Implementing New Features
+1. Update the model if needed (run migration)
+2. Create/update service class
+3. Add API endpoints
+4. Update frontend UI
+5. Test the full flow
+
+## Memory Bank Location
+Full system documentation: `CLINE_MEMORY_BANK.md` in project root
+
+# Cold Email Platform - Cline Rules v3
+
+## ⚠️ CRITICAL: Full Automation Required
+
+This platform must be **100% automated**. NO manual scripts. NO downloading files for users to run. Everything executes on the server.
+
+---
+
+## Golden Rules
+
+### 1. Server-Side Execution Only
+```python
+# ❌ NEVER DO THIS
+@router.get("/download-script")
+def download():
+    return FileResponse("script.ps1")
+
+# ✅ ALWAYS DO THIS  
+@router.post("/execute")
+async def execute():
+    await run_on_server()
+```
+
+### 2. Detect State Before Acting (Selenium)
+```python
+# ❌ NEVER ASSUME A FLOW
+driver.find_element(...).click()
+driver.find_element(...).send_keys(...)
+
+# ✅ ALWAYS CHECK STATE FIRST
+state = detect_current_state()
+if state == LoginState.NEEDS_EMAIL:
+    handle_email()
+elif state == LoginState.NEEDS_PASSWORD:
+    handle_password()
+```
+
+### 3. Checkpoint After Every Step
+```python
+# After EVERY operation, save state:
+tenant.step_completed = True
+await db.commit()  # CHECKPOINT
+```
+
+### 4. No Numbers in Emails
+```python
+# ❌ BAD
+"john.smith1@domain.com"
+
+# ✅ GOOD
+"john.smith@domain.com"
+"john.s@domain.com"
+```
+
+### 5. DKIM CNAMEs Must Be Unproxied
+```python
+await cloudflare.create_cname(
+    name="selector1._domainkey",
+    target=value,
+    proxied=False  # CRITICAL!
+)
+```
+
+---
+
+## Architecture
+
+```
+Selenium → First login, MFA, Security Defaults, Device Code OAuth
+Graph API → Domains, Users, Licenses
+PowerShell Core → DKIM, Mailboxes, Delegation (on Linux!)
+Cloudflare API → DNS records
+```
+
+---
+
+## Tech Stack
+
+- Backend: FastAPI, async SQLAlchemy, PostgreSQL
+- Frontend: Next.js 14, TypeScript, Tailwind
+- Automation: Selenium (Chrome headless), PowerShell Core 7
+- Deployment: Railway (Linux Docker)
+
+---
+
+## Database Model Essentials
+
+### Tenant Status Tracking
+```python
+# First Login
+first_login_completed: bool
+password_changed: bool
+security_defaults_disabled: bool
+totp_secret: str  # ENCRYPT
+
+# OAuth
+access_token: str  # ENCRYPT
+refresh_token: str  # ENCRYPT
+
+# Domain
+domain_added_to_m365: bool
+domain_verified_in_m365: bool
+
+# DNS
+mx_record_added: bool
+spf_record_added: bool
+
+# DKIM
+dkim_selector1: str
+dkim_selector2: str
+dkim_cnames_added: bool
+dkim_enabled: bool
+
+# Mailboxes
+mailboxes_created: bool
+delegation_completed: bool
+
+# Status
+status: TenantStatus
+setup_error: str
+```
+
+---
+
+## Selenium State Detection
+
+```python
+class LoginState(Enum):
+    NEEDS_EMAIL = "needs_email"
+    NEEDS_PASSWORD = "needs_password"
+    NEEDS_PASSWORD_CHANGE = "needs_password_change"
+    NEEDS_MFA_SETUP = "needs_mfa_setup"
+    NEEDS_MFA_CODE = "needs_mfa_code"
+    NEEDS_STAY_SIGNED_IN = "needs_stay_signed_in"
+    LOGGED_IN = "logged_in"
+    ERROR = "error"
+```
+
+Detection methods:
+- Check URL patterns
+- Check for specific elements
+- Check page text content
+- Always take screenshots
+
+---
+
+## PowerShell on Linux
+
+Railway runs Linux. PowerShell Core works on Linux:
+
+```dockerfile
+RUN apt-get install -y powershell
+RUN pwsh -Command "Install-Module ExchangeOnlineManagement -Force"
+```
+
+Execute from Python:
+```python
+process = await asyncio.create_subprocess_exec(
+    "/usr/bin/pwsh",
+    "-File", script_path,
+    stdout=asyncio.subprocess.PIPE
+)
+```
+
+---
+
+## Main Automation Endpoint
+
+```python
+@router.post("/batches/{batch_id}/start-full-automation")
+async def start_full_automation(
+    new_password: str,
+    first_name: str,
+    last_name: str,
+    mailboxes_per_tenant: int = 50,
+    max_workers: int = 10
+):
+    """
+    Starts COMPLETE automation:
+    1. First login for all tenants
+    2. OAuth tokens
+    3. Domain verification
+    4. DNS records
+    5. DKIM
+    6. Mailboxes
+    7. Delegation
+    
+    NO manual intervention.
+    """
+```
+
+---
+
+## Parallel Processing Pattern
+
+```python
+async def process_batch(tenants: List[Tenant], max_workers: int = 10):
+    semaphore = asyncio.Semaphore(max_workers)
+    
+    async def process_one(tenant: Tenant):
+        async with semaphore:
+            return await orchestrator.setup_tenant(tenant)
+    
+    results = await asyncio.gather(
+        *[process_one(t) for t in tenants],
+        return_exceptions=True
+    )
+```
+
+---
+
+## Error Handling Pattern
+
+```python
+try:
+    await do_operation()
+    tenant.operation_complete = True
+    await db.commit()
+except Exception as e:
+    tenant.setup_error = str(e)
+    tenant.setup_step = "operation_name"
+    screenshot = automation.take_screenshot("error")
+    await db.commit()
+    raise
+```
+
+---
+
+## Test Tenant
+
+```
+ID: be06745b-d4a7-4641-8289-88bef7ee600a
+Email: admin@Quopharamonquo9360193.onmicrosoft.com
+Password: v+YRt3hd
+```
+
+Use for testing Selenium selectors.
+
+---
+
+## File Organization
+
+```
+backend/app/services/
+├── selenium/           # Browser automation
+│   ├── browser.py
+│   ├── login.py
+│   └── mfa.py
+├── microsoft/          # Graph API
+│   ├── graph_client.py
+│   └── auth.py
+├── powershell/         # PowerShell runner
+│   ├── runner.py
+│   └── exchange.py
+├── orchestrator/       # Main coordinator
+│   ├── tenant_setup.py
+│   └── batch_processor.py
+└── cloudflare.py       # DNS
+```
+
+---
+
+## When Implementing Features
+
+1. **Check if automation exists** - Never create manual scripts
+2. **Add state detection** - Handle all possible states
+3. **Add checkpointing** - Save progress after each step
+4. **Add error capture** - Screenshots + error messages
+5. **Test with real tenant** - Use test credentials
+6. **Ensure parallel-safe** - Use semaphores, avoid race conditions
+
+# Cold Email Platform - Cline Rules (FINAL)
+
+## ⚠️ CRITICAL: Full Automation Required
+
+NO manual scripts. NO downloading files for users to run. Everything executes on the server.
+
+---
+
+## Golden Rules
+
+### 1. Server-Side Execution Only
+```python
+# ❌ NEVER
+@router.get("/download-script")
+
+# ✅ ALWAYS
+@router.post("/execute")
+async def execute():
+    await run_on_server()
+```
+
+### 2. Detect State Before Acting (Selenium)
+```python
+state = detect_current_state()
+if state == LoginState.NEEDS_EMAIL:
+    handle_email()
+elif state == LoginState.NEEDS_PASSWORD:
+    handle_password()
+# Never assume a specific flow
+```
+
+### 3. Checkpoint After Every Step
+```python
+tenant.step_completed = True
+await db.commit()  # CHECKPOINT!
+```
+
+### 4. No Numbers in Emails
+```python
+# ❌ "john.smith1@domain.com"
+# ✅ "john.smith@domain.com"
+```
+
+### 5. DKIM CNAMEs Must Be Unproxied
+```python
+proxied=False  # CRITICAL for DKIM!
+```
+
+---
+
+## Tech Stack
+
+- **Backend:** FastAPI, async SQLAlchemy, PostgreSQL
+- **Frontend:** Next.js 14, TypeScript, Tailwind
+- **Automation:** Selenium (Chrome), PowerShell Core
+- **Deployment:** Railway (Docker)
+
+---
+
+## Services to Create
+
+| Service | File | Purpose |
+|---------|------|---------|
+| MicrosoftLoginAutomation | selenium/login.py | First login with state detection |
+| DeviceCodeAuth | microsoft/auth.py | OAuth tokens |
+| GraphClient | microsoft/graph.py | Domain/user operations |
+| PowerShellRunner | powershell/runner.py | Execute pwsh |
+| ExchangeOperations | powershell/exchange.py | DKIM/mailboxes |
+| TenantSetupOrchestrator | orchestrator.py | Coordinates all steps |
+
+---
+
+## Selenium Login States
+
+```python
+NEEDS_EMAIL
+NEEDS_PASSWORD
+NEEDS_PASSWORD_CHANGE
+NEEDS_MFA_SETUP
+NEEDS_MFA_CODE
+NEEDS_STAY_SIGNED_IN
+LOGGED_IN
+ERROR
+```
+
+Always check state. Never assume flow.
+
+---
+
+## Test Tenant
+
+```
+Email: admin@Quopharamonquo9360193.onmicrosoft.com
+Password: v+YRt3hd
+```
+
+Use for testing Selenium selectors.
+
+---
+
+## Error Handling
+
+```python
+try:
+    await operation()
+    tenant.step_completed = True
+    await db.commit()
+except Exception as e:
+    tenant.setup_error = str(e)
+    screenshot = take_screenshot("error")
+    await db.commit()
+    raise
+```
+
+---
+
+## Parallel Processing
+
+```python
+semaphore = asyncio.Semaphore(10)  # 10 workers
+async with semaphore:
+    await process_tenant(tenant)
+```
+
+---
+
+## Dockerfile Must Have
+
+- Python 3.11
+- Chromium + chromedriver
+- PowerShell Core (pwsh)
+- ExchangeOnlineManagement module

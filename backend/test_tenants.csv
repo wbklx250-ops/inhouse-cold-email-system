@@ -1,0 +1,4 @@
+tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_email,domain_name
+Test Tenant 1,mt-001-test,testtenant1.onmicrosoft.com,admin@testtenant1.onmicrosoft.com,TestPass123!,LightningBase,user@testtenant1.onmicrosoft.com,
+Test Tenant 2,mt-002-test,testtenant2.onmicrosoft.com,admin@testtenant2.onmicrosoft.com,SecurePass456!,LightningBase,user@testtenant2.onmicrosoft.com,example.com
+Test Tenant 3,mt-003-test,testtenant3.onmicrosoft.com,admin@testtenant3.onmicrosoft.com,AnotherPass789!,Resold,,
