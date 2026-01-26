@@ -72,7 +72,7 @@ allowed_origins = [
 ]
 # Add any additional origins from settings
 if settings.allowed_origins:
-    allowed_origins.extend([str(origin) for origin in settings.allowed_origins])
+    allowed_origins.extend(settings.allowed_origins)
 
 # In debug mode, allow all origins for easier development
 if settings.debug:
