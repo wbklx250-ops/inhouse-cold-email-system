@@ -1,57 +1,61 @@
-# Railway Deployment Dockerfile
+# Railway Deployment Dockerfile - Cold Email Infrastructure Platform
 FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies
+# Install system dependencies (packages for Debian Trixie)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # Chrome/Chromium for Selenium
     chromium \
     chromium-driver \
-    # PowerShell dependencies
     wget \
-    apt-transport-https \
-    software-properties-common \
+    curl \
     gnupg \
-    # Build tools
+    ca-certificates \
     gcc \
     libpq-dev \
-    # Cleanup
+    fonts-liberation \
+    libasound2t64 \
+    libatk-bridge2.0-0 \
+    libdrm2 \
+    libgbm1 \
+    libgtk-3-0 \
+    libnspr4 \
+    libnss3 \
+    libxkbcommon0 \
+    libxshmfence1 \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PowerShell Core
-RUN wget -q https://packages.microsoft.com/config/debian/11/packages-microsoft-prod.deb \
-    && dpkg -i packages-microsoft-prod.deb \
-    && rm packages-microsoft-prod.deb \
+RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
+    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/microsoft.list \
     && apt-get update \
-    && apt-get install -y powershell \
+    && apt-get install -y --no-install-recommends powershell \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PowerShell modules
+# Install PowerShell modules for Exchange Online
 RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" \
     && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -Force -Scope AllUsers -AcceptLicense"
 
-# Set Chrome paths for Selenium
+# Set environment paths
 ENV CHROME_PATH=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV PWSH_PATH=/usr/bin/pwsh
 
-# Create app directory
 WORKDIR /app
 
-# Install Python dependencies
+RUN mkdir -p /tmp/screenshots /app/logs
+
 COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application
 COPY backend/ .
 
-# Create directories
-RUN mkdir -p /tmp/screenshots
-
 ENV SCREENSHOT_DIR=/tmp/screenshots
+ENV LOG_DIR=/app/logs
+ENV HEADLESS_MODE=true
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

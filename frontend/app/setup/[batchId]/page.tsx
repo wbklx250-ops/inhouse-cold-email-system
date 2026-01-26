@@ -283,6 +283,31 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoProgressed, setAutoProgressed] = useState(false);
+  const [nsGroups, setNsGroups] = useState<NameserverGroup[]>([]);
+  const [nsLoading, setNsLoading] = useState(false);
+
+  // Auto-fetch nameserver groups if zones already exist (resuming session)
+  useEffect(() => {
+    if (status && status.zones_created > 0) {
+      fetchNameserverGroups();
+    }
+  }, [batchId, status?.zones_created]);
+
+  const fetchNameserverGroups = async () => {
+    try {
+      setNsLoading(true);
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/nameserver-groups`);
+      if (res.ok) {
+        const data = await res.json();
+        console.log("DEBUG Step2Zones: Fetched NS groups:", data.nameserver_groups);
+        setNsGroups(data.nameserver_groups || []);
+      }
+    } catch (e) {
+      console.error("Failed to fetch nameserver groups:", e);
+    } finally {
+      setNsLoading(false);
+    }
+  };
 
   const handleCreate = async () => {
     setLoading(true);
@@ -318,7 +343,10 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
     }
   };
 
-  const nsGroups: NameserverGroup[] = result?.details?.nameserver_groups || [];
+  // Determine which NS groups to display:
+  // - If we just created zones (result exists), use the result's groups
+  // - Otherwise, use the auto-fetched groups (from persistent state)
+  const displayNsGroups: NameserverGroup[] = result?.details?.nameserver_groups || nsGroups;
 
   // Check if zones are already created (from a previous session)
   const zonesAlreadyCreated = status && status.zones_created > 0 && status.zones_pending === 0;
@@ -435,7 +463,7 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
           </div>
 
           {/* Nameserver groups */}
-          {nsGroups.length > 0 && (
+          {displayNsGroups.length > 0 && (
             <>
               <div>
                 <h3 className="font-bold text-gray-900 mb-2">
@@ -447,7 +475,7 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
                 </p>
               </div>
 
-              {nsGroups.map((g, i) => (
+              {displayNsGroups.map((g, i) => (
                 <div key={i} className="border rounded-lg p-4 bg-gray-50">
                   <div className="flex justify-between items-start">
                     <div className="flex-1">
@@ -484,7 +512,7 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
             </>
           )}
 
-          {nsGroups.length === 0 && !result.can_progress && (
+          {displayNsGroups.length === 0 && !result.can_progress && (
             <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
               <p className="text-yellow-800">
                 ⚠️ No nameservers returned. Check the Cloudflare dashboard to verify zones were created.

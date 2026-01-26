@@ -32,22 +32,44 @@ git push origin main
 
 In Railway dashboard → Your service → **Variables** tab, add:
 
-| Variable | Value | Notes |
-|----------|-------|-------|
-| `DATABASE_URL` | *auto-set by Railway* | Or your Neon URL |
-| `CLOUDFLARE_EMAIL` | your-email@example.com | From Cloudflare |
-| `CLOUDFLARE_API_KEY` | your-global-api-key | From Cloudflare |
-| `CLOUDFLARE_ACCOUNT_ID` | your-account-id | From Cloudflare |
-| `MS_CLIENT_ID` | your-azure-app-id | From Azure Portal |
-| `ENCRYPTION_KEY` | *generate-fernet-key* | See below |
-| `SECRET_KEY` | random-string | Any random string |
-| `SCREENSHOT_DIR` | /tmp/screenshots | Keep this value |
-| `HEADLESS_MODE` | true | Required for Railway |
+#### Required Variables
 
-**Generate ENCRYPTION_KEY:**
-```python
+| Variable | Example Value | Where to Get It |
+|----------|---------------|-----------------|
+| `DATABASE_URL` | `postgresql://...` | Auto-created if you add Railway PostgreSQL, OR use your Neon URL |
+| `CLOUDFLARE_EMAIL` | `you@example.com` | Your Cloudflare account email |
+| `CLOUDFLARE_API_KEY` | `abc123...` | Cloudflare Dashboard → Profile → API Tokens → Global API Key |
+| `CLOUDFLARE_ACCOUNT_ID` | `def456...` | Cloudflare Dashboard → Any site → Overview → Account ID (right sidebar) |
+| `MS_CLIENT_ID` | `12345678-abcd-...` | Azure Portal → App Registrations → Your App → Application (client) ID |
+| `ENCRYPTION_KEY` | `abc123base64...` | Generate with command below |
+| `SECRET_KEY` | `any-random-string` | Make up any random string |
+
+#### Auto-Set by Dockerfile (don't add these)
+
+These are already configured in the Dockerfile - no need to add manually:
+- `SCREENSHOT_DIR` → `/tmp/screenshots`
+- `HEADLESS_MODE` → `true`
+- `CHROME_PATH` → `/usr/bin/chromium`
+
+#### Generate ENCRYPTION_KEY
+
+Run this Python command locally:
+```bash
 python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
+
+Copy the output (looks like: `8sX9v2K...=`) and paste as ENCRYPTION_KEY value.
+
+#### If Using Neon (not Railway PostgreSQL)
+
+Your DATABASE_URL format should be:
+```
+postgresql+asyncpg://user:password@ep-xxx-xxx.us-east-2.aws.neon.tech/neondb?sslmode=require
+```
+
+Make sure it has:
+- `postgresql+asyncpg://` prefix (not just `postgresql://`)
+- `?sslmode=require` at the end
 
 ### 5. Deploy!
 
