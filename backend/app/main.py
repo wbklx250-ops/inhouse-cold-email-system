@@ -71,8 +71,8 @@ allowed_origins = [
     "http://127.0.0.1:3000",
 ]
 # Add any additional origins from settings
-if settings.allowed_origins:
-    allowed_origins.extend(settings.allowed_origins)
+if settings.allowed_origins_list:
+    allowed_origins.extend(settings.allowed_origins_list)
 
 # In debug mode, allow all origins for easier development
 if settings.debug:

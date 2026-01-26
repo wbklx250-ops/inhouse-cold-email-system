@@ -1,7 +1,6 @@
 from functools import lru_cache
 import json
 
-from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,20 +34,17 @@ class Settings(BaseSettings):
     # Each headless Chrome uses ~200-300MB RAM, so 3 = ~1GB RAM needed
     max_parallel_browsers: int = 3
 
-    allowed_origins: list[str] = []
+    allowed_origins: str = ""
     
-    @field_validator('allowed_origins', mode='before')
-    @classmethod
-    def parse_allowed_origins(cls, v):
+    @property
+    def allowed_origins_list(self) -> list[str]:
         """Parse allowed_origins as comma-separated string or JSON array."""
-        if isinstance(v, str):
-            if not v:
-                return []
-            # Handle both comma-separated and JSON array formats
-            if v.startswith('['):
-                return json.loads(v)
-            return [origin.strip() for origin in v.split(',') if origin.strip()]
-        return v
+        if not self.allowed_origins:
+            return []
+        # Handle both comma-separated and JSON array formats
+        if self.allowed_origins.startswith('['):
+            return json.loads(self.allowed_origins)
+        return [origin.strip() for origin in self.allowed_origins.split(',') if origin.strip()]
 
 
 @lru_cache
