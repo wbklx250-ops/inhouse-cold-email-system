@@ -752,9 +752,15 @@ async def batch_create_zones(batch_id: UUID, db: AsyncSession = Depends(get_db))
     await db.commit()
     
     # Determine if we can progress to step 3
-    can_progress = results["failed"] == 0
+    # Allow progress if at least 80% of domains succeeded (handles Cloudflare pending zone limits)
+    total = results["total"]
+    success_count = total - results["failed"]
+    success_rate = success_count / total if total > 0 else 0
+    can_progress = success_rate >= 0.80
     
-    # Update batch step - progress to step 3 if all zones are ready
+    print(f"DEBUG batch_create_zones: Progress check - {success_count}/{total} succeeded ({success_rate*100:.1f}%), can_progress={can_progress}")
+    
+    # Update batch step - progress to step 3 if enough zones are ready (80%+)
     if can_progress and batch.current_step == 2:
         batch.current_step = 3
         if batch.completed_steps is None:
@@ -781,6 +787,12 @@ async def batch_create_zones(batch_id: UUID, db: AsyncSession = Depends(get_db))
     else:
         message = f"Verified {results['already_existed']} existing zones"
     
+    # Add message about failed domains if any
+    if results["failed"] > 0 and can_progress:
+        message = f"{success_count}/{total} domains ready ({results['failed']} failed due to Cloudflare limits - can retry later)"
+    elif results["failed"] > 0:
+        message = f"Too many failures: {results['failed']}/{total} domains failed. Please resolve before continuing."
+    
     return {
         "success": results["failed"] == 0,
         "can_progress": can_progress,
@@ -790,10 +802,13 @@ async def batch_create_zones(batch_id: UUID, db: AsyncSession = Depends(get_db))
             "zones_created": results["created"],
             "zones_already_existed": results["already_existed"],
             "zones_failed": results["failed"],
+            "zones_succeeded": success_count,
+            "success_rate": round(success_rate * 100, 1),
             "dns_verified": results["dns_verified"],
             "redirects_configured": results["redirects_configured"],
             "nameserver_groups": nameserver_groups,
-            "errors": results["errors"]
+            "errors": results["errors"],
+            "failed_domains": [e["domain"] for e in results["errors"]]
         }
     }
 
