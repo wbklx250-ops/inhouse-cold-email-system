@@ -1,21 +1,29 @@
 # Railway Deployment Dockerfile - Cold Email Infrastructure Platform
-FROM python:3.11-slim
+# PINNED to Debian Bookworm for PowerShell compatibility
+
+FROM python:3.11-slim-bookworm
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies (packages for Debian Trixie)
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Chrome/Chromium for Selenium
     chromium \
     chromium-driver \
+    # General utilities
     wget \
     curl \
     gnupg \
     ca-certificates \
+    apt-transport-https \
+    software-properties-common \
+    # Build tools for Python packages
     gcc \
     libpq-dev \
+    # Chrome dependencies
     fonts-liberation \
-    libasound2t64 \
+    libasound2 \
     libatk-bridge2.0-0 \
     libdrm2 \
     libgbm1 \
@@ -27,7 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PowerShell Core
+# Install PowerShell Core (Debian 12 Bookworm)
 RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
     && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/debian/12/prod bookworm main" > /etc/apt/sources.list.d/microsoft.list \
     && apt-get update \
