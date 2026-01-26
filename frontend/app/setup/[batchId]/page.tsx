@@ -588,10 +588,10 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
   useEffect(() => {
     if (!autoCheckEnabled) return;
     
-    // Initial check after 5 seconds
+    // Initial check after 60 seconds (give user time to read the page)
     const initialTimeout = setTimeout(() => {
       handleCheck(true);
-    }, 5000);
+    }, 60000);
 
     // Then check every 15 minutes
     const interval = setInterval(() => {
@@ -801,20 +801,26 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
 
       {/* Retry redirects if some failed */}
       {hasFailedRedirects && (
-        <button
-          onClick={handleRetryRedirects}
-          disabled={retrying}
-          className="w-full py-3 border-2 border-orange-500 text-orange-600 font-bold rounded-lg hover:bg-orange-50 disabled:opacity-50"
-        >
-          {retrying ? (
-            <span className="flex items-center justify-center gap-2">
-              <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-orange-500"></span>
-              Retrying...
-            </span>
-          ) : (
-            `🔁 Retry Failed Redirects (${(status?.domains_total || 0) - (status?.redirects_configured || 0)} pending)`
-          )}
-        </button>
+        <div className="space-y-2">
+          <button
+            onClick={handleRetryRedirects}
+            disabled={retrying}
+            className="w-full py-3 border-2 border-orange-500 text-orange-600 font-bold rounded-lg hover:bg-orange-50 disabled:opacity-50"
+          >
+            {retrying ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-orange-500"></span>
+                Retrying...
+              </span>
+            ) : (
+              `🔁 Retry Failed Redirects (${(status?.domains_total || 0) - (status?.redirects_configured || 0)} pending)`
+            )}
+          </button>
+          <p className="text-xs text-gray-500 text-center">
+            💡 Only domains with Cloudflare zones can have redirects configured. 
+            If domains failed zone creation in Step 2, go back and retry "Create Zones" first.
+          </p>
+        </div>
       )}
 
       {/* Continue options */}
