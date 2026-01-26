@@ -9,9 +9,7 @@ const nextConfig = {
   },
   
   // Configure external packages that need to be bundled
-  experimental: {
-    serverComponentsExternalPackages: [],
-  },
+  serverExternalPackages: [],
   
   // Image optimization (use unoptimized if you have issues)
   images: {
