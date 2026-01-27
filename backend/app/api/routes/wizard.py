@@ -1111,12 +1111,123 @@ async def get_step4_status(batch_id: UUID, db: AsyncSession = Depends(get_db)):
         select(Domain).where(Domain.batch_id == batch_id)
     )).scalars().all()
     
+    # Count failed tenants (have error but not completed)
+    failed_count = sum(1 for t in tenants if t.setup_error and not t.first_login_completed)
+    
     return {
         "tenants_total": len(tenants),
         "tenants_first_login_complete": sum(1 for t in tenants if t.first_login_completed),
         "tenants_linked": sum(1 for t in tenants if t.domain_id),
+        "tenants_failed": failed_count,
         "domains_total": len(domains),
         "ready_for_step5": all(t.first_login_completed and t.domain_id for t in tenants)
+    }
+
+
+@router.post("/batches/{batch_id}/step4/skip-tenant/{tenant_id}")
+async def skip_tenant_first_login(
+    batch_id: UUID,
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """Skip first login for a failed tenant so user can proceed."""
+    tenant = await db.get(Tenant, tenant_id)
+    
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    if tenant.batch_id != batch_id:
+        raise HTTPException(status_code=400, detail="Tenant does not belong to this batch")
+    
+    # Mark as completed (skipped) so it doesn't block progress
+    tenant.first_login_completed = True
+    if not tenant.setup_error:
+        tenant.setup_error = "SKIPPED: Skipped by user"
+    else:
+        tenant.setup_error = f"SKIPPED: {tenant.setup_error}"
+    
+    await db.commit()
+    
+    return {"success": True, "message": f"Skipped tenant {tenant.name}"}
+
+
+@router.post("/batches/{batch_id}/step4/retry-tenant/{tenant_id}")
+async def retry_tenant_first_login(
+    batch_id: UUID,
+    tenant_id: UUID,
+    new_password: str = Form(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    db: AsyncSession = Depends(get_db)
+):
+    """Retry first login for a single tenant."""
+    tenant = await db.get(Tenant, tenant_id)
+    
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    if tenant.batch_id != batch_id:
+        raise HTTPException(status_code=400, detail="Tenant does not belong to this batch")
+    
+    # Clear error and retry
+    tenant.setup_error = None
+    tenant.first_login_completed = False
+    await db.commit()
+    
+    # Queue retry in background
+    tenant_data = [{
+        "tenant_id": str(tenant.id),
+        "admin_email": tenant.admin_email,
+        "initial_password": tenant.admin_password
+    }]
+    
+    async def run_retry():
+        results = await process_tenants_parallel(tenant_data, new_password, max_workers=1)
+        async with AsyncSession(async_engine, expire_on_commit=False) as session:
+            for r in results:
+                t = await session.get(Tenant, UUID(r["tenant_id"]))
+                if t:
+                    t.first_login_completed = r["success"]
+                    t.totp_secret = r["totp_secret"]
+                    t.security_defaults_disabled = r["security_defaults_disabled"]
+                    t.setup_error = r["error"]
+                    if r["success"] and r["new_password"]:
+                        t.admin_password = r["new_password"]
+                        t.password_changed = True
+                        t.first_login_at = datetime.utcnow()
+            await session.commit()
+    
+    background_tasks.add_task(run_retry)
+    
+    return {"success": True, "message": f"Retrying tenant {tenant.name}"}
+
+
+@router.post("/batches/{batch_id}/step4/skip-all-failed")
+async def skip_all_failed_tenants(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """Skip all failed tenants in a batch."""
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.first_login_completed == False,
+            Tenant.setup_error.isnot(None)
+        )
+    )
+    failed_tenants = result.scalars().all()
+    
+    skipped_count = 0
+    for tenant in failed_tenants:
+        tenant.first_login_completed = True
+        tenant.setup_error = f"SKIPPED: {tenant.setup_error}"
+        skipped_count += 1
+    
+    await db.commit()
+    
+    return {
+        "success": True, 
+        "skipped_count": skipped_count,
+        "message": f"Skipped {skipped_count} failed tenant(s)"
     }
 
 

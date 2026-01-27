@@ -874,6 +874,7 @@ interface Step4Status {
   tenants_total: number;
   tenants_first_login_complete: number;
   tenants_linked: number;
+  tenants_failed: number;
   domains_total: number;
   ready_for_step5: boolean;
 }
@@ -1096,16 +1097,84 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
   // Get status icon for a tenant
   const getStatusIcon = (tenant: TenantItem) => {
     if (tenant.first_login_completed) {
-      return <span className="text-green-500" title="Completed">🟢</span>;
+      // Check if it was skipped
+      if (tenant.setup_error?.startsWith('SKIPPED:')) {
+        return <span className="text-yellow-500" title="Skipped">⏭️</span>;
+      }
+      return <span className="text-green-500" title="Completed">✅</span>;
     }
     if (tenant.setup_error) {
-      return <span className="text-red-500" title={tenant.setup_error}>🔴</span>;
+      return <span className="text-red-500" title={tenant.setup_error}>❌</span>;
     }
     if (automating) {
-      return <span className="text-yellow-500 animate-pulse" title="Processing">🟡</span>;
+      return <span className="text-yellow-500 animate-pulse" title="Processing">⏳</span>;
     }
-    return <span className="text-gray-400" title="Pending">⚪</span>;
+    return <span className="text-gray-400" title="Pending">⏳</span>;
   };
+
+  // Skip a single tenant
+  const handleSkipTenant = async (tenantId: string) => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/skip-tenant/${tenantId}`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        fetchStep4Status();
+        fetchTenants();
+        onComplete();
+      }
+    } catch (e) {
+      console.error("Skip tenant error:", e);
+    }
+  };
+
+  // Retry a single tenant
+  const handleRetryTenant = async (tenantId: string) => {
+    if (!newPassword) {
+      alert("Please enter a password first");
+      return;
+    }
+    try {
+      const formData = new FormData();
+      formData.append("new_password", newPassword);
+      
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/retry-tenant/${tenantId}`, {
+        method: "POST",
+        body: formData
+      });
+      if (res.ok) {
+        fetchStep4Status();
+        fetchTenants();
+      }
+    } catch (e) {
+      console.error("Retry tenant error:", e);
+    }
+  };
+
+  // Skip all failed tenants
+  const handleSkipAllFailed = async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/skip-all-failed`, {
+        method: "POST"
+      });
+      if (res.ok) {
+        const data = await res.json();
+        alert(`Skipped ${data.skipped_count} failed tenant(s)`);
+        fetchStep4Status();
+        fetchTenants();
+        onComplete();
+      }
+    } catch (e) {
+      console.error("Skip all failed error:", e);
+    }
+  };
+
+  // Get failed tenants (have error but not completed/skipped)
+  const failedTenants = tenants.filter(t => 
+    t.setup_error && 
+    !t.first_login_completed && 
+    !t.setup_error.startsWith('SKIPPED:')
+  );
 
   // Phase 1: Import UI (no tenants yet)
   if (!status || status.tenants_total === 0) {
@@ -1380,6 +1449,28 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
         </div>
       )}
 
+      {/* Failed Tenants Banner */}
+      {failedTenants.length > 0 && !automating && (
+        <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4">
+          <div className="flex items-center justify-between">
+            <div>
+              <p className="font-medium text-yellow-800">
+                ⚠️ {failedTenants.length} tenant(s) failed automation
+              </p>
+              <p className="text-sm text-yellow-700 mt-1">
+                You can skip failed tenants to continue, or retry them individually.
+              </p>
+            </div>
+            <button
+              onClick={handleSkipAllFailed}
+              className="px-4 py-2 bg-yellow-600 text-white font-bold rounded-lg hover:bg-yellow-700"
+            >
+              Skip All Failed
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Tenant List */}
       <div className="border rounded-lg overflow-hidden">
         <div className="bg-gray-100 px-4 py-2 border-b flex justify-between items-center">
@@ -1393,7 +1484,7 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
           </button>
         </div>
         
-        <div className="max-h-64 overflow-y-auto">
+        <div className="max-h-96 overflow-y-auto">
           {tenants.length === 0 ? (
             <div className="p-4 text-center text-gray-500">
               {loadingTenants ? "Loading tenants..." : "No tenants found"}
@@ -1402,27 +1493,80 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
             <table className="w-full text-sm">
               <thead className="bg-gray-50 sticky top-0">
                 <tr>
-                  <th className="px-4 py-2 text-left">Status</th>
-                  <th className="px-4 py-2 text-left">Tenant Name</th>
-                  <th className="px-4 py-2 text-left">Admin Email</th>
-                  <th className="px-4 py-2 text-left">Domain</th>
+                  <th className="px-3 py-2 text-left w-12">Status</th>
+                  <th className="px-3 py-2 text-left">Tenant Name</th>
+                  <th className="px-3 py-2 text-left">Admin Email</th>
+                  <th className="px-3 py-2 text-left">Domain</th>
+                  <th className="px-3 py-2 text-left">Error</th>
+                  <th className="px-3 py-2 text-left w-28">Actions</th>
                 </tr>
               </thead>
               <tbody className="divide-y">
-                {tenants.map((tenant) => (
-                  <tr key={tenant.id} className="hover:bg-gray-50">
-                    <td className="px-4 py-2 text-center">{getStatusIcon(tenant)}</td>
-                    <td className="px-4 py-2 font-medium">{tenant.name}</td>
-                    <td className="px-4 py-2 text-gray-600 font-mono text-xs">{tenant.admin_email}</td>
-                    <td className="px-4 py-2">
-                      {tenant.custom_domain ? (
-                        <span className="text-green-600">{tenant.custom_domain}</span>
-                      ) : (
-                        <span className="text-gray-400">Not linked</span>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {tenants.map((tenant) => {
+                  const hasFailed = tenant.setup_error && !tenant.first_login_completed;
+                  const isSkipped = tenant.setup_error?.startsWith('SKIPPED:');
+                  
+                  return (
+                    <tr 
+                      key={tenant.id} 
+                      className={`
+                        hover:bg-gray-50
+                        ${hasFailed ? 'bg-red-50' : ''}
+                        ${isSkipped ? 'bg-yellow-50' : ''}
+                      `}
+                    >
+                      <td className="px-3 py-2 text-center">{getStatusIcon(tenant)}</td>
+                      <td className="px-3 py-2 font-medium truncate max-w-[140px]" title={tenant.name}>
+                        {tenant.name}
+                      </td>
+                      <td className="px-3 py-2 text-gray-600 font-mono text-xs truncate max-w-[160px]" title={tenant.admin_email}>
+                        {tenant.admin_email}
+                      </td>
+                      <td className="px-3 py-2">
+                        {tenant.custom_domain ? (
+                          <span className="text-green-600 text-xs">{tenant.custom_domain}</span>
+                        ) : (
+                          <span className="text-gray-400 text-xs">Not linked</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-xs max-w-[180px]">
+                        {tenant.setup_error ? (
+                          <span 
+                            className={`truncate block ${isSkipped ? 'text-yellow-600' : 'text-red-600'}`}
+                            title={tenant.setup_error}
+                          >
+                            {tenant.setup_error}
+                          </span>
+                        ) : (
+                          <span className="text-gray-400">-</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2">
+                        {hasFailed && !isSkipped && (
+                          <div className="flex gap-1">
+                            <button
+                              onClick={() => handleSkipTenant(tenant.id)}
+                              className="px-2 py-1 text-xs bg-gray-200 hover:bg-gray-300 rounded"
+                              title="Skip this tenant"
+                            >
+                              Skip
+                            </button>
+                            <button
+                              onClick={() => handleRetryTenant(tenant.id)}
+                              className="px-2 py-1 text-xs bg-blue-500 hover:bg-blue-600 text-white rounded"
+                              title="Retry this tenant"
+                            >
+                              Retry
+                            </button>
+                          </div>
+                        )}
+                        {isSkipped && (
+                          <span className="text-xs text-yellow-600">Skipped</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
@@ -1430,11 +1574,11 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
       </div>
 
       {/* Status Legend */}
-      <div className="flex gap-4 text-sm text-gray-600">
-        <span>⚪ Pending</span>
-        <span>🟡 Processing</span>
-        <span>🟢 Completed</span>
-        <span>🔴 Failed</span>
+      <div className="flex flex-wrap gap-4 text-sm text-gray-600">
+        <span>⏳ Pending</span>
+        <span>✅ Completed</span>
+        <span>❌ Failed</span>
+        <span>⏭️ Skipped</span>
       </div>
 
       {/* Continue Button */}
