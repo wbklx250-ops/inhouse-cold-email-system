@@ -88,6 +88,20 @@ class Tenant(TimestampUUIDMixin, Base):
     licensed_user_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
     licensed_user_created: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     licensed_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    license_assigned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # === STEP 6 PROGRESS TRACKING ===
+    step6_started: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step6_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    step6_mailboxes_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_display_names_fixed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_accounts_enabled: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_passwords_set: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_upns_fixed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_delegations_done: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step6_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    step6_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # === DOMAIN LINKING ===
     custom_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)

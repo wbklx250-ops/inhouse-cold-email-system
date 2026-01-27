@@ -7,7 +7,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, List, Optional
 from uuid import UUID
 
-from sqlalchemy import DateTime, Enum as SqlEnum, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -62,6 +62,10 @@ class SetupBatch(TimestampUUIDMixin, Base):
     # Completion tracking
     completed_steps: Mapped[Optional[List[int]]] = mapped_column(JSONB, nullable=True, default=list)  # e.g., [1, 2, 3]
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # Step 6 batch-level tracking
+    step6_emails_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step6_emails_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
     # Relationships
     domains: Mapped[list[Domain]] = relationship(

@@ -9,14 +9,15 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks, Response
 from fastapi.responses import StreamingResponse, PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
+from sqlalchemy.orm import selectinload
 from typing import Optional, List
 from pydantic import BaseModel
 from uuid import UUID
 import csv
 import io
 
-from app.db.session import get_db_session as get_db, async_engine, get_db_session_with_retry, RetryableSession
+from app.db.session import get_db_session as get_db, async_engine, get_db_session_with_retry, RetryableSession, SessionLocal, async_session_factory
 from app.services.tenant_import import tenant_import_service
 from app.services.tenant_automation import process_tenants_parallel, get_progress
 from app.services.domain_import import parse_domains_csv, DomainImportData
@@ -25,13 +26,18 @@ from app.models.domain import Domain, DomainStatus
 from app.models.tenant import Tenant, TenantStatus
 from app.models.mailbox import Mailbox, MailboxStatus
 from app.services.cloudflare import cloudflare_service
-from app.services.email_generator import email_generator
+from app.services.email_generator import generate_email_addresses
 from app.services.m365_scripts import m365_scripts
 from app.services.mailbox_scripts import mailbox_scripts
 from app.services.orchestrator import process_batch, SetupConfig
 from app.services.m365_setup import run_step5_for_batch, run_step5_for_tenant, Step5Result
 from app.services.selenium.parallel_processor import run_parallel_step5, DomainTask
 from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress
+from app.services.mailbox_setup import (
+    run_step6_for_batch,
+    get_all_progress as get_step6_all_progress,
+    get_progress as get_step6_progress,
+)
 
 router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
 
@@ -599,217 +605,181 @@ async def batch_import_domains(
 
 
 @router.post("/batches/{batch_id}/step2/create-zones")
-async def batch_create_zones(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+async def batch_create_zones(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
     """
-    Step 2: Create Cloudflare zones for all domains in batch.
-    
-    Handles existing zones:
-    - If domain already has zone_id in DB, verify it exists in Cloudflare
-    - If zone exists in Cloudflare but not in DB, use existing
-    - Ensures DNS records are correct for all zones
-    - Returns can_progress: true when all domains are ready
+    Step 2: Create/verify Cloudflare zones for all domains in the batch.
+    Uses incremental commits to avoid Neon connection timeouts.
+    Advances batch to Step 3 on completion.
     """
-    import asyncio
+    # 1. Verify batch exists and is on correct step
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
     
-    batch = await db.get(SetupBatch, batch_id)
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     
-    # Get ALL domains in batch (not just those without zone_id)
-    result = await db.execute(
-        select(Domain).where(Domain.batch_id == batch_id)
+    # 2. Get all domain IDs upfront (quick query, then release connection)
+    domains_result = await db.execute(
+        select(Domain.id, Domain.name, Domain.cloudflare_zone_id, Domain.redirect_url, Domain.redirect_configured)
+        .where(Domain.batch_id == batch_id)
     )
-    domains = result.scalars().all()
+    domain_list = domains_result.all()
     
-    if not domains:
-        raise HTTPException(status_code=404, detail="No domains found in batch")
+    if not domain_list:
+        raise HTTPException(status_code=400, detail="No domains found in batch")
     
-    results = {
-        "total": len(domains),
-        "already_existed": 0,
-        "created": 0,
-        "failed": 0,
-        "dns_verified": 0,
-        "redirects_configured": 0,
-        "errors": []
-    }
+    # Get redirect URL from batch
+    redirect_url = batch.redirect_url or "https://example.com"
     
-    ns_groups: dict = {}
+    # 3. Process each domain with individual commits (prevents Neon timeout)
+    results = []
+    success_count = 0
+    error_count = 0
     
-    print(f"DEBUG batch_create_zones: Processing {len(domains)} domains (including existing)")
-    
-    for domain in domains:
+    for domain_id, domain_name, existing_zone_id, domain_redirect_url, redirect_configured in domain_list:
         try:
-            await asyncio.sleep(0.25)  # Rate limiting
-            
-            zone_id = None
+            zone_data = None
             nameservers = []
             zone_status = "pending"
-            zone_already_existed = False
             
-            # CASE 1: Domain already has zone_id in database
-            if domain.cloudflare_zone_id:
-                print(f"DEBUG batch_create_zones: {domain.name} has zone_id in DB: {domain.cloudflare_zone_id}")
-                
-                # Verify zone still exists in Cloudflare
-                existing = await cloudflare_service.get_zone_by_id(domain.cloudflare_zone_id)
-                
-                if existing:
-                    # Zone exists - use it
-                    zone_id = existing["zone_id"]
-                    nameservers = existing.get("nameservers", [])
-                    zone_status = existing.get("status", "pending")
-                    zone_already_existed = True
-                    results["already_existed"] += 1
-                    print(f"DEBUG batch_create_zones: {domain.name} zone verified in CF")
+            # Check if zone already exists in DB
+            if existing_zone_id:
+                print(f"DEBUG batch_create_zones: {domain_name} has zone_id in DB: {existing_zone_id}")
+                # Verify it still exists in Cloudflare
+                zone_info = await cloudflare_service.get_zone_by_id(existing_zone_id)
+                if zone_info:
+                    print(f"DEBUG batch_create_zones: {domain_name} zone verified in CF")
+                    zone_data = zone_info
+                    nameservers = zone_info.get("nameservers", [])
+                    zone_status = zone_info.get("status", "pending")
                 else:
-                    # Zone was deleted from Cloudflare, clear the ID and recreate
-                    print(f"DEBUG batch_create_zones: {domain.name} zone NOT found in CF, will recreate")
-                    domain.cloudflare_zone_id = None
+                    # Zone was deleted from CF, need to recreate
+                    print(f"DEBUG batch_create_zones: {domain_name} zone NOT found in CF, recreating")
+                    existing_zone_id = None
             
-            # CASE 2: No zone_id in DB (or was cleared above), get or create zone
-            if not zone_id:
-                zone_result = await cloudflare_service.get_or_create_zone(domain.name)
-                print(f"DEBUG batch_create_zones: get_or_create_zone for {domain.name} = {zone_result}")
-                
-                if zone_result.get('zone_id'):
-                    zone_id = zone_result['zone_id']
-                    nameservers = zone_result.get('nameservers', [])
-                    zone_status = zone_result.get('status', 'pending')
-                    zone_already_existed = zone_result.get('already_existed', False)
-                    
-                    if zone_already_existed:
-                        results["already_existed"] += 1
-                    else:
-                        results["created"] += 1
-                        
-                        # Create Phase 1 DNS (CNAME @ -> www, DMARC) for new zones only
-                        await asyncio.sleep(0.25)
-                        await cloudflare_service.create_phase1_dns(zone_id, domain.name)
-                        domain.phase1_cname_added = True
-                        domain.phase1_dmarc_added = True
+            # Create zone if needed
+            if not existing_zone_id:
+                print(f"DEBUG batch_create_zones: Creating zone for {domain_name}")
+                zone_result = await cloudflare_service.get_or_create_zone(domain_name)
+                if zone_result:
+                    zone_data = zone_result
+                    existing_zone_id = zone_result.get("zone_id")
+                    nameservers = zone_result.get("nameservers", [])
+                    zone_status = zone_result.get("status", "pending")
+                    print(f"DEBUG batch_create_zones: get_or_create_zone for {domain_name} = {zone_result}")
                 else:
-                    results["failed"] += 1
-                    results["errors"].append({
-                        "domain": domain.name,
-                        "error": zone_result.get('error', 'Unknown error creating zone')
-                    })
-                    print(f"DEBUG batch_create_zones: Failed to get/create zone for {domain.name}")
-                    continue
+                    raise Exception("Failed to create Cloudflare zone")
             
-            # Update domain record with zone info
-            domain.cloudflare_zone_id = zone_id
-            domain.cloudflare_nameservers = nameservers
-            domain.cloudflare_zone_status = zone_status
-            domain.status = DomainStatus.ZONE_CREATED if zone_status == "pending" else DomainStatus.NS_PROPAGATED
-            
-            # Group by NS for display
-            if nameservers:
-                ns_key = tuple(sorted(nameservers))
-            else:
-                ns_key = ("nameservers-pending",)
-                print(f"DEBUG batch_create_zones: WARNING - No nameservers for {domain.name}")
-            
-            if ns_key not in ns_groups:
-                ns_groups[ns_key] = []
-            ns_groups[ns_key].append(domain.name)
-            
-            # Ensure DNS records are correct (idempotent - safe to call multiple times)
-            try:
-                await asyncio.sleep(0.25)
-                await cloudflare_service.ensure_email_dns_records(zone_id, domain.name)
-                results["dns_verified"] += 1
-                print(f"DEBUG batch_create_zones: DNS records verified for {domain.name}")
-            except Exception as dns_e:
-                print(f"DEBUG batch_create_zones: DNS verification error for {domain.name}: {dns_e}")
-            
-            # Setup redirect if configured (idempotent)
-            redirect_url = domain.redirect_url or batch.redirect_url
-            if redirect_url and not domain.redirect_configured:
-                await asyncio.sleep(0.25)
-                try:
-                    redirect_result = await cloudflare_service.create_redirect_rule(
-                        zone_id, domain.name, redirect_url
+            # Ensure DNS records exist
+            if existing_zone_id:
+                await cloudflare_service.ensure_email_dns_records(
+                    existing_zone_id,
+                    domain_name
+                )
+                print(f"DEBUG batch_create_zones: DNS records verified for {domain_name}")
+                
+                # Create redirect rule if not already configured
+                actual_redirect = domain_redirect_url or redirect_url
+                if actual_redirect:
+                    await cloudflare_service.create_redirect_rule(
+                        existing_zone_id,
+                        domain_name,
+                        actual_redirect
                     )
-                    if redirect_result.get('success'):
-                        domain.redirect_configured = True
-                        results["redirects_configured"] += 1
-                        print(f"DEBUG batch_create_zones: Redirect configured for {domain.name}")
-                except Exception as re:
-                    print(f"DEBUG batch_create_zones: Redirect exception for {domain.name}: {re}")
-            elif domain.redirect_configured:
-                results["redirects_configured"] += 1
-        
+                    print(f"DEBUG batch_create_zones: Redirect configured for {domain_name}")
+            
+            # Determine status based on zone status
+            domain_status = "ns_propagated" if zone_status == "active" else "zone_created"
+            
+            # 4. COMMIT THIS DOMAIN IMMEDIATELY (fresh session to avoid timeout)
+            async with async_session_factory() as fresh_db:
+                await fresh_db.execute(
+                    update(Domain)
+                    .where(Domain.id == domain_id)
+                    .values(
+                        status=domain_status,
+                        cloudflare_zone_id=existing_zone_id,
+                        cloudflare_nameservers=nameservers,
+                        cloudflare_zone_status=zone_status,
+                        redirect_configured=True,
+                        updated_at=func.now()
+                    )
+                )
+                await fresh_db.commit()
+            
+            results.append({
+                "domain": domain_name,
+                "success": True,
+                "zone_id": existing_zone_id,
+                "status": domain_status,
+                "nameservers": nameservers
+            })
+            success_count += 1
+            
         except Exception as e:
-            results["failed"] += 1
-            results["errors"].append({
-                "domain": domain.name,
+            print(f"ERROR batch_create_zones: {domain_name} failed: {str(e)}")
+            results.append({
+                "domain": domain_name,
+                "success": False,
                 "error": str(e)
             })
-            domain.error_message = str(e)
-            print(f"DEBUG batch_create_zones: Exception for {domain.name}: {e}")
+            error_count += 1
     
-    await db.commit()
+    # 5. ALL DOMAINS PROCESSED - Now advance the batch to Step 3
+    can_progress = error_count == 0
     
-    # Determine if we can progress to step 3
-    # Allow progress if at least 80% of domains succeeded (handles Cloudflare pending zone limits)
-    total = results["total"]
-    success_count = total - results["failed"]
-    success_rate = success_count / total if total > 0 else 0
-    can_progress = success_rate >= 0.80
+    # Always try to advance if we had any success (allow partial progress)
+    # Or if all succeeded
+    if success_count > 0:
+        try:
+            async with async_session_factory() as final_db:
+                # Update batch to Step 3
+                await final_db.execute(
+                    update(SetupBatch)
+                    .where(SetupBatch.id == batch_id)
+                    .values(
+                        current_step=3,
+                        updated_at=func.now()
+                    )
+                )
+                
+                # Also update completed_steps if that column is used
+                # Using raw SQL to handle JSONB array append
+                await final_db.execute(
+                    text("""
+                        UPDATE setup_batches 
+                        SET completed_steps = COALESCE(completed_steps, '[]'::jsonb) || '2'::jsonb
+                        WHERE id = :batch_id 
+                        AND NOT (COALESCE(completed_steps, '[]'::jsonb) @> '2'::jsonb)
+                    """),
+                    {"batch_id": str(batch_id)}
+                )
+                
+                await final_db.commit()
+                print(f"DEBUG batch_create_zones: Batch {batch_id} advanced to Step 3")
+                
+        except Exception as e:
+            print(f"ERROR batch_create_zones: Failed to advance batch: {str(e)}")
+            # Don't fail the whole request if just the step update fails
+            # The domains are already processed
     
-    print(f"DEBUG batch_create_zones: Progress check - {success_count}/{total} succeeded ({success_rate*100:.1f}%), can_progress={can_progress}")
-    
-    # Update batch step - progress to step 3 if enough zones are ready (80%+)
-    if can_progress and batch.current_step == 2:
-        batch.current_step = 3
-        if batch.completed_steps is None:
-            batch.completed_steps = []
-        if 2 not in batch.completed_steps:
-            batch.completed_steps = batch.completed_steps + [2]
-        await db.commit()
-    
-    nameserver_groups = [
-        {"nameservers": list(ns), "domain_count": len(doms), "domains": doms}
-        for ns, doms in ns_groups.items()
-    ]
-    
-    print(f"DEBUG batch_create_zones: Results = {results}")
-    print(f"DEBUG batch_create_zones: can_progress = {can_progress}")
-    
-    # Build message
-    if results["already_existed"] == results["total"]:
-        message = f"All {results['total']} zones already exist and verified"
-    elif results["created"] > 0 and results["already_existed"] > 0:
-        message = f"Created {results['created']} new zones, {results['already_existed']} already existed"
-    elif results["created"] > 0:
-        message = f"Created {results['created']} zones"
-    else:
-        message = f"Verified {results['already_existed']} existing zones"
-    
-    # Add message about failed domains if any
-    if results["failed"] > 0 and can_progress:
-        message = f"{success_count}/{total} domains ready ({results['failed']} failed due to Cloudflare limits - can retry later)"
-    elif results["failed"] > 0:
-        message = f"Too many failures: {results['failed']}/{total} domains failed. Please resolve before continuing."
-    
+    # 6. Return comprehensive response
     return {
-        "success": results["failed"] == 0,
+        "success": can_progress,
+        "message": f"Processed {success_count}/{len(domain_list)} domains successfully",
         "can_progress": can_progress,
-        "message": message,
-        "details": {
-            "total": results["total"],
-            "zones_created": results["created"],
-            "zones_already_existed": results["already_existed"],
-            "zones_failed": results["failed"],
-            "zones_succeeded": success_count,
-            "success_rate": round(success_rate * 100, 1),
-            "dns_verified": results["dns_verified"],
-            "redirects_configured": results["redirects_configured"],
-            "nameserver_groups": nameserver_groups,
-            "errors": results["errors"],
-            "failed_domains": [e["domain"] for e in results["errors"]]
-        }
+        "current_step": 3 if success_count > 0 else 2,
+        "summary": {
+            "total": len(domain_list),
+            "success": success_count,
+            "errors": error_count
+        },
+        "results": results
     }
 
 
@@ -2152,6 +2122,300 @@ async def retry_failed_tenants(
     }
 
 
+# =============================================================================
+# STEP 6: MAILBOX CREATION ENDPOINTS
+# =============================================================================
+
+
+@router.get("/batches/{batch_id}/step6/status")
+async def get_step6_status(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get Step 6 status for all tenants in batch."""
+
+    # Get batch info
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    # Get tenants with mailbox counts
+    result = await db.execute(
+        select(Tenant).where(Tenant.batch_id == batch_id)
+    )
+    tenants = result.scalars().all()
+
+    tenant_statuses = []
+    for tenant in tenants:
+        # Count mailboxes for this tenant
+        mailbox_result = await db.execute(
+            select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+        )
+        mailbox_count = mailbox_result.scalar() or 0
+
+        # Get live progress if available
+        live_progress = get_step6_progress(str(tenant.id))
+
+        tenant_statuses.append(
+            {
+                "tenant_id": str(tenant.id),
+                "name": tenant.name,
+                "domain": tenant.custom_domain,
+                "onmicrosoft_domain": tenant.onmicrosoft_domain,
+                "step5_complete": tenant.domain_verified_in_m365 and tenant.dkim_enabled,
+                "step6_started": tenant.step6_started,
+                "step6_complete": tenant.step6_complete,
+                "step6_error": tenant.step6_error,
+                "licensed_user": tenant.licensed_user_email,
+                "mailbox_count": mailbox_count,
+                "progress": {
+                    "mailboxes_created": tenant.step6_mailboxes_created,
+                    "display_names_fixed": tenant.step6_display_names_fixed,
+                    "accounts_enabled": tenant.step6_accounts_enabled,
+                    "passwords_set": tenant.step6_passwords_set,
+                    "upns_fixed": tenant.step6_upns_fixed,
+                    "delegations_done": tenant.step6_delegations_done,
+                },
+                "live_progress": {
+                    "step": live_progress.get("step", ""),
+                    "status": live_progress.get("status", ""),
+                    "detail": live_progress.get("detail", ""),
+                    "active": bool(live_progress),
+                },
+            }
+        )
+
+    # Summary stats
+    total = len(tenants)
+    step5_complete = sum(1 for t in tenant_statuses if t["step5_complete"])
+    step6_complete = sum(1 for t in tenant_statuses if t["step6_complete"])
+    step6_errors = sum(1 for t in tenant_statuses if t["step6_error"])
+
+    return {
+        "batch_id": str(batch_id),
+        "display_name": f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
+        or None,
+        "summary": {
+            "total_tenants": total,
+            "step5_complete": step5_complete,
+            "step6_complete": step6_complete,
+            "step6_errors": step6_errors,
+            "ready_for_step6": step5_complete - step6_complete - step6_errors,
+        },
+        "tenants": tenant_statuses,
+    }
+
+
+@router.post("/batches/{batch_id}/step6/start")
+async def start_step6_automation(
+    batch_id: UUID,
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Start Step 6 automation for a batch."""
+
+    display_name = request.get("display_name", "").strip()
+    if not display_name or " " not in display_name:
+        raise HTTPException(
+            400, "Display name must include first and last name (e.g., 'Jack Zuvelek')"
+        )
+
+    # Verify batch exists
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    # Check if there are eligible tenants
+    tenant_result = await db.execute(
+        select(func.count(Tenant.id)).where(
+            Tenant.batch_id == batch_id,
+            Tenant.domain_verified_in_m365 == True,
+            Tenant.step6_complete == False,
+        )
+    )
+    eligible_count = tenant_result.scalar() or 0
+
+    if eligible_count == 0:
+        raise HTTPException(
+            400, "No eligible tenants for Step 6 (need Step 5 complete, Step 6 not complete)"
+        )
+
+    # Start automation in background
+    background_tasks.add_task(run_step6_for_batch, batch_id, display_name, db)
+
+    return {
+        "success": True,
+        "message": f"Started Step 6 for {eligible_count} tenant(s)",
+        "display_name": display_name,
+    }
+
+
+@router.get("/batches/{batch_id}/step6/automation-status")
+async def get_step6_automation_status(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get real-time automation status for Step 6."""
+
+    # Get tenants
+    result = await db.execute(
+        select(Tenant).where(Tenant.batch_id == batch_id)
+    )
+    tenants = result.scalars().all()
+
+    # Get live progress
+    all_progress = get_step6_all_progress()
+
+    statuses = []
+    for tenant in tenants:
+        progress = all_progress.get(str(tenant.id), {})
+        statuses.append(
+            {
+                "tenant_id": str(tenant.id),
+                "domain": tenant.custom_domain,
+                "step": progress.get("step", ""),
+                "status": progress.get("status", ""),
+                "detail": progress.get("detail", ""),
+                "db_complete": tenant.step6_complete,
+                "db_error": tenant.step6_error,
+            }
+        )
+
+    # Count active
+    active = sum(1 for s in statuses if s["status"] == "in_progress")
+    complete = sum(1 for s in statuses if s["db_complete"])
+    errors = sum(1 for s in statuses if s["db_error"])
+
+    return {
+        "active": active,
+        "complete": complete,
+        "errors": errors,
+        "total": len(tenants),
+        "tenants": statuses,
+    }
+
+
+@router.get("/batches/{batch_id}/step6/export-csv")
+async def export_mailboxes_csv(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Export all mailboxes as CSV (DisplayName,EmailAddress,Password)."""
+    from fastapi.responses import StreamingResponse
+    import csv
+    import io
+
+    # Get batch for display name
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    display_name = f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
+
+    # Get all tenants with their mailboxes
+    result = await db.execute(
+        select(Tenant)
+        .where(Tenant.batch_id == batch_id)
+        .options(selectinload(Tenant.mailboxes))
+    )
+    tenants = result.scalars().all()
+
+    # Build CSV
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["DisplayName", "EmailAddress", "Password"])
+
+    for tenant in tenants:
+        # First row: Licensed user (me1)
+        if tenant.licensed_user_email:
+            writer.writerow(
+                [
+                    display_name or "Licensed User",
+                    tenant.licensed_user_email,
+                    tenant.licensed_user_password or "#Sendemails1",
+                ]
+            )
+
+        # Mailboxes
+        for mailbox in tenant.mailboxes:
+            writer.writerow(
+                [
+                    mailbox.display_name,
+                    mailbox.email,
+                    mailbox.password,
+                ]
+            )
+
+    output.seek(0)
+
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={
+            "Content-Disposition": f"attachment; filename=mailboxes_batch_{batch_id}.csv"
+        },
+    )
+
+
+@router.post("/tenants/{tenant_id}/step6/retry")
+async def retry_step6_for_tenant(
+    tenant_id: UUID,
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry Step 6 for a single tenant."""
+
+    display_name = request.get("display_name", "").strip()
+    if not display_name:
+        raise HTTPException(400, "Display name required")
+
+    # Get tenant
+    result = await db.execute(
+        select(Tenant).where(Tenant.id == tenant_id)
+    )
+    tenant = result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+
+    # Reset step 6 status
+    tenant.step6_started = False
+    tenant.step6_complete = False
+    tenant.step6_error = None
+    await db.commit()
+
+    # Prepare tenant data
+    tenant_data = {
+        "id": str(tenant.id),
+        "name": tenant.name,
+        "custom_domain": tenant.custom_domain,
+        "onmicrosoft_domain": tenant.onmicrosoft_domain,
+        "admin_email": tenant.admin_email,
+        "admin_password": tenant.admin_password,
+        "totp_secret": tenant.totp_secret,
+    }
+
+    # Run in background
+    from app.services.mailbox_setup import run_step6_for_tenant_sync
+
+    background_tasks.add_task(run_step6_for_tenant_sync, tenant_data, display_name)
+
+    return {
+        "success": True,
+        "message": f"Retrying Step 6 for {tenant.custom_domain}",
+    }
+
+
 @router.post("/batches/{batch_id}/step6/generate-mailboxes", response_model=StepResult)
 async def batch_generate_mailboxes(
     batch_id: UUID,
@@ -2186,7 +2450,7 @@ async def batch_generate_mailboxes(
         if not domain:
             continue
         
-        mailbox_data = email_generator.generate(first_name, last_name, domain.name, count)
+        mailbox_data = generate_email_addresses(first_name, last_name, domain.name, count)
         
         for mb_data in mailbox_data:
             existing = await db.execute(select(Mailbox).where(Mailbox.email == mb_data['email']))
@@ -2811,7 +3075,7 @@ async def wizard_generate_mailboxes(
                 continue
             
             # Generate email variations (NO NUMBERS!)
-            mailbox_data = email_generator.generate(
+            mailbox_data = generate_email_addresses(
                 first_name=first_name,
                 last_name=last_name,
                 domain=domain.name,

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 
 interface WizardStatus {
@@ -68,9 +68,13 @@ export default function BatchWizard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [activeStep, setActiveStep] = useState(1);
+  const [nameserversConfirmed, setNameserversConfirmed] = useState(false);
 
   useEffect(() => {
-    if (batchId) loadStatus();
+    if (batchId) {
+      setNameserversConfirmed(false);
+      loadStatus();
+    }
   }, [batchId]);
 
   const loadStatus = async () => {
@@ -131,7 +135,19 @@ export default function BatchWizard() {
       <div className="max-w-4xl mx-auto px-4 pb-12">
         <div className="bg-white rounded-lg shadow-lg p-8">
           {activeStep === 1 && <Step1Domains batchId={batchId} status={status} onComplete={loadStatus} />}
-          {activeStep === 2 && <Step2Zones batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 2 && (
+            <Step2Zones
+              batchId={batchId}
+              status={status}
+              onComplete={loadStatus}
+              nameserversConfirmed={nameserversConfirmed}
+              onConfirmNameservers={async () => {
+                setNameserversConfirmed(true);
+                await loadStatus();
+                setActiveStep(3);
+              }}
+            />
+          )}
           {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(4)} />}
           {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={loadStatus} />}
           {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(6)} />}
@@ -278,13 +294,26 @@ outbound-mail.co,https://example.com,porkbun`}</pre>
 // Continue with Step2Zones, Step3Propagation, Step4Tenants, Step5M365, Step6Mailboxes, StepComplete
 // Each one follows the same pattern: pass batchId to postStep(batchId, "/stepX/...", formData)
 
-function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+function Step2Zones({
+  batchId,
+  status,
+  onComplete,
+  nameserversConfirmed,
+  onConfirmNameservers,
+}: {
+  batchId: string;
+  status: WizardStatus | null;
+  onComplete: () => void;
+  nameserversConfirmed: boolean;
+  onConfirmNameservers: () => void;
+}) {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<any>(null);
   const [error, setError] = useState<string | null>(null);
   const [autoProgressed, setAutoProgressed] = useState(false);
   const [nsGroups, setNsGroups] = useState<NameserverGroup[]>([]);
   const [nsLoading, setNsLoading] = useState(false);
+  const [confirmationChecked, setConfirmationChecked] = useState(false);
 
   // Auto-fetch nameserver groups if zones already exist (resuming session)
   useEffect(() => {
@@ -347,6 +376,8 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
   // - If we just created zones (result exists), use the result's groups
   // - Otherwise, use the auto-fetched groups (from persistent state)
   const displayNsGroups: NameserverGroup[] = result?.details?.nameserver_groups || nsGroups;
+  const multipleGroups = displayNsGroups.length > 1;
+  const needsNameserverUpdate = displayNsGroups.length > 0;
 
   // Check if zones are already created (from a previous session)
   const zonesAlreadyCreated = status && status.zones_created > 0 && status.zones_pending === 0;
@@ -388,7 +419,7 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
       {autoProgressed && (
         <div className="bg-green-50 border border-green-200 rounded-lg p-4">
           <p className="text-green-800 font-medium">
-            ✅ All zones verified! Automatically advancing to Step 3...
+            ✅ All zones verified! You can continue to Step 3 once you update nameservers.
           </p>
         </div>
       )}
@@ -421,7 +452,7 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
             )}
           </button>
         </>
-      ) : result && !autoProgressed ? (
+      ) : result ? (
         <div className="space-y-6">
           {/* Success summary */}
           <div className={`border rounded-lg p-4 ${result.success ? 'bg-green-50 border-green-200' : 'bg-yellow-50 border-yellow-200'}`}>
@@ -473,6 +504,12 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
                   Copy the nameservers below and update them at your domain registrar.
                   Domains are grouped by their assigned nameservers.
                 </p>
+                {multipleGroups && (
+                  <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm text-yellow-800">
+                    ⚠️ This batch has {displayNsGroups.length} different nameserver groups. Make sure each
+                    domain uses the correct nameserver pair.
+                  </div>
+                )}
               </div>
 
               {displayNsGroups.map((g, i) => (
@@ -535,17 +572,42 @@ function Step2Zones({ batchId, status, onComplete }: { batchId: string; status: 
               </p>
             </div>
           )}
+          {needsNameserverUpdate && (
+            <label className="flex items-start gap-3 bg-gray-50 border border-gray-200 rounded-lg p-4">
+              <input
+                type="checkbox"
+                checked={confirmationChecked}
+                onChange={(e) => {
+                  setConfirmationChecked(e.target.checked);
+                  if (e.target.checked && !nameserversConfirmed) {
+                    onConfirmNameservers();
+                  }
+                }}
+                className="mt-1 rounded"
+              />
+              <span className="text-sm text-gray-700">
+                I’ve updated the nameservers at my registrar for <strong>all</strong> domains above.
+              </span>
+            </label>
+          )}
 
-          <button 
-            onClick={onComplete} 
+          <button
+            onClick={async () => {
+              if (!nameserversConfirmed && confirmationChecked) {
+                onConfirmNameservers();
+              } else {
+                await onComplete();
+              }
+            }}
+            disabled={needsNameserverUpdate && !confirmationChecked}
             className={`w-full py-4 text-white text-lg font-bold rounded-lg ${
-              result.can_progress 
-                ? 'bg-green-600 hover:bg-green-700' 
+              result.can_progress
+                ? 'bg-green-600 hover:bg-green-700'
                 : 'bg-blue-600 hover:bg-blue-700'
-            }`}
+            } ${needsNameserverUpdate && !confirmationChecked ? 'opacity-50 cursor-not-allowed' : ''}`}
           >
-            {result.can_progress 
-              ? "Continue to Nameserver Verification →" 
+            {result.can_progress
+              ? "Continue to Nameserver Verification →"
               : "I've Updated Nameservers → Continue"
             }
           </button>
@@ -690,6 +752,11 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
       ) : nsGroups.length > 0 && (
         <div className="border rounded-lg p-4 bg-gray-50">
           <h3 className="font-bold text-gray-900 mb-3">📋 Nameservers to Update at Your Registrar</h3>
+          {nsGroups.length > 1 && (
+            <div className="mb-3 bg-yellow-50 border border-yellow-200 rounded-lg p-2 text-sm text-yellow-800">
+              ⚠️ Multiple nameserver groups detected. Make sure each domain uses its assigned pair.
+            </div>
+          )}
           <div className="space-y-3">
             {nsGroups.map((g, i) => (
               <div key={i} className="bg-white rounded-lg p-3 border">
@@ -2094,69 +2161,421 @@ function Step5M365({ batchId, status, onComplete, onNext }: { batchId: string; s
   );
 }
 
+interface TenantStep6Status {
+  tenant_id: string;
+  name: string;
+  domain: string;
+  onmicrosoft_domain: string;
+  step5_complete: boolean;
+  step6_started: boolean;
+  step6_complete: boolean;
+  step6_error: string | null;
+  licensed_user: string | null;
+  mailbox_count: number;
+  progress: {
+    mailboxes_created: number;
+    display_names_fixed: number;
+    accounts_enabled: number;
+    passwords_set: number;
+    upns_fixed: number;
+    delegations_done: number;
+  };
+  live_progress: {
+    step: string;
+    status: string;
+    detail: string;
+    active: boolean;
+  };
+}
+
+interface Step6DetailedStatus {
+  batch_id: string;
+  display_name: string | null;
+  summary: {
+    total_tenants: number;
+    step5_complete: number;
+    step6_complete: number;
+    step6_errors: number;
+    ready_for_step6: number;
+  };
+  tenants: TenantStep6Status[];
+}
+
 function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
-  const [firstName, setFirstName] = useState("");
-  const [lastName, setLastName] = useState("");
-  const [count, setCount] = useState(50);
-  const [generating, setGenerating] = useState(false);
-  const [creating, setCreating] = useState(false);
+  const [step6Status, setStep6Status] = useState<Step6DetailedStatus | null>(null);
+  const [displayName, setDisplayName] = useState("");
+  const [isLoading, setIsLoading] = useState(true);
+  const [isStarting, setIsStarting] = useState(false);
+  const [isAutomationRunning, setIsAutomationRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleGenerate = async () => {
-    setGenerating(true);
-    const formData = new FormData();
-    formData.append("first_name", firstName);
-    formData.append("last_name", lastName);
-    formData.append("count", count.toString());
-    await postStep(batchId, "/step6/generate-mailboxes", formData);
-    onComplete();
-    setGenerating(false);
+  // Fetch step6 status
+  const fetchStep6Status = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/status`);
+      if (!response.ok) throw new Error("Failed to fetch status");
+      const data = await response.json();
+      setStep6Status(data);
+      
+      // Set display name from batch if available
+      if (data.display_name && !displayName) {
+        setDisplayName(data.display_name);
+      }
+      
+      // Check if automation is running
+      const hasActiveProgress = data.tenants.some((t: TenantStep6Status) => t.live_progress.active);
+      setIsAutomationRunning(hasActiveProgress);
+      
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to fetch status");
+    } finally {
+      setIsLoading(false);
+    }
+  }, [batchId, displayName]);
+
+  // Initial fetch and polling
+  useEffect(() => {
+    fetchStep6Status();
+    
+    // Poll more frequently when automation is running
+    const interval = setInterval(fetchStep6Status, isAutomationRunning ? 3000 : 10000);
+    return () => clearInterval(interval);
+  }, [fetchStep6Status, isAutomationRunning]);
+
+  // Start automation
+  const handleStartAutomation = async () => {
+    if (!displayName.trim() || !displayName.includes(" ")) {
+      setError("Please enter a full name (first and last name)");
+      return;
+    }
+
+    setIsStarting(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/start`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: displayName.trim() }),
+      });
+
+      if (!response.ok) {
+        const data = await response.json();
+        throw new Error(data.detail || "Failed to start automation");
+      }
+
+      setIsAutomationRunning(true);
+      fetchStep6Status();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to start automation");
+    } finally {
+      setIsStarting(false);
+    }
   };
 
-  const handleCreate = async () => {
-    setCreating(true);
-    await postStep(batchId, "/step6/create-mailboxes");
-    onComplete();
-    setCreating(false);
+  // Download CSV
+  const handleDownloadCSV = async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/export-csv`);
+      if (!response.ok) throw new Error("Failed to download CSV");
+      
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `mailboxes_${batchId}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to download CSV");
+    }
   };
+
+  // Get status icon
+  const getStatusIcon = (tenant: TenantStep6Status) => {
+    if (tenant.step6_complete) return "✅";
+    if (tenant.step6_error) return "❌";
+    if (tenant.live_progress.active) return "🔄";
+    if (tenant.step6_started) return "⏳";
+    if (!tenant.step5_complete) return "⚪";
+    return "🟡";
+  };
+
+  // Get progress percentage
+  const getProgressPercent = (tenant: TenantStep6Status) => {
+    const total = 50 * 6; // 50 mailboxes × 6 steps
+    const done = 
+      tenant.progress.mailboxes_created +
+      tenant.progress.display_names_fixed +
+      tenant.progress.accounts_enabled +
+      tenant.progress.passwords_set +
+      tenant.progress.upns_fixed +
+      tenant.progress.delegations_done;
+    return Math.round((done / total) * 100);
+  };
+
+  if (isLoading) {
+    return (
+      <div className="text-center py-8">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto"></div>
+        <p className="mt-4 text-gray-600">Loading Step 6...</p>
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-6">
-      <h2 className="text-xl font-bold">Step 6: Mailboxes</h2>
-      <div className="grid grid-cols-3 gap-4 text-center">
-        <div className="bg-gray-50 p-4 rounded-lg">
-          <p className="text-3xl font-bold">{status?.mailboxes_total || 0}</p>
-          <p className="text-sm">Total</p>
+      {/* Header */}
+      <div>
+        <h2 className="text-xl font-bold text-gray-900">Step 6: Create Mailboxes</h2>
+        <p className="text-gray-600 mt-2">
+          Create 50 shared mailboxes per tenant and delegate to licensed user.
+        </p>
+      </div>
+
+      {/* Error Alert */}
+      {error && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-red-800">{error}</p>
+          <button
+            onClick={() => setError(null)}
+            className="mt-2 text-sm text-red-600 hover:text-red-800"
+          >
+            Dismiss
+          </button>
         </div>
-        <div className="bg-yellow-50 p-4 rounded-lg">
-          <p className="text-3xl font-bold text-yellow-600">{status?.mailboxes_pending || 0}</p>
-          <p className="text-sm">Pending</p>
+      )}
+
+      {/* Summary Cards */}
+      {step6Status && (
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+          <div className="bg-white rounded-lg shadow p-4 text-center">
+            <div className="text-3xl font-bold text-gray-900">{step6Status.summary.total_tenants}</div>
+            <div className="text-sm text-gray-500">Total Tenants</div>
+          </div>
+          <div className="bg-white rounded-lg shadow p-4 text-center">
+            <div className="text-3xl font-bold text-blue-600">{step6Status.summary.step5_complete}</div>
+            <div className="text-sm text-gray-500">Step 5 Complete</div>
+          </div>
+          <div className="bg-white rounded-lg shadow p-4 text-center">
+            <div className="text-3xl font-bold text-yellow-600">{step6Status.summary.ready_for_step6}</div>
+            <div className="text-sm text-gray-500">Ready for Step 6</div>
+          </div>
+          <div className="bg-white rounded-lg shadow p-4 text-center">
+            <div className="text-3xl font-bold text-green-600">{step6Status.summary.step6_complete}</div>
+            <div className="text-sm text-gray-500">Step 6 Complete</div>
+          </div>
+          <div className="bg-white rounded-lg shadow p-4 text-center">
+            <div className="text-3xl font-bold text-red-600">{step6Status.summary.step6_errors}</div>
+            <div className="text-sm text-gray-500">Errors</div>
+          </div>
         </div>
-        <div className="bg-green-50 p-4 rounded-lg">
-          <p className="text-3xl font-bold text-green-600">{status?.mailboxes_ready || 0}</p>
-          <p className="text-sm">Ready</p>
+      )}
+
+      {/* Configuration Panel */}
+      <div className="bg-white rounded-lg shadow p-6">
+        <h3 className="text-lg font-semibold text-gray-900 mb-4">Configuration</h3>
+        
+        <div className="grid md:grid-cols-2 gap-6">
+          {/* Display Name Input */}
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Display Name (for all mailboxes)
+            </label>
+            <input
+              type="text"
+              value={displayName}
+              onChange={(e) => setDisplayName(e.target.value)}
+              placeholder="e.g., Jack Zuvelek"
+              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              disabled={isAutomationRunning}
+            />
+            <p className="mt-1 text-sm text-gray-500">
+              Enter first and last name. This will be used for all 50 mailboxes per tenant.
+            </p>
+          </div>
+
+          {/* Actions */}
+          <div className="flex items-end gap-4">
+            <button
+              onClick={handleStartAutomation}
+              disabled={isStarting || isAutomationRunning || !displayName.includes(" ")}
+              className={`px-6 py-2 rounded-lg font-medium transition-colors ${
+                isStarting || isAutomationRunning || !displayName.includes(" ")
+                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  : "bg-blue-600 text-white hover:bg-blue-700"
+              }`}
+            >
+              {isStarting ? "Starting..." : isAutomationRunning ? "Automation Running..." : "🚀 Start Mailbox Creation"}
+            </button>
+
+            {step6Status && step6Status.summary.step6_complete > 0 && (
+              <button
+                onClick={handleDownloadCSV}
+                className="px-6 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
+              >
+                📥 Download CSV
+              </button>
+            )}
+          </div>
+        </div>
+
+        {/* Progress indicator when running */}
+        {isAutomationRunning && (
+          <div className="mt-6 p-4 bg-blue-50 rounded-lg">
+            <div className="flex items-center gap-3">
+              <div className="animate-spin rounded-full h-5 w-5 border-b-2 border-blue-600"></div>
+              <span className="text-blue-800 font-medium">Automation in progress...</span>
+            </div>
+            <p className="mt-2 text-sm text-blue-600">
+              Processing {step6Status?.summary.ready_for_step6} tenant(s). This may take ~10 minutes per tenant.
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Tenant Status Table */}
+      <div className="bg-white rounded-lg shadow overflow-hidden">
+        <div className="px-6 py-4 border-b border-gray-200 flex justify-between items-center">
+          <h3 className="text-lg font-semibold text-gray-900">Tenant Status</h3>
+          <button
+            onClick={fetchStep6Status}
+            className="text-sm text-blue-600 hover:text-blue-800"
+          >
+            🔄 Refresh
+          </button>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="min-w-full divide-y divide-gray-200">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Status</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Tenant</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Domain</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Licensed User</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Mailboxes</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Progress</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Live Status</th>
+              </tr>
+            </thead>
+            <tbody className="bg-white divide-y divide-gray-200">
+              {step6Status?.tenants.map((tenant) => (
+                <tr
+                  key={tenant.tenant_id}
+                  className={`${
+                    tenant.step6_error
+                      ? "bg-red-50"
+                      : tenant.live_progress.active
+                      ? "bg-blue-50"
+                      : tenant.step6_complete
+                      ? "bg-green-50"
+                      : ""
+                  }`}
+                >
+                  {/* Status Icon */}
+                  <td className="px-4 py-3 text-center text-xl">
+                    {getStatusIcon(tenant)}
+                  </td>
+
+                  {/* Tenant Name */}
+                  <td className="px-4 py-3">
+                    <div className="font-medium text-gray-900 truncate max-w-[150px]" title={tenant.name}>
+                      {tenant.name}
+                    </div>
+                  </td>
+
+                  {/* Domain */}
+                  <td className="px-4 py-3 text-sm text-gray-600">
+                    {tenant.domain}
+                  </td>
+
+                  {/* Licensed User */}
+                  <td className="px-4 py-3 text-sm">
+                    {tenant.licensed_user ? (
+                      <span className="text-green-600">{tenant.licensed_user}</span>
+                    ) : (
+                      <span className="text-gray-400">-</span>
+                    )}
+                  </td>
+
+                  {/* Mailbox Count */}
+                  <td className="px-4 py-3 text-sm">
+                    <span className={tenant.mailbox_count === 50 ? "text-green-600 font-medium" : "text-gray-600"}>
+                      {tenant.mailbox_count}/50
+                    </span>
+                  </td>
+
+                  {/* Progress Bar */}
+                  <td className="px-4 py-3">
+                    {tenant.step6_started && (
+                      <div className="w-32">
+                        <div className="flex justify-between text-xs text-gray-500 mb-1">
+                          <span>{getProgressPercent(tenant)}%</span>
+                        </div>
+                        <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-blue-600 transition-all duration-500"
+                            style={{ width: `${getProgressPercent(tenant)}%` }}
+                          />
+                        </div>
+                      </div>
+                    )}
+                  </td>
+
+                  {/* Live Status */}
+                  <td className="px-4 py-3 text-sm max-w-[200px]">
+                    {tenant.step6_error ? (
+                      <span className="text-red-600 truncate block" title={tenant.step6_error}>
+                        ❌ {tenant.step6_error}
+                      </span>
+                    ) : tenant.live_progress.active ? (
+                      <div className="text-blue-600">
+                        <span className="animate-pulse">●</span>{" "}
+                        <span className="font-medium">{tenant.live_progress.step}</span>
+                        <div className="text-xs text-blue-500 truncate" title={tenant.live_progress.detail}>
+                          {tenant.live_progress.detail}
+                        </div>
+                      </div>
+                    ) : tenant.step6_complete ? (
+                      <span className="text-green-600">✓ Complete</span>
+                    ) : !tenant.step5_complete ? (
+                      <span className="text-gray-400">Waiting for Step 5</span>
+                    ) : (
+                      <span className="text-gray-400">Ready</span>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 
-      <div className="bg-gray-50 p-4 rounded-lg space-y-4">
-        <h3 className="font-bold">Generate Mailboxes</h3>
-        <div className="grid grid-cols-2 gap-4">
-          <input type="text" value={firstName} onChange={(e) => setFirstName(e.target.value)} placeholder="First Name" className="px-3 py-2 border rounded-lg" />
-          <input type="text" value={lastName} onChange={(e) => setLastName(e.target.value)} placeholder="Last Name" className="px-3 py-2 border rounded-lg" />
-        </div>
-        <button onClick={handleGenerate} disabled={!firstName || !lastName || generating}
-          className="w-full py-3 bg-blue-600 text-white font-bold rounded-lg disabled:bg-gray-300">
-          {generating ? "Generating..." : "Generate Mailboxes"}
+      {/* Navigation */}
+      <div className="flex justify-between items-center border-t pt-6">
+        <button
+          onClick={() => onComplete()}
+          className="px-4 py-2 text-gray-600 hover:text-gray-800"
+        >
+          ← Back to Step 5
         </button>
-      </div>
 
-      <button onClick={handleCreate} disabled={creating || !status?.mailboxes_pending}
-        className="w-full py-3 bg-green-600 text-white font-bold rounded-lg disabled:bg-gray-300">
-        {creating ? "Creating..." : "Create in M365"}
-      </button>
-      <button onClick={() => window.open(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/export-credentials`)}
-        disabled={!status?.mailboxes_total} className="w-full py-3 border-2 border-blue-600 text-blue-600 font-bold rounded-lg">
-        📥 Export Credentials
-      </button>
+        {step6Status && step6Status.summary.step6_complete === step6Status.summary.total_tenants && (
+          <div className="text-center">
+            <p className="text-green-600 font-medium mb-2">🎉 All tenants complete!</p>
+            <button
+              onClick={handleDownloadCSV}
+              className="px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
+            >
+              📥 Download All Mailboxes CSV
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

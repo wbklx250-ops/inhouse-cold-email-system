@@ -179,6 +179,9 @@ SessionLocal = async_sessionmaker(
     expire_on_commit=False,
 )
 
+# Session factory for creating new sessions (used for incremental commits)
+async_session_factory = SessionLocal
+
 
 async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
     """

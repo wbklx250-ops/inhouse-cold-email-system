@@ -5,7 +5,7 @@ from sqlalchemy import select
 from app.models.tenant import Tenant
 from app.models.domain import Domain
 from app.models.mailbox import Mailbox, MailboxStatus, WarmupStage
-from app.services.email_generator import email_generator
+from app.services.email_generator import generate_email_addresses
 
 async def test_generate():
     tenant_id = UUID('045b7f79-7d56-48b7-b0be-8016c25f9043')
@@ -23,7 +23,7 @@ async def test_generate():
             print(f'Domain: {domain.name}')
             
             # Generate emails
-            variations = email_generator.generate('Jack', 'Zuvelek', domain.name, 5)
+            variations = generate_email_addresses('Jack', 'Zuvelek', domain.name, 5)
             print(f'Generated {len(variations)} variations:')
             for v in variations:
                 print(f'  {v["email"]}')

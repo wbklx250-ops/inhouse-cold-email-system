@@ -1,9 +1,8 @@
 """
-Email Address Generator
+Email Generator Service
 
-Generates 50 professional email variations from a persona name.
-Uses ONLY combinations of first name and last name with separators (. _ -)
-NO numbers, NO prefixes like "mail.", NO suffixes like ".work"
+Generates 50 unique email addresses from a display name using proven patterns.
+NO numbers, NO random suffixes - strictly name-based patterns only.
 """
 
 import secrets
@@ -11,19 +10,204 @@ import string
 from typing import List, Dict
 
 
-def generate_password(length: int = 16) -> str:
-    """Generate a secure random password."""
-    chars = string.ascii_letters + string.digits + "!@#$%"
+# The 50 email patterns in EXACT order
+EMAIL_PATTERNS = [
+    "{first}",
+    "{f}",
+    "{first}.{last}",
+    "{f}{last}",
+    "{f}.{last}",
+    "{last}.{first}",
+    "{last}{f}",
+    "{first}{last}",
+    "{last}{first}",
+    "{f}{l}",
+    "{first}_{last}",
+    "{last}_{first}",
+    "{first}-{last}",
+    "{last}-{first}",
+    "{last}.{f}",
+    "{f2}{last}",
+    "{f2}.{last}",
+    "{last}{f2}",
+    "{last}.{f2}",
+    "{f3}{last}",
+    "{f3}.{last}",
+    "{last}{f3}",
+    "{last}.{f3}",
+    "{first}{l}",
+    "{first}.{l}",
+    "{l}{first}",
+    "{l}.{first}",
+    "{first}{l2}",
+    "{first}.{l2}",
+    "{l2}{first}",
+    "{l2}.{first}",
+    "{first}{l3}",
+    "{first}.{l3}",
+    "{l3}{first}",
+    "{l3}.{first}",
+    "{first}{l4}",
+    "{first}.{l4}",
+    "{l4}{first}",
+    "{l4}.{first}",
+    "{first}{l5}",
+    "{first}.{l5}",
+    "{l5}{first}",
+    "{l5}.{first}",
+    "{first}{l6}",
+    "{first}.{l6}",
+    "{l6}{first}",
+    "{l6}.{first}",
+    "{f}.{l}",
+    "{f}{l2}",
+    "{f}.{l2}",
+]
+
+
+def generate_password(length: int = 12) -> str:
+    """
+    Generate a secure password.
+    
+    Requirements:
+    - At least one lowercase letter
+    - At least one uppercase letter
+    - At least one digit
+    - At least one special character
+    - No ambiguous characters (0, O, l, 1, I)
+    - Compliant with M365 password policy
+    """
+    # Character sets (excluding ambiguous characters)
+    lowercase = "abcdefghjkmnpqrstuvwxyz"  # no l
+    uppercase = "ABCDEFGHJKMNPQRSTUVWXYZ"  # no I, O
+    digits = "23456789"  # no 0, 1
+    special = "!@#$%^&*()-_=+"
+    
+    # Ensure at least one of each required type
     password = [
-        secrets.choice(string.ascii_uppercase),
-        secrets.choice(string.ascii_lowercase),
-        secrets.choice(string.digits),
-        secrets.choice("!@#$%"),
+        secrets.choice(lowercase),
+        secrets.choice(uppercase),
+        secrets.choice(digits),
+        secrets.choice(special),
     ]
-    password.extend(secrets.choice(chars) for _ in range(length - 4))
+    
+    # Fill remaining length with random mix
+    all_chars = lowercase + uppercase + digits + special
+    password.extend(secrets.choice(all_chars) for _ in range(length - 4))
+    
+    # Shuffle to randomize position of required characters
     password_list = list(password)
     secrets.SystemRandom().shuffle(password_list)
+    
     return ''.join(password_list)
+
+
+def parse_display_name(display_name: str) -> tuple:
+    """
+    Parse display name into first and last name.
+    
+    Args:
+        display_name: Full name like "Jack Zuvelek"
+    
+    Returns:
+        Tuple of (first_name, last_name) in lowercase
+    """
+    parts = display_name.strip().split()
+    
+    if len(parts) < 2:
+        raise ValueError(f"Display name must have first and last name: '{display_name}'")
+    
+    first = parts[0].lower()
+    last = parts[-1].lower()  # Use last part as surname (handles middle names)
+    
+    return first, last
+
+
+def generate_local_part(pattern: str, first: str, last: str) -> str:
+    """
+    Generate the local part of an email (before @) from a pattern.
+    
+    Args:
+        pattern: Email pattern like "{first}.{last}"
+        first: First name in lowercase
+        last: Last name in lowercase
+    
+    Returns:
+        Local part of email address
+    """
+    # Create all the substitution values
+    substitutions = {
+        "first": first,
+        "last": last,
+        "f": first[0] if len(first) >= 1 else "",
+        "l": last[0] if len(last) >= 1 else "",
+        "f2": first[:2] if len(first) >= 2 else first,
+        "f3": first[:3] if len(first) >= 3 else first,
+        "l2": last[:2] if len(last) >= 2 else last,
+        "l3": last[:3] if len(last) >= 3 else last,
+        "l4": last[:4] if len(last) >= 4 else last,
+        "l5": last[:5] if len(last) >= 5 else last,
+        "l6": last[:6] if len(last) >= 6 else last,
+    }
+    
+    # Replace all placeholders
+    result = pattern
+    for key, value in substitutions.items():
+        result = result.replace("{" + key + "}", value)
+    
+    return result
+
+
+def generate_emails_for_domain(
+    display_name: str,
+    domain: str,
+    count: int = 50
+) -> List[Dict[str, str]]:
+    """
+    Generate email addresses for a domain.
+    
+    Args:
+        display_name: Full name like "Jack Zuvelek"
+        domain: Domain like "loancatermail13.info"
+        count: Number of emails to generate (default 50)
+    
+    Returns:
+        List of dicts with keys: email, display_name, password, local_part
+    """
+    first, last = parse_display_name(display_name)
+    
+    emails = []
+    used_local_parts = set()
+    
+    # Use patterns up to count
+    patterns_to_use = EMAIL_PATTERNS[:count]
+    
+    for pattern in patterns_to_use:
+        local_part = generate_local_part(pattern, first, last)
+        
+        # Skip if we somehow get a duplicate (shouldn't happen with these patterns)
+        if local_part in used_local_parts:
+            continue
+        
+        used_local_parts.add(local_part)
+        
+        email = f"{local_part}@{domain}"
+        password = generate_password()
+        
+        # Ensure password doesn't contain parts of email
+        while (local_part in password.lower() or 
+               first in password.lower() or 
+               last in password.lower()):
+            password = generate_password()
+        
+        emails.append({
+            "email": email,
+            "display_name": display_name,  # Keep original casing
+            "password": password,
+            "local_part": local_part
+        })
+    
+    return emails
 
 
 def generate_email_addresses(
@@ -33,126 +217,74 @@ def generate_email_addresses(
     count: int = 50
 ) -> List[Dict[str, str]]:
     """
-    Generate unique email addresses for a domain.
+    Backward compatibility wrapper for orchestrator.py.
     
-    Uses ONLY variations of first/last name:
-    - Full names: pierre, mechen, pierremechen
-    - Initials: p, pm
-    - Truncations: pi, pie, pier, pierr
-    - Separators: . _ -
+    Args:
+        first_name: First name like "Jack"
+        last_name: Last name like "Zuvelek"
+        domain: Domain like "loancatermail13.info"
+        count: Number of emails to generate (default 50)
     
-    Returns list of:
-    {
-        "email": "john.smith@domain.com",
-        "display_name": "John Smith",
-        "password": "SecurePass123!"
-    }
+    Returns:
+        List of dicts with keys: email, display_name, password
     """
-    first = first_name.lower().strip()
-    last = last_name.lower().strip()
-    
-    # Generate truncations of first name (1 to len-1 chars)
-    first_truncations = [first[:i] for i in range(1, len(first))]
-    
-    # Generate truncations of last name (1 to len-1 chars)  
-    last_truncations = [last[:i] for i in range(1, len(last))]
-    
-    emails_set = set()
-    
-    # === CORE PATTERNS (no separator) ===
-    core_patterns = [
-        first,                    # pierre
-        first[0],                 # p
-        f"{first}{last}",         # pierremechen
-        f"{last}{first}",         # mechenpierre
-        f"{first[0]}{last}",      # pmechen
-        f"{last}{first[0]}",      # mechenp
-        f"{first[0]}{last[0]}",   # pm
-    ]
-    emails_set.update(core_patterns)
-    
-    # === DOT SEPARATOR PATTERNS ===
-    dot_patterns = [
-        f"{first}.{last}",        # pierre.mechen
-        f"{last}.{first}",        # mechen.pierre
-        f"{first[0]}.{last}",     # p.mechen
-        f"{last}.{first[0]}",     # mechen.p
-    ]
-    emails_set.update(dot_patterns)
-    
-    # === UNDERSCORE SEPARATOR PATTERNS ===
-    underscore_patterns = [
-        f"{first}_{last}",        # pierre_mechen
-        f"{last}_{first}",        # mechen_pierre
-    ]
-    emails_set.update(underscore_patterns)
-    
-    # === HYPHEN SEPARATOR PATTERNS ===
-    hyphen_patterns = [
-        f"{first}-{last}",        # pierre-mechen
-        f"{last}-{first}",        # mechen-pierre
-    ]
-    emails_set.update(hyphen_patterns)
-    
-    # === TRUNCATED FIRST NAME PATTERNS ===
-    for trunc in first_truncations:
-        if len(trunc) >= 2:  # Skip single char (already covered by initial)
-            # No separator
-            emails_set.add(f"{trunc}{last}")       # pi+mechen = pimechen
-            emails_set.add(f"{last}{trunc}")       # mechen+pi = mechenpi
-            # Dot separator
-            emails_set.add(f"{trunc}.{last}")      # pi.mechen
-            emails_set.add(f"{last}.{trunc}")      # mechen.pi
-    
-    # === TRUNCATED LAST NAME PATTERNS ===
-    for trunc in last_truncations:
-        # No separator
-        emails_set.add(f"{first}{trunc}")          # pierre+m = pierrem
-        emails_set.add(f"{trunc}{first}")          # m+pierre = mpierre
-        # Dot separator
-        emails_set.add(f"{first}.{trunc}")         # pierre.m
-        emails_set.add(f"{trunc}.{first}")         # m.pierre
-    
-    # Convert to list and create output
-    display_name = f"{first_name.title()} {last_name.title()}"
-    
-    emails = []
-    for local in emails_set:
-        if local and len(local) >= 1:  # Valid local part
-            email = f"{local}@{domain}"
-            emails.append({
-                "email": email,
-                "display_name": display_name,
-                "password": generate_password()
-            })
-    
-    # Sort by length (shorter emails first) for consistency
-    emails.sort(key=lambda x: len(x["email"]))
-    
-    return emails[:count]
+    display_name = f"{first_name} {last_name}"
+    return generate_emails_for_domain(display_name, domain, count)
 
 
-class EmailGenerator:
-    """Email generator class for generating mailbox credentials."""
+def generate_emails_for_batch(
+    display_name: str,
+    domains: List[str],
+    emails_per_domain: int = 50
+) -> List[Dict[str, str]]:
+    """
+    Generate emails for multiple domains in a batch.
     
-    def generate(
-        self,
-        first_name: str,
-        last_name: str,
-        domain: str,
-        count: int = 50
-    ) -> List[Dict[str, str]]:
-        """Generate email addresses for a domain."""
-        return generate_email_addresses(first_name, last_name, domain, count)
+    Args:
+        display_name: Full name like "Jack Zuvelek"
+        domains: List of domains
+        emails_per_domain: Number of emails per domain (default 50)
+    
+    Returns:
+        List of all email dicts across all domains
+    """
+    all_emails = []
+    
+    for domain in domains:
+        domain_emails = generate_emails_for_domain(
+            display_name=display_name,
+            domain=domain,
+            count=emails_per_domain
+        )
+        all_emails.extend(domain_emails)
+    
+    return all_emails
 
 
-# Singleton instance
-email_generator = EmailGenerator()
+# ============================================================================
+# TESTING
+# ============================================================================
 
-
-# Test the function
 if __name__ == "__main__":
-    emails = generate_email_addresses("Pierre", "Mechen", "vesselbridge-partners.com", 50)
-    print(f"Generated {len(emails)} emails:\n")
-    for e in emails:
-        print(e["email"])
+    # Test with sample data
+    test_display_name = "Jack Zuvelek"
+    test_domain = "loancatermail13.info"
+    
+    print(f"Generating emails for '{test_display_name}' @ {test_domain}")
+    print("=" * 60)
+    
+    emails = generate_emails_for_domain(test_display_name, test_domain)
+    
+    for i, email_data in enumerate(emails, 1):
+        print(f"{i:2}. {email_data['email']:40} | {email_data['password']}")
+    
+    print("=" * 60)
+    print(f"Total: {len(emails)} emails generated")
+    
+    # Verify all emails are unique
+    email_set = set(e['email'] for e in emails)
+    print(f"Unique: {len(email_set)} (should match total)")
+    
+    # Verify no numbers in local parts
+    has_numbers = any(any(c.isdigit() for c in e['local_part']) for e in emails)
+    print(f"Contains numbers: {has_numbers} (should be False)")

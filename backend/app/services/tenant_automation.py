@@ -74,11 +74,56 @@ DEBUG_MAX_TENANTS = 0      # Set to 0 to process ALL tenants (was 1 for debuggin
 DEBUG_HEADLESS = True      # Set to False to SEE the browser (True for production)
 SCREENSHOT_DIR = "/tmp/screenshots"
 
+# MFA timing constants
+DEFAULT_WAIT = 10  # seconds for element waits
+LONG_WAIT = 20     # seconds for slow operations
+CANT_SCAN_WAIT = 5  # seconds to wait after clicking "Can't scan" for secret to appear
+
 import os
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 _progress = {"completed": 0, "failed": 0, "total": 0}
 _progress_lock = threading.Lock()
+
+
+# === CRITICAL: Save TOTP immediately helper ===
+async def _save_totp_immediately(db, tenant_id: str, totp_secret: str, worker_id: int = 0) -> bool:
+    """
+    CRITICAL: Save TOTP to database IMMEDIATELY and verify it was saved.
+    This MUST succeed before we complete MFA enrollment to prevent lockouts.
+    """
+    from sqlalchemy import text
+    
+    try:
+        # Save the TOTP
+        await db.execute(
+            text("""
+                UPDATE tenants 
+                SET totp_secret = :secret, 
+                    updated_at = NOW()
+                WHERE id = :tenant_id::uuid
+            """),
+            {"secret": totp_secret, "tenant_id": tenant_id}
+        )
+        await db.commit()
+        
+        # VERIFY it was actually saved
+        result = await db.execute(
+            text("SELECT totp_secret FROM tenants WHERE id = :tenant_id::uuid"),
+            {"tenant_id": tenant_id}
+        )
+        row = result.fetchone()
+        
+        if row and row[0] == totp_secret:
+            logger.info(f"[W{worker_id}] ✅ TOTP SAVED AND VERIFIED IN DATABASE")
+            return True
+        else:
+            logger.error(f"[W{worker_id}] ❌ TOTP SAVE VERIFICATION FAILED!")
+            return False
+            
+    except Exception as e:
+        logger.error(f"[W{worker_id}] ❌ CRITICAL: Failed to save TOTP to database: {e}")
+        return False
 
 
 @dataclass
@@ -232,6 +277,75 @@ class BrowserWorker:
             (By.ID, "signInAnotherWay"),
         ], timeout=timeout)
     
+    def _validate_totp_secret(self, secret: str) -> bool:
+        """Validate a TOTP secret by trying to generate a code."""
+        try:
+            if not re.match(r'^[A-Z2-7]+$', secret):
+                return False
+            code = pyotp.TOTP(secret).now()
+            if len(code) == 6 and code.isdigit():
+                logger.info(f"[W{self.worker_id}] ✓ TOTP secret validated (generates code: {code})")
+                return True
+        except Exception as e:
+            logger.debug(f"[W{self.worker_id}] TOTP validation failed: {e}")
+        return False
+    
+    def _extract_totp_from_visible_page(self) -> Optional[str]:
+        """
+        Extract TOTP secret from the page WITHOUT clicking anything.
+        The "Can't scan" button should have already been clicked.
+        """
+        logger.info(f"[W{self.worker_id}] Extracting TOTP from visible page...")
+        
+        try:
+            body = self.driver.find_element(By.TAG_NAME, "body")
+            page_text = body.text
+            
+            logger.info(f"[W{self.worker_id}] Page text ({len(page_text)} chars): {page_text[:500]}...")
+            
+            # Pattern 1: "Secret key: XXXXX" format
+            secret_key_match = re.search(r'[Ss]ecret\s*[Kk]ey[:\s]+([A-Za-z0-7]{16,32})', page_text)
+            if secret_key_match:
+                secret = secret_key_match.group(1).upper().replace(' ', '')
+                logger.info(f"[W{self.worker_id}] Found via 'Secret key:' pattern")
+                if self._validate_totp_secret(secret):
+                    return secret
+            
+            # Pattern 2: Base32 strings (uppercase, 16-32 chars)
+            base32_matches = re.findall(r'\b([A-Z2-7]{16,32})\b', page_text.upper())
+            for match in base32_matches:
+                if self._validate_totp_secret(match):
+                    logger.info(f"[W{self.worker_id}] Found via base32 pattern")
+                    return match
+            
+            # Pattern 3: Look in specific elements
+            for selector in ["[class*='secret']", "[class*='key']", "code", "pre", "[data-testid*='secret']"]:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    for elem in elements:
+                        text = elem.text.strip().upper().replace(' ', '')
+                        if 16 <= len(text) <= 32:
+                            if self._validate_totp_secret(text):
+                                logger.info(f"[W{self.worker_id}] Found in element: {selector}")
+                                return text
+                except Exception:
+                    continue
+            
+            # Pattern 4: otpauth URL
+            otpauth_match = re.search(r'otpauth://totp/[^?]+\?secret=([A-Za-z2-7]+)', page_text)
+            if otpauth_match:
+                secret = otpauth_match.group(1).upper()
+                logger.info(f"[W{self.worker_id}] Found via otpauth URL")
+                if self._validate_totp_secret(secret):
+                    return secret
+            
+            logger.error(f"[W{self.worker_id}] ❌ No valid TOTP secret found on page!")
+            return None
+            
+        except Exception as e:
+            logger.error(f"[W{self.worker_id}] Error extracting TOTP: {e}")
+            return None
+    
     def _find_and_click_cant_scan_link(self) -> bool:
         """
         Find and click the "Can't scan the QR code?" element.
@@ -284,35 +398,27 @@ class BrowserWorker:
             logger.error(f"[W{worker_id}] ✗ Could not find 'Can't scan' button with any selector!")
             return False
         
-        # Try multiple click methods
-        # Method 1: Standard click
+        # IMPORTANT: This is a TOGGLE button - click ONLY ONCE!
+        # Clicking twice will HIDE the secret key again.
+        
+        # Try standard click first
         try:
             element.click()
-            logger.info(f"[W{worker_id}] ✓ Standard click succeeded on 'Can't scan' button")
+            logger.info(f"[W{worker_id}] ✓ Clicked 'Can't scan' button (standard click)")
             return True
         except Exception as e:
-            logger.warning(f"[W{worker_id}] Standard click failed: {e}")
+            logger.warning(f"[W{worker_id}] Standard click failed: {e}, trying JS click...")
         
-        # Method 2: JavaScript click
-        try:
-            self.driver.execute_script("arguments[0].click();", element)
-            logger.info(f"[W{worker_id}] ✓ JavaScript click succeeded on 'Can't scan' button")
-            return True
-        except Exception as e:
-            logger.warning(f"[W{worker_id}] JS click failed: {e}")
-        
-        # Method 3: Scroll into view then click
+        # Fallback: JavaScript click (only if standard failed)
         try:
             self.driver.execute_script("arguments[0].scrollIntoView(true);", element)
-            time.sleep(0.5)
-            element.click()
-            logger.info(f"[W{worker_id}] ✓ Scroll+click succeeded on 'Can't scan' button")
+            time.sleep(0.3)
+            self.driver.execute_script("arguments[0].click();", element)
+            logger.info(f"[W{worker_id}] ✓ Clicked 'Can't scan' button (JS click)")
             return True
         except Exception as e:
-            logger.warning(f"[W{worker_id}] Scroll+click failed: {e}")
-        
-        logger.error(f"[W{worker_id}] ✗ All click methods failed for 'Can't scan' button!")
-        return False
+            logger.error(f"[W{worker_id}] ✗ Failed to click 'Can't scan' button: {e}")
+            return False
     
     def _wait_for_page_stable(self, timeout: int = 5):
         """Wait for page to stop loading/changing."""
@@ -362,6 +468,42 @@ class BrowserWorker:
         
         logger.warning(f"[W{worker_id}] ⚠️ Page still empty/short after {timeout}s! Length: {len(page_text)}")
         return page_text
+    
+    def _extract_totp_with_retry(self, max_attempts: int = 3) -> Optional[str]:
+        """
+        Try to extract TOTP secret with retries.
+        
+        This handles cases where the secret takes time to appear
+        or the page hasn't fully loaded.
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+        
+        for attempt in range(max_attempts):
+            logger.info(f"[W{worker_id}] TOTP extraction attempt {attempt + 1}/{max_attempts}")
+            
+            # Wait progressively longer each attempt
+            time.sleep(2 + attempt * 2)
+            
+            self._screenshot(f"totp_extraction_attempt_{attempt + 1}")
+            
+            # Try to extract from page
+            secret = self._extract_totp_secret_from_page()
+            if secret:
+                logger.info(f"[W{worker_id}] ✓ TOTP extracted on attempt {attempt + 1}: {secret[:4]}...")
+                return secret
+            
+            # If failed, try scrolling to trigger lazy-loaded content
+            if attempt < max_attempts - 1:
+                logger.info(f"[W{worker_id}] Attempt {attempt + 1} failed, scrolling page...")
+                try:
+                    self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+                    time.sleep(1)
+                    self.driver.execute_script("window.scrollTo(0, 0);")
+                except Exception:
+                    pass
+        
+        logger.error(f"[W{worker_id}] ✗ TOTP extraction failed after {max_attempts} attempts!")
+        return None
     
     def _debug_page_elements(self):
         """Log all interactive elements on page for debugging."""
@@ -984,7 +1126,7 @@ class BrowserWorker:
                 
                 if cant_scan_clicked:
                     logger.info(f"[W{worker_id}] [MFA Step 3] ✓ Clicked 'Can't scan the QR code?' button")
-                    time.sleep(3)  # Wait for page transition
+                    time.sleep(CANT_SCAN_WAIT)  # Wait for secret to appear
                     self._screenshot("mfa_04_after_cant_scan")
                 else:
                     logger.error(f"[W{worker_id}] [MFA Step 3] ✗ Could not click 'Can't scan' button!")

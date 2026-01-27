@@ -15,7 +15,7 @@ from app.models.domain import Domain
 from app.models.mailbox import Mailbox, MailboxStatus, WarmupStage
 from app.models.tenant import Tenant, TenantStatus
 from app.schemas.mailbox import MailboxCreate, MailboxRead, MailboxUpdate
-from app.services.email_generator import email_generator
+from app.services.email_generator import generate_email_addresses
 
 router = APIRouter(prefix="/api/v1/mailboxes", tags=["mailboxes"])
 
@@ -135,7 +135,7 @@ async def generate_mailboxes(
         raise HTTPException(status_code=404, detail="Domain not found")
 
     # Generate email variations using the new generator (NO NUMBERS!)
-    variations = email_generator.generate(
+    variations = generate_email_addresses(
         first_name=request.first_name,
         last_name=request.last_name,
         domain=domain.name,

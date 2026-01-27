@@ -1,6 +1,6 @@
-from app.services.email_generator import email_generator
+from app.services.email_generator import generate_email_addresses
 
-results = email_generator.generate("Jack", "Zuvelek", "example.com", 50)
+results = generate_email_addresses("Jack", "Zuvelek", "example.com", 50)
 print(f"Generated {len(results)} emails\n")
 
 # CRITICAL: Verify NO numbers in any email
