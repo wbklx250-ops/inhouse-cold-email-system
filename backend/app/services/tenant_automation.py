@@ -19,6 +19,9 @@ import logging
 import secrets
 import string
 import traceback
+import uuid
+import tempfile
+import shutil
 from typing import Optional, Dict, Any, List
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -170,11 +173,13 @@ class BrowserWorker:
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
         opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument(f"--user-data-dir=/tmp/chrome-profile-{self.worker_id}")
+        profile_dir = tempfile.mkdtemp(prefix=f"chrome-profile-{self.worker_id}-{uuid.uuid4()}-")
+        opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         
         driver = webdriver.Chrome(options=opts)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver._profile_dir = profile_dir
         return driver
     
     def _find(self, by, value, timeout=15):
@@ -1065,22 +1070,10 @@ class BrowserWorker:
         self._screenshot("mfa_totp_extraction_failed")
         return None
     
-    def handle_mfa_setup(self) -> Optional[str]:
+    def extract_totp_only(self) -> Optional[str]:
         """
-        Handle MFA enrollment flow and extract TOTP secret.
-        
-        CRITICAL: On "Scan the QR code" page, must click "Can't scan the QR code?" 
-        BEFORE clicking Next, otherwise we get the wrong flow (push notifications 
-        instead of TOTP).
-        
-        Flow:
-        1. "Install Microsoft Authenticator" → Click "Set up a different authentication app"
-        2. "Set up your account in app" → Click "Next"
-        3. "Scan the QR code" → Click "Can't scan the QR code?" (NOT Next!)
-        4. "Enter the following into Authenticator" → Extract secret key, then click "Next"
-        5. Enter verification code → Submit
-        
-        Returns TOTP secret if successful, None otherwise.
+        Phase 1: Navigate to secret page and extract TOTP secret.
+        Does NOT complete enrollment (no code entry / verify / done clicks).
         """
         worker_id = getattr(self, 'worker_id', 0)
         try:
@@ -1172,82 +1165,15 @@ class BrowserWorker:
                 # Check if we accidentally went to the Code/URL page (wrong path)
                 if "code:" in page_text.lower() and "url:" in page_text.lower():
                     logger.error(f"[W{worker_id}] [MFA Step 4] ✗ Wrong flow! Got Code/URL page instead of Secret Key page")
-                    logger.error(f"[W{worker_id}] [MFA Step 4] This means 'Set up different auth app' was not clicked")
-                    return None
-                
-                return None
-            
+
             # Extract the secret key
             totp_secret = self._extract_totp_secret_from_page()
-            
             if not totp_secret:
                 logger.error(f"[W{worker_id}] [MFA Step 4] ✗ Failed to extract TOTP secret!")
                 return None
-            
-            logger.info(f"[W{worker_id}] [MFA Step 4] ✓ Extracted TOTP secret: {totp_secret[:4]}...{totp_secret[-4:]}")
-            
-            # NOW click Next to go to code entry
-            if self._click_next_button():
-                logger.info(f"[W{worker_id}] [MFA Step 4] ✓ Clicked Next to proceed to code entry")
-            time.sleep(2)
-            self._screenshot("mfa_06_code_entry_page")
-            
-            # ========== STEP 5: Enter verification code ==========
-            logger.info(f"[W{worker_id}] [MFA Step 5] Entering verification code...")
-            
-            totp = pyotp.TOTP(totp_secret.upper())
-            code = totp.now()
-            logger.info(f"[W{worker_id}] [MFA Step 5] Generated code: {code}")
-            
-            # Find code input field
-            code_input = self._find_element([
-                (By.CSS_SELECTOR, "input[name='otc']"),
-                (By.CSS_SELECTOR, "input[type='tel']"),
-                (By.CSS_SELECTOR, "input[maxlength='6']"),
-                (By.CSS_SELECTOR, "input[aria-label*='code']"),
-                (By.XPATH, "//input[@type='tel']"),
-            ], timeout=10)
-            
-            if code_input:
-                code_input.clear()
-                code_input.send_keys(code)
-                logger.info(f"[W{worker_id}] [MFA Step 5] ✓ Entered verification code")
-                time.sleep(1)
-                self._screenshot("mfa_07_code_entered")
-                
-                # Submit the code
-                self._click_if_exists([
-                    (By.XPATH, "//button[contains(text(), 'Verify')]"),
-                    (By.XPATH, "//button[contains(text(), 'Next')]"),
-                    (By.ID, "idSubmit_SAOTCC_Continue"),
-                    (By.ID, "idSIButton9"),
-                ], timeout=5) or code_input.send_keys(Keys.RETURN)
-                
-                time.sleep(3)
-                self._screenshot("mfa_08_after_verify")
-            else:
-                logger.error(f"[W{worker_id}] [MFA Step 5] ✗ Code input field not found!")
-                return None
-            
-            # ========== STEP 6: Click through completion ==========
-            logger.info(f"[W{worker_id}] [MFA Step 6] Completing MFA setup...")
-            
-            for i in range(5):
-                clicked = self._click_if_exists([
-                    (By.XPATH, "//button[contains(text(), 'Done')]"),
-                    (By.XPATH, "//button[contains(text(), 'Finish')]"),
-                    (By.XPATH, "//button[contains(text(), 'OK')]"),
-                    (By.XPATH, "//button[contains(text(), 'Yes')]"),
-                    (By.ID, "idSIButton9"),
-                ], timeout=2)
-                
-                if clicked:
-                    logger.info(f"[W{worker_id}] [MFA Step 6] Clicked completion button")
-                    time.sleep(2)
-            
-            self._screenshot("mfa_09_complete")
-            logger.info(f"[W{worker_id}] ✓ MFA setup complete!")
-            
+
+            logger.info(f"[W{worker_id}] ✓ Extracted TOTP secret: {totp_secret[:4]}...{totp_secret[-4:]}")
+            return totp_secret.upper()
             return totp_secret.upper()
             
         except Exception as e:
@@ -1255,6 +1181,77 @@ class BrowserWorker:
             logger.error(f"[W{worker_id}] Traceback: {traceback.format_exc()}")
             self._screenshot("mfa_CRASH")
             return None
+
+    def complete_mfa_enrollment(self, totp_secret: str) -> bool:
+        """
+        Phase 2: Complete MFA enrollment by entering code and finishing steps.
+        MUST ONLY be called after TOTP is saved to DB.
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+
+        # Click Next to go to code entry
+        if self._click_next_button():
+            logger.info(f"[W{worker_id}] [MFA Step 4] ✓ Clicked Next to proceed to code entry")
+        time.sleep(2)
+        self._screenshot("mfa_06_code_entry_page")
+
+        # ========== STEP 5: Enter verification code ==========
+        logger.info(f"[W{worker_id}] [MFA Step 5] Entering verification code...")
+
+        totp = pyotp.TOTP(totp_secret.upper())
+        code = totp.now()
+        logger.info(f"[W{worker_id}] [MFA Step 5] Generated code: {code}")
+
+        # Find code input field
+        code_input = self._find_element([
+            (By.CSS_SELECTOR, "input[name='otc']"),
+            (By.CSS_SELECTOR, "input[type='tel']"),
+            (By.CSS_SELECTOR, "input[maxlength='6']"),
+            (By.CSS_SELECTOR, "input[aria-label*='code']"),
+            (By.XPATH, "//input[@type='tel']"),
+        ], timeout=10)
+
+        if not code_input:
+            logger.error(f"[W{worker_id}] [MFA Step 5] ✗ Code input field not found!")
+            return False
+
+        code_input.clear()
+        code_input.send_keys(code)
+        logger.info(f"[W{worker_id}] [MFA Step 5] ✓ Entered verification code")
+        time.sleep(1)
+        self._screenshot("mfa_07_code_entered")
+
+        # Submit the code
+        self._click_if_exists([
+            (By.XPATH, "//button[contains(text(), 'Verify')]") ,
+            (By.XPATH, "//button[contains(text(), 'Next')]") ,
+            (By.ID, "idSubmit_SAOTCC_Continue"),
+            (By.ID, "idSIButton9"),
+        ], timeout=5) or code_input.send_keys(Keys.RETURN)
+
+        time.sleep(3)
+        self._screenshot("mfa_08_after_verify")
+
+        # ========== STEP 6: Click through completion ==========
+        logger.info(f"[W{worker_id}] [MFA Step 6] Completing MFA setup...")
+
+        for i in range(5):
+            clicked = self._click_if_exists([
+                (By.XPATH, "//button[contains(text(), 'Done')]"),
+                (By.XPATH, "//button[contains(text(), 'Finish')]"),
+                (By.XPATH, "//button[contains(text(), 'OK')]"),
+                (By.XPATH, "//button[contains(text(), 'Yes')]"),
+                (By.ID, "idSIButton9"),
+            ], timeout=2)
+
+            if clicked:
+                logger.info(f"[W{worker_id}] [MFA Step 6] Clicked completion button")
+                time.sleep(2)
+
+        self._screenshot("mfa_09_complete")
+        logger.info(f"[W{worker_id}] ✓ MFA setup complete!")
+
+        return True
 
     def _extract_totp_secret_from_page(self) -> Optional[str]:
         """
@@ -2241,16 +2238,25 @@ async def process_tenant(tenant, db, worker_id: int = 0) -> dict:
                 time.sleep(2)
             
             elif state == LoginState.NEEDS_MFA_SETUP:
-                logger.info(f"[W{worker_id}] === MFA Setup Required ===")
-                totp = worker.handle_mfa_setup()
-                if totp:
-                    # IMMEDIATELY save to DB
-                    tenant.totp_secret = totp
-                    await db.commit()
-                    result["totp_secret"] = totp
-                    logger.info(f"[W{worker_id}] ✓ TOTP saved")
-                else:
-                    raise Exception("MFA setup failed")
+                logger.info(f"[W{worker_id}] === MFA Setup Required (Two-Phase) ===")
+                # PHASE 1: Extract TOTP secret
+                totp = worker.extract_totp_only()
+                if not totp:
+                    raise Exception("Failed to extract TOTP secret")
+
+                # PHASE 2: Save to DB and verify
+                success = await _save_totp_immediately(db, str(tenant.id), totp, worker_id)
+                if not success:
+                    raise Exception("Failed to save TOTP to database")
+
+                result["totp_secret"] = totp
+                logger.info(f"[W{worker_id}] ✓ TOTP saved and verified in DB")
+
+                # PHASE 3: Complete MFA enrollment
+                if not worker.complete_mfa_enrollment(totp):
+                    raise Exception("MFA enrollment completion failed")
+
+                logger.info(f"[W{worker_id}] ✓ MFA setup complete")
                 time.sleep(2)
             
             elif state == LoginState.NEEDS_STAY_SIGNED_IN:
@@ -2316,6 +2322,13 @@ async def process_tenant(tenant, db, worker_id: int = 0) -> dict:
                 worker.driver.quit()
             except:
                 pass
+            # Clean up temporary profile directory
+            try:
+                if hasattr(worker.driver, '_profile_dir'):
+                    shutil.rmtree(worker.driver._profile_dir)
+                    logger.info(f"[W{worker_id}] 🔄 Cleaned up profile: {worker.driver._profile_dir}")
+            except Exception as e:
+                logger.debug(f"[W{worker_id}] Profile cleanup failed: {e}")
     
     return result
 

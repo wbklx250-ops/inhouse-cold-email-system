@@ -11,6 +11,7 @@ import ssl
 import asyncio
 import logging
 from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from functools import wraps
 from typing import TypeVar, Callable, Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -191,6 +192,18 @@ async def get_db_session() -> AsyncGenerator[AsyncSession, None]:
         @router.get("/")
         async def endpoint(db: AsyncSession = Depends(get_db_session)):
             ...
+    """
+    async with SessionLocal() as session:
+        yield session
+
+
+@asynccontextmanager
+async def get_fresh_db_session() -> AsyncGenerator[AsyncSession, None]:
+    """
+    Get a fresh database session for a single operation.
+
+    This is useful for long-running workflows where the database connection
+    may be closed by the serverless provider if left idle.
     """
     async with SessionLocal() as session:
         yield session

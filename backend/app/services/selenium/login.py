@@ -29,7 +29,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 import pyotp
 
-from .browser import create_driver, take_screenshot
+from .browser import create_driver, take_screenshot, cleanup_driver
 
 logger = logging.getLogger(__name__)
 
@@ -263,10 +263,10 @@ class MicrosoftLoginAutomation:
         time.sleep(4)
         return True
     
-    def handle_mfa_setup(self) -> Optional[str]:
+    def extract_totp_only(self) -> Optional[str]:
         """
-        Handle MFA enrollment and extract TOTP secret.
-        Returns TOTP secret if successful.
+        Phase 1: Navigate to secret page and extract TOTP secret.
+        Does NOT complete enrollment (no code entry / verify / done clicks).
         """
         worker_id = getattr(self, 'worker_id', 0)
         
@@ -403,97 +403,99 @@ class MicrosoftLoginAutomation:
             (By.XPATH, "//*[contains(text(), 'manually')]"),
         ])
         logger.info(f"[W{worker_id}] 'Can't scan?' BUTTON clicked: {cant_scan_clicked}")
-        
+
         if not cant_scan_clicked:
-            logger.error(f"[W{worker_id}] FAILED to click 'Can't scan' button! Listing all buttons:")
-            try:
-                buttons = self.driver.find_elements(By.TAG_NAME, "button")
-                for i, btn in enumerate(buttons):
-                    logger.error(f"[W{worker_id}]   BUTTON {i}: text='{btn.text}'")
-            except Exception as e:
-                logger.error(f"[W{worker_id}]   Error listing buttons: {e}")
+            logger.error(f"[W{worker_id}] FAILED to click 'Can't scan' button")
+            self._screenshot("mfa_ERROR_cant_scan")
+            return None
+
         time.sleep(2)
-        
         self._screenshot("mfa_secret_page")
-        
         # Extract TOTP secret
         logger.info(f"[W{worker_id}] --- Extracting TOTP secret ---")
         totp_secret = self._extract_totp_secret()
-        
+
         if totp_secret:
-            logger.info(f"[W{worker_id}]  Extracted TOTP: {totp_secret[:4]}...")
-            
-            logger.info(f"[W{worker_id}] --- Clicking Next to go to code entry ---")
-            next_to_code = self._click_next_button()
-            logger.info(f"[W{worker_id}] Next to code entry clicked: {next_to_code}")
-            time.sleep(2)
-            
-            # Enter code
-            code = pyotp.TOTP(totp_secret).now()
-            logger.info(f"[W{worker_id}] Generated MFA code: {code}")
-            
-            code_input = self._find_element([
-                (By.CSS_SELECTOR, "input[name='otc']"),
-                (By.CSS_SELECTOR, "input[type='tel']"),
-                (By.CSS_SELECTOR, "input[maxlength='6']"),
-            ])
-            
-            if code_input:
-                logger.info(f"[W{worker_id}] Found code input field")
-                code_input.clear()
-                code_input.send_keys(code)
-                logger.info(f"[W{worker_id}]  Entered code: {code}")
-                time.sleep(1)
-                
-                logger.info(f"[W{worker_id}] --- Clicking Verify/Next ---")
-                verify_clicked = self._click_if_exists([
-                    (By.XPATH, "//button[contains(text(), 'Verify')]"),
-                    # New Microsoft UI (reskin) - data-testid
-                    (By.CSS_SELECTOR, "button[data-testid='reskin-step-next-button']"),
-                    # Old Microsoft UI - id based
-                    (By.ID, "idSubmit_ProofUp_Redirect"),
-                    (By.ID, "idSIButton9"),
-                    # Text-based fallbacks
-                    (By.XPATH, "//button[normalize-space()='Next']"),
-                    (By.XPATH, "//button[contains(text(), 'Next')]"),
-                ])
-                logger.info(f"[W{worker_id}] Verify/Next clicked: {verify_clicked}")
-                time.sleep(3)
-                logger.info(f"[W{worker_id}] After verify URL: {self.driver.current_url}")
-                self._screenshot("mfa_after_verify")
-            else:
-                logger.error(f"[W{worker_id}]  Could not find code input field!")
-                self._screenshot("mfa_ERROR_no_code_input")
-            
-            # Click through completion
-            logger.info(f"[W{worker_id}] --- Clicking completion buttons ---")
-            for i in range(5):
-                done_clicked = self._click_if_exists([
-                    (By.XPATH, "//button[contains(text(), 'Done')]"),
-                    (By.XPATH, "//button[contains(text(), 'Finish')]"),
-                    (By.XPATH, "//button[contains(text(), 'OK')]"),
-                    (By.ID, "idSIButton9"),
-                ])
-                if done_clicked:
-                    logger.info(f"[W{worker_id}]  Clicked completion button (iteration {i})")
-                time.sleep(1)
-            
-            logger.info(f"[W{worker_id}] ======= MFA SETUP COMPLETE =======")
-            logger.info(f"[W{worker_id}] Final URL: {self.driver.current_url}")
-            self._screenshot("mfa_complete")
+            logger.info(f"[W{worker_id}]  Extracted TOTP: {totp_secret[:4]}...")
             return totp_secret
-        else:
-            logger.error(f"[W{worker_id}]  Could not extract TOTP secret from page!")
-            logger.info(f"[W{worker_id}] Current URL: {self.driver.current_url}")
-            try:
-                page_text = self.driver.find_element(By.TAG_NAME, "body").text
-                logger.info(f"[W{worker_id}] Page text at failure: {page_text[:1000]}")
-            except:
-                pass
-            self._screenshot("mfa_ERROR_no_secret")
+
+        logger.error(f"[W{worker_id}]  Could not extract TOTP secret from page!")
+        logger.info(f"[W{worker_id}] Current URL: {self.driver.current_url}")
+        try:
+            page_text = self.driver.find_element(By.TAG_NAME, "body").text
+            logger.info(f"[W{worker_id}] Page text at failure: {page_text[:1000]}")
+        except:
+            pass
+        self._screenshot("mfa_ERROR_no_secret")
         
-        logger.info(f"[W{worker_id}] ======= MFA SETUP FAILED =======")
+        logger.info(f"[W{worker_id}] ======= MFA SETUP FAILED (NO SECRET) =======")
         return None
+
+    def complete_mfa_enrollment(self, totp_secret: str) -> bool:
+        """
+        Phase 2: Complete MFA enrollment by entering code and finishing steps.
+        MUST ONLY be called after TOTP is saved to DB.
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+
+        logger.info(f"[W{worker_id}] --- Clicking Next to go to code entry ---")
+        next_to_code = self._click_next_button()
+        logger.info(f"[W{worker_id}] Next to code entry clicked: {next_to_code}")
+        time.sleep(2)
+
+        code = pyotp.TOTP(totp_secret).now()
+        logger.info(f"[W{worker_id}] Generated MFA code: {code}")
+
+        code_input = self._find_element([
+            (By.CSS_SELECTOR, "input[name='otc']"),
+            (By.CSS_SELECTOR, "input[type='tel']"),
+            (By.CSS_SELECTOR, "input[maxlength='6']"),
+        ])
+
+        if not code_input:
+            logger.error(f"[W{worker_id}]  Could not find code input field!")
+            self._screenshot("mfa_ERROR_no_code_input")
+            return False
+
+        logger.info(f"[W{worker_id}] Found code input field")
+        code_input.clear()
+        code_input.send_keys(code)
+        logger.info(f"[W{worker_id}]  Entered code: {code}")
+        time.sleep(1)
+
+        logger.info(f"[W{worker_id}] --- Clicking Verify/Next ---")
+        verify_clicked = self._click_if_exists([
+            (By.XPATH, "//button[contains(text(), 'Verify')]"),
+            # New Microsoft UI (reskin) - data-testid
+            (By.CSS_SELECTOR, "button[data-testid='reskin-step-next-button']"),
+            # Old Microsoft UI - id based
+            (By.ID, "idSubmit_ProofUp_Redirect"),
+            (By.ID, "idSIButton9"),
+            # Text-based fallbacks
+            (By.XPATH, "//button[normalize-space()='Next']"),
+            (By.XPATH, "//button[contains(text(), 'Next')]"),
+        ])
+        logger.info(f"[W{worker_id}] Verify/Next clicked: {verify_clicked}")
+        time.sleep(3)
+        logger.info(f"[W{worker_id}] After verify URL: {self.driver.current_url}")
+        self._screenshot("mfa_after_verify")
+
+        logger.info(f"[W{worker_id}] --- Clicking completion buttons ---")
+        for i in range(5):
+            done_clicked = self._click_if_exists([
+                (By.XPATH, "//button[contains(text(), 'Done')]"),
+                (By.XPATH, "//button[contains(text(), 'Finish')]"),
+                (By.XPATH, "//button[contains(text(), 'OK')]"),
+                (By.ID, "idSIButton9"),
+            ])
+            if done_clicked:
+                logger.info(f"[W{worker_id}]  Clicked completion button (iteration {i})")
+            time.sleep(1)
+
+        logger.info(f"[W{worker_id}] ======= MFA SETUP COMPLETE =======")
+        logger.info(f"[W{worker_id}] Final URL: {self.driver.current_url}")
+        self._screenshot("mfa_complete")
+        return True
     
     def _extract_totp_secret(self) -> Optional[str]:
         """Extract TOTP secret from page."""
@@ -637,7 +639,7 @@ class MicrosoftLoginAutomation:
                     current_password = new_password
                     result.new_password = new_password
                 elif state in (LoginState.NEEDS_MFA_SETUP, LoginState.NEEDS_MFA_METHOD_SELECT):
-                    extracted = self.handle_mfa_setup()
+                    extracted = self.extract_totp_only()
                     if extracted:
                         totp_secret = extracted
                         result.totp_secret = totp_secret
@@ -674,7 +676,7 @@ class MicrosoftLoginAutomation:
         finally:
             result.screenshots = self.screenshots
             if self.driver:
-                self.driver.quit()
+                cleanup_driver(self.driver)
                 self.driver = None
         
         return result

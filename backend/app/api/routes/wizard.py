@@ -1529,7 +1529,7 @@ async def start_step5_automation(
                     step5_jobs[job_id]["current_tenant"] = tenant_id
                     step5_jobs[job_id]["current_step"] = f"{step}: {status}"
                 
-                summary = await run_step5_for_batch(bg_db, batch_id, on_progress)
+                summary = await run_step5_for_batch(batch_id, on_progress)
                 
                 step5_jobs[job_id]["status"] = "completed"
                 step5_jobs[job_id]["completed"] = summary["total"]
