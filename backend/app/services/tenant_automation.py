@@ -170,7 +170,7 @@ class BrowserWorker:
         opts.add_argument("--disable-gpu")
         opts.add_argument("--window-size=1920,1080")
         opts.add_argument("--disable-blink-features=AutomationControlled")
-        opts.add_argument(f"--user-data-dir=/tmp/chrome-{self.worker_id}-{time.time()}")
+        opts.add_argument(f"--user-data-dir=/tmp/chrome-profile-{self.worker_id}")
         opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         
         driver = webdriver.Chrome(options=opts)
@@ -443,6 +443,24 @@ class BrowserWorker:
         # Small additional wait for dynamic content
         time.sleep(1)
     
+    def _wait_for_page_load(self, timeout: int = 30):
+        """
+        STEP 4 FIX: Wait for page to fully load with document.readyState == "complete".
+        This should be called after every driver.get() or navigation to ensure the page
+        is fully loaded before interacting with elements.
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+        try:
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            logger.info(f"[W{worker_id}] ✓ Page fully loaded (readyState=complete)")
+            time.sleep(1)  # Small buffer for any final rendering
+            return True
+        except Exception as e:
+            logger.warning(f"[W{worker_id}] Page load timeout after {timeout}s: {e}")
+            return False
+    
     def _wait_for_page_content(self, min_length: int = 50, timeout: int = 10) -> str:
         """
         Wait for page to have actual content (not empty).
@@ -678,6 +696,7 @@ class BrowserWorker:
             # Fallback: refresh the page and start over
             logger.info(f"[W{worker_id}] No back button, refreshing page")
             self.driver.get("https://portal.azure.com")
+            self._wait_for_page_load()  # STEP 4 FIX: Wait for page to fully load
             time.sleep(3)
     
     def _enter_email(self, email: str) -> bool:
@@ -1352,6 +1371,7 @@ class BrowserWorker:
             # LOGIN - STEP 1: Navigate to Azure Portal
             logger.info(f"[W{self.worker_id}] 🌐 Navigating to portal.azure.com...")
             self.driver.get("https://portal.azure.com")
+            self._wait_for_page_load()  # STEP 4 FIX: Wait for page to fully load
             time.sleep(2)
             self._screenshot("01_azure_portal_loaded")
             logger.info(f"[W{self.worker_id}] Current URL: {self.driver.current_url}")
@@ -2109,8 +2129,17 @@ class ParallelAutomation:
         results = []
         logger.info(f"Starting: {len(tenants)} tenants, {self.max_workers} workers")
         
+        # STEP 4 FIX: Stagger worker startups by 5 seconds to prevent browser collision issues
+        STEP4_STAGGER_SECONDS = 5
+        
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futures = {executor.submit(_worker_task, w): w for w in work}
+            futures = {}
+            for i, w in enumerate(work):
+                if i > 0:
+                    logger.info(f"Staggering worker startup: waiting {STEP4_STAGGER_SECONDS}s before starting worker {i}")
+                    time.sleep(STEP4_STAGGER_SECONDS)
+                futures[executor.submit(_worker_task, w)] = w
+            
             for future in as_completed(futures):
                 results.append(future.result())
         

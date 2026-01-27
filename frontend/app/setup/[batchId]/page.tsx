@@ -1096,9 +1096,17 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
     }
   };
 
-  // Start automation
+  // Start automation with debouncing to prevent double-clicks
+  const automationRequestInProgress = useRef(false);
+  
   const handleStartAutomation = async () => {
-    if (!newPassword) return;
+    // Debouncing: prevent multiple rapid clicks
+    if (!newPassword || automationRequestInProgress.current) {
+      return;
+    }
+    
+    // Mark request as in-progress immediately
+    automationRequestInProgress.current = true;
     setAutomating(true);
     setAutomationStarted(true);
     setProgress({ completed: 0, failed: 0, total: 0 });
@@ -1115,15 +1123,41 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
       
       if (res.ok) {
         const data = await res.json();
+        
+        // Check if automation already running (from server-side deduplication)
+        if (data.already_running) {
+          alert(data.message);
+          setAutomating(false);
+          setAutomationStarted(false);
+          automationRequestInProgress.current = false;
+          return;
+        }
+        
         setProgress(prev => ({ ...prev, total: data.tenants }));
         setEstimatedMinutes(data.estimated_minutes || Math.round(data.tenants / maxWorkers * 1.5));
+      } else {
+        // Request failed - reset state
+        const errorData = await res.json().catch(() => ({ message: "Failed to start" }));
+        alert(errorData.message || "Failed to start automation");
+        setAutomating(false);
+        setAutomationStarted(false);
+        automationRequestInProgress.current = false;
       }
     } catch (e) {
       console.error("Start automation error:", e);
+      alert(e instanceof Error ? e.message : "Failed to start automation");
       setAutomating(false);
       setAutomationStarted(false);
+      automationRequestInProgress.current = false;
     }
   };
+  
+  // Reset request flag when automation completes (from polling detection)
+  useEffect(() => {
+    if (!automating && !automationStarted) {
+      automationRequestInProgress.current = false;
+    }
+  }, [automating, automationStarted]);
 
   // Download templates
   const downloadCsvTemplate = () => {

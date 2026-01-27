@@ -44,6 +44,9 @@ router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
 # Store active automation jobs
 active_jobs = {}
 
+# Store active Step 4 automation jobs (per batch)
+step4_jobs = {}
+
 
 # ============== SCHEMAS ==============
 
@@ -1020,6 +1023,29 @@ async def start_automation(
     db: AsyncSession = Depends(get_db)
 ):
     """Start parallel first-login automation."""
+    import logging
+    logger = logging.getLogger(__name__)
+
+    # STEP 4 FIX: Enforce max 2 concurrent workers to avoid browser rendering issues
+    STEP4_MAX_WORKERS = 2
+    if max_workers > STEP4_MAX_WORKERS:
+        logger.warning(
+            "Step 4 max_workers capped at %s (requested %s)",
+            STEP4_MAX_WORKERS,
+            max_workers,
+        )
+        max_workers = STEP4_MAX_WORKERS
+    
+    # Check if automation is already running for this batch
+    job_id = str(batch_id)
+    if job_id in step4_jobs and step4_jobs[job_id].get("status") == "running":
+        logger.warning(f"Step 4 automation already running for batch {batch_id}")
+        return {
+            "success": False,
+            "message": f"Automation already running for this batch (started at {step4_jobs[job_id].get('started_at')})",
+            "already_running": True
+        }
+    
     tenants = (await db.execute(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
@@ -1030,29 +1056,58 @@ async def start_automation(
     if not tenants:
         return {"success": True, "message": "No tenants"}
     
+    # CRITICAL LOGGING: Log the actual max_workers value being used
+    logger.info(f"=" * 60)
+    logger.info(f"STEP 4 AUTOMATION STARTING")
+    logger.info(f"Batch ID: {batch_id}")
+    logger.info(f"Max Workers (parallel browsers): {max_workers}")
+    logger.info(f"Total tenants: {len(tenants)}")
+    logger.info(f"=" * 60)
+    
     tenant_data = [
         {"tenant_id": str(t.id), "admin_email": t.admin_email, "initial_password": t.admin_password}
         for t in tenants
     ]
     
+    # Initialize job tracking
+    step4_jobs[job_id] = {
+        "status": "running",
+        "total": len(tenants),
+        "max_workers": max_workers,
+        "started_at": datetime.utcnow().isoformat()
+    }
+    
     async def run():
-        results = await process_tenants_parallel(tenant_data, new_password, max_workers)
-        async with AsyncSession(async_engine, expire_on_commit=False) as session:
-            for r in results:
-                t = await session.get(Tenant, UUID(r["tenant_id"]))
-                if t:
-                    t.first_login_completed = r["success"]
-                    t.totp_secret = r["totp_secret"]
-                    t.security_defaults_disabled = r["security_defaults_disabled"]
-                    t.setup_error = r["error"]
-                    if r["success"]:
-                        # Only update admin_password AFTER successful password change
-                        # This preserves the original TXT password until change is confirmed
-                        if r["new_password"]:  # Only update if we have a new password
-                            t.admin_password = r["new_password"]
-                            t.password_changed = True  # CRITICAL: Mark password as changed!
-                        t.first_login_at = datetime.utcnow()
-            await session.commit()
+        try:
+            results = await process_tenants_parallel(tenant_data, new_password, max_workers)
+            async with AsyncSession(async_engine, expire_on_commit=False) as session:
+                for r in results:
+                    t = await session.get(Tenant, UUID(r["tenant_id"]))
+                    if t:
+                        t.first_login_completed = r["success"]
+                        t.totp_secret = r["totp_secret"]
+                        t.security_defaults_disabled = r["security_defaults_disabled"]
+                        t.setup_error = r["error"]
+                        if r["success"]:
+                            # Only update admin_password AFTER successful password change
+                            # This preserves the original TXT password until change is confirmed
+                            if r["new_password"]:  # Only update if we have a new password
+                                t.admin_password = r["new_password"]
+                                t.password_changed = True  # CRITICAL: Mark password as changed!
+                            t.first_login_at = datetime.utcnow()
+                await session.commit()
+            
+            # Mark job as completed
+            step4_jobs[job_id]["status"] = "completed"
+            step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            logger.info(f"Step 4 automation completed for batch {batch_id}")
+            
+        except Exception as e:
+            # Mark job as failed
+            step4_jobs[job_id]["status"] = "failed"
+            step4_jobs[job_id]["error"] = str(e)
+            step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            logger.error(f"Step 4 automation failed for batch {batch_id}: {str(e)}")
     
     background_tasks.add_task(run)
     
