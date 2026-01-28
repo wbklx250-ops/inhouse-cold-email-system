@@ -285,7 +285,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             # ========================================
             # PHASE 1: PowerShell - Create, fix names, delegate
             # ========================================
-            if not needs_powershell and all_created and all_delegated:
+            if not needs_powershell:
                 logger.info(
                     "[%s] Mailboxes already created & delegated, skipping PowerShell",
                     tenant.custom_domain,
@@ -372,7 +372,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             # ========================================
             # PHASE 2: Graph API - Set passwords, enable accounts
             # ========================================
-            if not needs_graph_api and all_passwords_set:
+            if not needs_graph_api:
                 logger.info("[%s] Passwords already set, skipping Graph API", tenant.custom_domain)
                 update_progress(
                     str(tenant.id),

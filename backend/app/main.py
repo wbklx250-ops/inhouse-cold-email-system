@@ -29,6 +29,7 @@ settings = get_settings()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
+    logger.info("Starting Cold Email Infrastructure API")
     # Startup: Test database connection
     logger.info("Testing database connection...")
     try:
@@ -130,6 +131,7 @@ async def root() -> dict[str, Any]:
 @app.get("/health", tags=["health"])
 async def health_check() -> dict[str, str]:
     """Health check endpoint."""
+    logger.info("/health check requested")
     return {"status": "ok"}
 
 
