@@ -144,6 +144,63 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
 
 
 # ============================================================
+# SYNC BATCH PROCESSOR - Matches Step 4 pattern for Chrome stability
+# ============================================================
+
+def _sync_process_chunk(chunk_data: List[dict], max_workers: int) -> dict:
+    """
+    Process a chunk of domains in parallel using ThreadPoolExecutor.
+    
+    CRITICAL: This function runs ENTIRELY in sync context, with the
+    ThreadPoolExecutor created INSIDE this function. This matches the
+    Step 4 pattern that works reliably with Chrome.
+    
+    The key difference from the old code:
+    - OLD: ThreadPoolExecutor was used with loop.run_in_executor() from async context
+    - NEW: ThreadPoolExecutor is created inside a sync function that was offloaded
+    
+    This isolates the browser threads from asyncio's event loop.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    chunk_results = {}
+    
+    logger.info(f"[SYNC] Processing {len(chunk_data)} domains with {max_workers} workers (Step 4 pattern)")
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks - this is pure threading, no asyncio involvement
+        future_to_domain = {
+            executor.submit(_sync_setup_domain, tenant_data): tenant_data["domain"]
+            for tenant_data in chunk_data
+        }
+        
+        # Wait for completion using as_completed (pure threading)
+        for future in as_completed(future_to_domain):
+            domain_name = future_to_domain[future]
+            
+            try:
+                result = future.result()  # Sync call, blocks until done
+                chunk_results[domain_name] = result
+                
+                if result.get("success"):
+                    logger.info(f"[{domain_name}] SUCCESS")
+                else:
+                    logger.warning(f"[{domain_name}] FAILED: {result.get('error')}")
+            
+            except Exception as e:
+                logger.exception(f"[{domain_name}] Thread error: {e}")
+                chunk_results[domain_name] = {
+                    "success": False,
+                    "verified": False,
+                    "dns_configured": False,
+                    "error": str(e)
+                }
+    
+    logger.info(f"[SYNC] Chunk complete: {len(chunk_results)} results")
+    return chunk_results
+
+
+# ============================================================
 # MAIN ASYNC BATCH PROCESSOR
 # ============================================================
 
@@ -153,19 +210,28 @@ async def run_step5_for_batch(
     """
     TRUE BATCH PROCESSING - Process domains in chunks of 3.
     
+    ARCHITECTURE FIX (Step 4 Pattern):
+    ===================================
+    This now matches Step 4's working pattern:
+    1. Gather data in async context
+    2. Offload ENTIRE chunk processing to a SINGLE sync function
+    3. That sync function creates its own ThreadPoolExecutor internally
+    4. Update database in async context after chunk completes
+    
+    This isolates Chrome/Selenium threads from asyncio's event loop,
+    which was causing crashes in the old implementation.
+    
     Memory-efficient architecture:
     - Only gather data for the current chunk (3 domains)
     - Process that chunk completely (Selenium + DB updates)
     - Then move to next chunk
-    
-    This prevents memory issues when processing 50+ domains by NOT
-    pre-scheduling all domains upfront.
     """
     from app.models.batch import SetupBatch
     
     # ============ TRUE BATCH MODE INDICATOR ============
     logger.info("=" * 60)
     logger.info(f"=== TRUE BATCH MODE (MEMORY EFFICIENT) ===")
+    logger.info(f"=== USING STEP 4 PATTERN: Nested ThreadPoolExecutor ===")
     logger.info(f"=== Processing in chunks of 3, max {MAX_PARALLEL_BROWSERS} parallel browsers ===")
     logger.info("=" * 60)
     
@@ -285,50 +351,24 @@ async def run_step5_for_batch(
             logger.info(f"Chunk {chunk_num}: No valid tenants after validation, moving to next chunk")
             continue
         
-        # ========== PHASE 2: Run Selenium for THIS CHUNK ==========
+        # ========== PHASE 2: Run Selenium for THIS CHUNK (Step 4 Pattern) ==========
+        # 
+        # CRITICAL FIX: Instead of using loop.run_in_executor() with a ThreadPoolExecutor
+        # created in async context, we offload the ENTIRE parallel processing to a
+        # single sync function. That sync function creates its own ThreadPoolExecutor
+        # internally, completely isolated from asyncio.
+        #
+        # This matches Step 4's working pattern in tenant_automation.py
         
-        logger.info(f"Chunk {chunk_num}: Starting Selenium for {len(chunk_data)} domains...")
+        logger.info(f"Chunk {chunk_num}: Starting Selenium via Step 4 pattern (isolated ThreadPoolExecutor)...")
         
-        chunk_results = {}  # domain -> result dict
-        
-        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BROWSERS) as executor:
-            future_to_domain = {}
-            
-            for tenant_data in chunk_data:
-                domain_name = tenant_data["domain"]
-                
-                future = loop.run_in_executor(
-                    executor,
-                    _sync_setup_domain,
-                    tenant_data
-                )
-                future_to_domain[future] = {
-                    "domain": domain_name,
-                    "tenant_data": tenant_data
-                }
-            
-            # Wait for all tasks in this chunk to complete
-            for future in asyncio.as_completed(list(future_to_domain.keys())):
-                task_info = future_to_domain[future]
-                domain_name = task_info["domain"]
-                
-                try:
-                    result = await future
-                    chunk_results[domain_name] = result
-                    
-                    if result.get("success"):
-                        logger.info(f"[{domain_name}] SUCCESS")
-                    else:
-                        logger.warning(f"[{domain_name}] FAILED: {result.get('error')}")
-                
-                except Exception as e:
-                    logger.exception(f"[{domain_name}] Thread error: {e}")
-                    chunk_results[domain_name] = {
-                        "success": False,
-                        "verified": False,
-                        "dns_configured": False,
-                        "error": str(e)
-                    }
+        # Offload entire chunk to sync processor - ThreadPoolExecutor created inside
+        chunk_results = await loop.run_in_executor(
+            None,  # Use default executor for the wrapper
+            _sync_process_chunk,  # This creates its own ThreadPoolExecutor inside
+            chunk_data,
+            MAX_PARALLEL_BROWSERS
+        )
         
         # ========== PHASE 3: Update database for THIS CHUNK ==========
         
