@@ -353,34 +353,30 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     )
     password_field.clear()
     password_field.send_keys(admin_password + Keys.RETURN)
-    time.sleep(3)
-
-    # Detect MFA prompt by page text OR input field
-    page_text = driver.page_source.lower()
-    mfa_indicators = [
-        "verify your identity",
-        "verification code",
-        "use the authenticator",
-        "enter code",
-        "sign in with a code",
-    ]
-    mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
-
+    
+    # IMPORTANT: Wait for MFA prompt to appear - don't check immediately!
+    # Railway headless is slower, so we must explicitly wait for the MFA input field
+    logger.info(f"[{domain}] Waiting for MFA prompt to appear (up to 30s)...")
+    
     code_input = None
-    if mfa_detected:
-        logger.info(f"[{domain}] MFA detected, waiting for TOTP input...")
-        code_input = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.NAME, "otc"))
+    
+    # Method 1: Wait for the specific Microsoft MFA input ID (most reliable)
+    try:
+        code_input = WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.ID, "idTxtBx_SAOTCC_OTC"))
         )
-    else:
-        # Still check if the code input shows up even without text indicators
+        logger.info(f"[{domain}] MFA input detected via ID (idTxtBx_SAOTCC_OTC)")
+    except Exception:
+        logger.info(f"[{domain}] MFA input not found via ID, trying name='otc'...")
+        # Method 2: Fallback to name="otc"
         try:
             code_input = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.NAME, "otc"))
             )
-            logger.info(f"[{domain}] MFA input found without explicit indicators")
+            logger.info(f"[{domain}] MFA input detected via name='otc'")
         except Exception:
             code_input = None
+            logger.info(f"[{domain}] No MFA code input detected after waiting")
 
     if code_input:
         code = pyotp.TOTP(totp_secret).now()
