@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Dict, List
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.tenant import TenantStatus
 
@@ -15,11 +15,12 @@ class TenantBase(BaseModel):
 
 
 class TenantCreate(TenantBase):
+    model_config = ConfigDict(populate_by_name=True)
     microsoft_tenant_id: str
     admin_email: str
     admin_password: str
     onmicrosoft_domain: str
-    licensed_user_email: str | None = None  # Maps to licensed_user_upn
+    licensed_user_upn: str | None = Field(default=None, alias="licensed_user_email")
     provider_order_id: str | None = None
 
 
@@ -109,13 +110,14 @@ class TenantList(BaseModel):
 
 class TenantBulkImport(BaseModel):
     """Schema for bulk importing tenants from CSV."""
+    model_config = ConfigDict(populate_by_name=True)
     microsoft_tenant_id: str
     name: str
     onmicrosoft_domain: str
     provider: str
     admin_email: str
     admin_password: str
-    licensed_user_email: str | None = None
+    licensed_user_upn: str | None = Field(default=None, alias="licensed_user_email")
     provider_order_id: str | None = None
 
 

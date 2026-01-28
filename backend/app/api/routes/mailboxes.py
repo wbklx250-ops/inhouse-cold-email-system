@@ -283,7 +283,7 @@ async def bulk_configure_mailboxes(
     
     For EACH tenant:
     1. Get all mailboxes with status="created"
-    2. Get admin credentials and licensed_user_email from tenant
+    2. Get admin credentials and licensed_user_upn from tenant
     3. For each mailbox:
        a. Enable account
        b. Set password (from mailbox.password field)
@@ -337,7 +337,7 @@ async def bulk_configure_mailboxes(
                     admin_password=tenant.admin_password,
                     email=mailbox.email,
                     password=mailbox.password,
-                    licensed_user_email=tenant.licensed_user_email,
+                    licensed_user_upn=tenant.licensed_user_upn,
                 )
                 
                 if ps_result.get("success"):

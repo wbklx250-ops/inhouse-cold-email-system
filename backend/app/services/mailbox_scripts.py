@@ -23,7 +23,7 @@ class MailboxScriptGenerator:
     def generate_master_script(
         self,
         tenant_id: str,
-        licensed_user_email: str,
+        licensed_user_upn: str,
         mailboxes: List[Dict[str, str]]
     ) -> str:
         """
@@ -31,7 +31,7 @@ class MailboxScriptGenerator:
         
         Args:
             tenant_id: Microsoft tenant ID
-            licensed_user_email: User to delegate mailboxes to
+            licensed_user_upn: User to delegate mailboxes to
             mailboxes: List of {display_name, email, password}
         """
         # Create embedded CSV data
@@ -80,7 +80,7 @@ Write-Host "Connecting to Exchange Online..." -ForegroundColor Yellow
 Connect-ExchangeOnline -Organization "{tenant_id}" -ShowBanner:$false
 
 # Licensed user for delegation
-$licensedUser = "{licensed_user_email}"
+$licensedUser = "{licensed_user_upn}"
 
 # ============================================================
 # STEP 1: CREATE SHARED MAILBOXES

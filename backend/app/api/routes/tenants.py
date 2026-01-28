@@ -87,7 +87,7 @@ async def create_tenant(
         provider=tenant_in.provider,
         admin_email=tenant_in.admin_email,
         admin_password=encrypt_password(tenant_in.admin_password),
-        licensed_user_email=tenant_in.licensed_user_email or "",
+        licensed_user_upn=tenant_in.licensed_user_upn or "",
         status=TenantStatus.NEW,
     )
     db.add(tenant)
@@ -185,7 +185,7 @@ async def bulk_import_tenants(
                 provider=tenant_data.provider,
                 admin_email=tenant_data.admin_email,
                 admin_password=encrypt_password(tenant_data.admin_password),
-                licensed_user_email=tenant_data.licensed_user_email or "",
+                licensed_user_upn=tenant_data.licensed_user_upn or "",
                 status=TenantStatus.NEW,
             )
             db.add(tenant)
@@ -246,7 +246,7 @@ async def bulk_import_tenants_csv(
     Bulk import tenants from CSV file.
     
     CSV format (columns):
-    tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_email,domain_name
+    tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_upn,domain_name
     
     Features:
     - Plain text admin_password storage (MVP)
@@ -277,7 +277,7 @@ async def bulk_import_tenants_csv(
         admin_email = row.get('admin_email', '').strip()
         admin_password = row.get('admin_password', '').strip()
         provider = row.get('provider', '').strip()
-        licensed_user_email = row.get('licensed_user_email', '').strip()
+        licensed_user_upn = row.get('licensed_user_upn', '').strip() or row.get('licensed_user_email', '').strip()
         domain_name = row.get('domain_name', '').strip()
         
         # Validate required fields
@@ -328,7 +328,7 @@ async def bulk_import_tenants_csv(
                 provider=provider,
                 admin_email=admin_email,
                 admin_password=admin_password,  # Plain text for MVP
-                licensed_user_email=licensed_user_email or "",
+                licensed_user_upn=licensed_user_upn or "",
                 status=TenantStatus.NEW,
             )
             db.add(tenant)

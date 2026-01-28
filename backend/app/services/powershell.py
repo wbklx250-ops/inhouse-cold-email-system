@@ -203,7 +203,7 @@ class PowerShellService:
         admin_password: str,
         email: str,
         password: str,
-        licensed_user_email: str
+        licensed_user_upn: str
     ) -> Dict:
         """
         Configure a mailbox:
@@ -217,7 +217,7 @@ class PowerShellService:
             admin_password: M365 admin password
             email: Mailbox email address to configure
             password: Password to set for the mailbox
-            licensed_user_email: Email of licensed user to grant delegation
+            licensed_user_upn: Email of licensed user to grant delegation
             
         Returns: {
             "success": True/False,
@@ -236,7 +236,7 @@ class PowerShellService:
             "AdminPassword": admin_password,
             "Email": email,
             "Password": password,
-            "LicensedUserEmail": licensed_user_email
+            "LicensedUserEmail": licensed_user_upn
         })
         
         if result["success"]:

@@ -336,71 +336,23 @@ class Step6Orchestrator:
                     pass
 
     def _login(self) -> bool:
-        """Login to M365 Admin Portal."""
+        """Login using the proven Step 5 login code."""
         try:
-            self.driver.get("https://admin.microsoft.com")
-            time.sleep(2)
+            from app.services.selenium.admin_portal import _login_with_mfa
 
-            # Enter email
-            from selenium.webdriver.common.by import By
-            from selenium.webdriver.support.ui import WebDriverWait
-            from selenium.webdriver.support import expected_conditions as EC
+            _login_with_mfa(
+                driver=self.driver,
+                admin_email=self.admin_email,
+                admin_password=self.admin_password,
+                totp_secret=self.totp_secret,
+                domain=self.domain,
+            )
 
-            wait = WebDriverWait(self.driver, 15)
-
-            email_input = wait.until(EC.presence_of_element_located((By.NAME, "loginfmt")))
-            email_input.send_keys(self.admin_email)
-
-            # Click Next
-            next_btn = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
-            next_btn.click()
-            time.sleep(2)
-
-            # Enter password
-            password_input = wait.until(EC.presence_of_element_located((By.NAME, "passwd")))
-            password_input.send_keys(self.admin_password)
-
-            # Click Sign In
-            signin_btn = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
-            signin_btn.click()
-            time.sleep(3)
-
-            # Handle TOTP if needed
-            if self.totp_secret and "totp" in self.driver.current_url.lower():
-                import pyotp
-
-                totp = pyotp.TOTP(self.totp_secret)
-                code = totp.now()
-
-                code_input = wait.until(EC.presence_of_element_located((By.NAME, "otc")))
-                code_input.send_keys(code)
-
-                verify_btn = wait.until(
-                    EC.element_to_be_clickable((By.ID, "idSubmit_SAOTCC_Continue"))
-                )
-                verify_btn.click()
-                time.sleep(3)
-
-            # Handle "Stay signed in?" prompt
-            try:
-                stay_signed_in = wait.until(EC.element_to_be_clickable((By.ID, "idSIButton9")))
-                stay_signed_in.click()
-                time.sleep(2)
-            except Exception:
-                pass
-
-            # Verify we're logged in
-            time.sleep(3)
-            if "admin.microsoft.com" in self.driver.current_url or "portal" in self.driver.current_url:
-                logger.info("[%s] Login successful", self.domain)
-                return True
-
-            self._screenshot("login_failed")
-            return False
-
+            logger.info("[%s] Login successful", self.domain)
+            return True
         except Exception as e:
             logger.error("[%s] Login failed: %s", self.domain, e)
-            self._screenshot("login_error")
+            self._screenshot("login_failed")
             return False
 
     def _create_licensed_user(self) -> Dict[str, Any]:
@@ -497,7 +449,7 @@ class Step6Orchestrator:
         result = self.user_ops.fix_upns_bulk(users)
         return len(result.get("fixed", []))
 
-    def _delegate_mailboxes(self, mailbox_data: List[Dict[str, Any]], licensed_user_email: str) -> int:
+    def _delegate_mailboxes(self, mailbox_data: List[Dict[str, Any]], licensed_user_upn: str) -> int:
         """Delegate mailboxes to licensed user via Exchange API."""
         delegated = 0
 
@@ -507,7 +459,7 @@ class Step6Orchestrator:
             asyncio.set_event_loop(loop)
             try:
                 result = loop.run_until_complete(
-                    self.exchange_service.delegate_mailboxes_bulk(emails, licensed_user_email)
+                    self.exchange_service.delegate_mailboxes_bulk(emails, licensed_user_upn)
                 )
                 delegated = len(result.get("delegated", []))
             finally:
@@ -664,7 +616,7 @@ async def _update_tenant_step6_status(db: AsyncSession, tenant_id: str, result: 
         # Update licensed user info
         if result.get("licensed_user", {}).get("success"):
             values["licensed_user_created"] = True
-            values["licensed_user_email"] = result["licensed_user"]["email"]
+            values["licensed_user_upn"] = result["licensed_user"]["email"]
             values["licensed_user_password"] = result["licensed_user"].get(
                 "password", LICENSED_USER_PASSWORD
             )

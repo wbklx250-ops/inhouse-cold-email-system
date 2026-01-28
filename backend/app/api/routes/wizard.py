@@ -2231,7 +2231,7 @@ async def get_step6_status(
                 "step6_started": tenant.step6_started,
                 "step6_complete": tenant.step6_complete,
                 "step6_error": tenant.step6_error,
-                "licensed_user": tenant.licensed_user_email,
+                "licensed_user": tenant.licensed_user_upn,
                 "mailbox_count": mailbox_count,
                 "progress": {
                     "mailboxes_created": tenant.step6_mailboxes_created,
@@ -2399,11 +2399,11 @@ async def export_mailboxes_csv(
 
     for tenant in tenants:
         # First row: Licensed user (me1)
-        if tenant.licensed_user_email:
+        if tenant.licensed_user_upn:
             writer.writerow(
                 [
                     display_name or "Licensed User",
-                    tenant.licensed_user_email,
+                    tenant.licensed_user_upn,
                     tenant.licensed_user_password or "#Sendemails1",
                 ]
             )
@@ -2993,7 +2993,7 @@ async def wizard_import_tenants(
     """
     Step 4: Import tenants from CSV and auto-link to domains.
     
-    CSV format: tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_email,domain_name
+    CSV format: tenant_name,microsoft_tenant_id,onmicrosoft_domain,admin_email,admin_password,provider,licensed_user_upn,domain_name
     """
     try:
         content = await file.read()
@@ -3027,7 +3027,7 @@ async def wizard_import_tenants(
                 admin_email=row.get('admin_email', '').strip(),
                 admin_password=row.get('admin_password', '').strip(),
                 provider=row.get('provider', '').strip(),
-                licensed_user_email=row.get('licensed_user_email', '').strip(),
+                licensed_user_upn=row.get('licensed_user_upn', '').strip() or row.get('licensed_user_email', '').strip(),
                 status=TenantStatus.IMPORTED
             )
             

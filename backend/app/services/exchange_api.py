@@ -274,24 +274,24 @@ class ExchangeAPIService:
     async def delegate_mailbox_to_user(
         self,
         mailbox_email: str,
-        licensed_user_email: str,
+        licensed_user_upn: str,
     ) -> Dict[str, Any]:
         """
         Add full delegation (FullAccess + SendAs) to a mailbox.
 
         Args:
             mailbox_email: The shared mailbox
-            licensed_user_email: The me1@... user
+            licensed_user_upn: The me1@... user
         """
         results = {
             "full_access": await self.add_mailbox_permission(
                 mailbox_email,
-                licensed_user_email,
+                licensed_user_upn,
                 "FullAccess",
             ),
             "send_as": await self.add_send_as_permission(
                 mailbox_email,
-                licensed_user_email,
+                licensed_user_upn,
             ),
         }
 
@@ -301,7 +301,7 @@ class ExchangeAPIService:
     async def delegate_mailboxes_bulk(
         self,
         mailbox_emails: List[str],
-        licensed_user_email: str,
+        licensed_user_upn: str,
     ) -> Dict[str, Any]:
         """
         Delegate multiple mailboxes to licensed user.
@@ -309,7 +309,7 @@ class ExchangeAPIService:
         results = {"delegated": [], "failed": []}
 
         for email in mailbox_emails:
-            result = await self.delegate_mailbox_to_user(email, licensed_user_email)
+            result = await self.delegate_mailbox_to_user(email, licensed_user_upn)
 
             if result.get("success"):
                 results["delegated"].append(email)
