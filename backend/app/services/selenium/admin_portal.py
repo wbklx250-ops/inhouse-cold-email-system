@@ -3,6 +3,8 @@ import re
 import os
 import json
 import pyotp
+import tempfile
+import uuid
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -393,19 +395,20 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     # ===== SETUP BROWSER =====
     opts = Options()
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--window-size=1920,1080")
     if headless:
         opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--disable-extensions")
-    opts.add_argument("--disable-infobars")
-    opts.add_argument("--disable-notifications")
-    opts.add_argument("--disable-popup-blocking")
-    opts.add_experimental_option("prefs", {"credentials_enable_service": False, "profile.password_manager_enabled": False})
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--disable-blink-features=AutomationControlled")
+    profile_dir = tempfile.mkdtemp(prefix=f"chrome-profile-admin-{uuid.uuid4()}-")
+    opts.add_argument(f"--user-data-dir={profile_dir}")
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     
     driver = webdriver.Chrome(options=opts)
+    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+    driver._profile_dir = profile_dir
     driver.implicitly_wait(15)  # Increased from 10
     driver.set_page_load_timeout(60)  # Add page load timeout
     logger.info(f"[{domain}] Browser initialized successfully")

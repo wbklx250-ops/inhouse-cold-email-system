@@ -38,6 +38,13 @@ class TokenExtractor:
                 logger.info("Got Graph token via Graph Explorer")
                 return token
 
+            # Method 2: Implicit OAuth flow (Graph Explorer client)
+            logger.info("Trying implicit OAuth flow...")
+            token = self.get_graph_token_via_implicit_flow()
+            if token:
+                logger.info("Got Graph token via implicit OAuth flow")
+                return token
+
             # Method 2: Try to get from sessionStorage/localStorage
             logger.info("Trying storage extraction...")
             token = self._get_token_from_storage()
@@ -72,13 +79,24 @@ class TokenExtractor:
             # The M365 Admin Portal stores MSAL tokens with specific key patterns
             script = """
                 function findGraphToken() {
+                    const looksLikeJwt = (value) => value && value.startsWith('eyJ') && value.length > 200;
+                    const isGraphToken = (jwt) => {
+                        try {
+                            const payload = JSON.parse(atob(jwt.split('.')[1]));
+                            const aud = payload.aud || '';
+                            return aud.includes('graph.microsoft.com') || aud.includes('00000003-0000-0000-c000-000000000000');
+                        } catch (e) {
+                            return false;
+                        }
+                    };
+
                     // Check sessionStorage
                     for (let i = 0; i < sessionStorage.length; i++) {
                         let key = sessionStorage.key(i);
                         let value = sessionStorage.getItem(key);
 
                         // MSAL v2 stores tokens with keys containing 'accesstoken'
-                        if (key.toLowerCase().includes('accesstoken')) {
+                        if (key.toLowerCase().includes('accesstoken') || key.toLowerCase().includes('msal')) {
                             try {
                                 let parsed = JSON.parse(value);
                                 // Look for Graph API audience
@@ -88,7 +106,17 @@ class TokenExtractor:
                                 )) {
                                     return parsed.secret;
                                 }
+                                if (parsed.secret && isGraphToken(parsed.secret)) {
+                                    return parsed.secret;
+                                }
+                                if (parsed.accessToken && isGraphToken(parsed.accessToken)) {
+                                    return parsed.accessToken;
+                                }
                             } catch(e) {}
+                        }
+
+                        if (looksLikeJwt(value) && isGraphToken(value)) {
+                            return value;
                         }
                     }
 
@@ -97,7 +125,7 @@ class TokenExtractor:
                         let key = localStorage.key(i);
                         let value = localStorage.getItem(key);
 
-                        if (key.toLowerCase().includes('accesstoken')) {
+                        if (key.toLowerCase().includes('accesstoken') || key.toLowerCase().includes('msal')) {
                             try {
                                 let parsed = JSON.parse(value);
                                 if (parsed.secret && (
@@ -106,7 +134,17 @@ class TokenExtractor:
                                 )) {
                                     return parsed.secret;
                                 }
+                                if (parsed.secret && isGraphToken(parsed.secret)) {
+                                    return parsed.secret;
+                                }
+                                if (parsed.accessToken && isGraphToken(parsed.accessToken)) {
+                                    return parsed.accessToken;
+                                }
                             } catch(e) {}
+                        }
+
+                        if (looksLikeJwt(value) && isGraphToken(value)) {
+                            return value;
                         }
                     }
 
@@ -116,7 +154,7 @@ class TokenExtractor:
                             let key = storage.key(i);
                             let value = storage.getItem(key);
 
-                            if (value && value.startsWith('eyJ')) {
+                            if (looksLikeJwt(value)) {
                                 // Decode JWT to check audience
                                 try {
                                     let payload = JSON.parse(atob(value.split('.')[1]));
@@ -132,11 +170,11 @@ class TokenExtractor:
                             // Also check JSON values
                             try {
                                 let parsed = JSON.parse(value);
-                                if (parsed.secret && parsed.secret.startsWith('eyJ')) {
-                                    let payload = JSON.parse(atob(parsed.secret.split('.')[1]));
-                                    if (payload.aud && payload.aud.includes('graph')) {
-                                        return parsed.secret;
-                                    }
+                                if (parsed.secret && looksLikeJwt(parsed.secret) && isGraphToken(parsed.secret)) {
+                                    return parsed.secret;
+                                }
+                                if (parsed.accessToken && looksLikeJwt(parsed.accessToken) && isGraphToken(parsed.accessToken)) {
+                                    return parsed.accessToken;
                                 }
                             } catch(e) {}
                         }
@@ -322,6 +360,18 @@ class TokenExtractor:
             # Open Graph Explorer in same session
             self.driver.get("https://developer.microsoft.com/en-us/graph/graph-explorer")
             time.sleep(5)
+
+            # Click sign-in/consent button if present
+            try:
+                sign_in_button = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable(
+                        (By.XPATH, "//button[contains(., 'Sign in') or contains(., 'Sign In') or contains(., 'Sign in to Graph Explorer')]"),
+                    )
+                )
+                sign_in_button.click()
+                time.sleep(5)
+            except Exception:
+                pass
 
             # First try storage extraction inside Graph Explorer context
             token = self.driver.execute_script(

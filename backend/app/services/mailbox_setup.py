@@ -180,12 +180,33 @@ class Step6Orchestrator:
                     "Graph + Exchange tokens OK",
                 )
             else:
-                update_progress(
-                    self.tenant_id,
-                    "token",
-                    "partial",
-                    "Exchange only (Graph failed)",
+                logger.info(
+                    "[%s] Selenium Graph extraction failed, trying ROPC...",
+                    self.domain,
                 )
+
+                from app.services.graph_auth import get_graph_token_ropc_sync
+
+                graph_token = get_graph_token_ropc_sync(self.admin_email, self.admin_password)
+
+                if graph_token:
+                    self.graph_service = GraphAPIService(graph_token)
+                    update_progress(
+                        self.tenant_id,
+                        "token",
+                        "complete",
+                        "All tokens acquired (ROPC)",
+                    )
+                else:
+                    update_progress(
+                        self.tenant_id,
+                        "token",
+                        "partial",
+                        "Exchange only (Graph failed)",
+                    )
+
+            if not self.exchange_service:
+                raise Exception("No Exchange token available")
 
             # Step 3: Create licensed user (me1)
             update_progress(
@@ -388,39 +409,20 @@ class Step6Orchestrator:
         """Create shared mailboxes via Exchange API or UI."""
         created = 0
 
-        if self.exchange_service:
-            # Use Exchange API (fast)
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    self.exchange_service.create_shared_mailboxes_bulk(mailbox_data)
-                )
-                created = len(result.get("created", [])) + len(result.get("skipped", []))
-            finally:
-                loop.close()
-        else:
-            # Fallback to UI (slow but works)
-            created = self._create_mailboxes_via_ui(mailbox_data)
+        if not self.exchange_service:
+            logger.error("No Exchange token - cannot create mailboxes")
+            return 0
 
-        return created
-
-    def _create_mailboxes_via_ui(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Create mailboxes via Exchange Admin UI (fallback)."""
-        created = 0
-
-        # Navigate to Exchange Admin
-        self.driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
-        time.sleep(5)
-
-        for mb in mailbox_data:
-            try:
-                # This would be the UI automation to create each mailbox
-                # For now, log that we need this implemented
-                logger.warning("UI mailbox creation not fully implemented: %s", mb["email"])
-                created += 1  # Placeholder
-            except Exception as e:
-                logger.error("Failed to create %s: %s", mb["email"], e)
+        # Use Exchange API (fast)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.exchange_service.create_shared_mailboxes_bulk(mailbox_data)
+            )
+            created = len(result.get("created", [])) + len(result.get("skipped", []))
+        finally:
+            loop.close()
 
         return created
 
@@ -428,26 +430,29 @@ class Step6Orchestrator:
         """Fix display names (remove number suffixes)."""
         fixed = 0
 
-        if self.exchange_service:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    self.exchange_service.fix_display_names_bulk(
-                        mailbox_data,
-                        self.display_name,
-                    )
+        if not self.exchange_service:
+            logger.error("No Exchange token - cannot fix display names")
+            return 0
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.exchange_service.fix_display_names_bulk(
+                    mailbox_data,
+                    self.display_name,
                 )
-                fixed = len(result.get("fixed", []))
-            finally:
-                loop.close()
+            )
+            fixed = len(result.get("fixed", []))
+        finally:
+            loop.close()
 
         return fixed
 
     def _enable_accounts(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Enable user accounts via Graph API."""
         if not self.graph_service:
-            logger.warning("No Graph token - skipping account enable")
+            logger.error("No Graph token - skipping account enable")
             return 0
 
         upns = [f"{mb['local_part']}@{self.onmicrosoft_domain}" for mb in mailbox_data]
@@ -463,7 +468,7 @@ class Step6Orchestrator:
     def _set_passwords(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Set passwords via Graph API."""
         if not self.graph_service:
-            logger.warning("No Graph token - skipping password set")
+            logger.error("No Graph token - skipping password set")
             return 0
 
         users = [
@@ -485,7 +490,7 @@ class Step6Orchestrator:
     def _fix_upns(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Fix UPNs via Graph API."""
         if not self.graph_service:
-            logger.warning("No Graph token - skipping UPN fix")
+            logger.error("No Graph token - skipping UPN fix")
             return 0
 
         users = [
@@ -508,17 +513,20 @@ class Step6Orchestrator:
         """Delegate mailboxes to licensed user via Exchange API."""
         delegated = 0
 
-        if self.exchange_service:
-            emails = [mb["email"] for mb in mailbox_data]
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                result = loop.run_until_complete(
-                    self.exchange_service.delegate_mailboxes_bulk(emails, licensed_user_upn)
-                )
-                delegated = len(result.get("delegated", []))
-            finally:
-                loop.close()
+        if not self.exchange_service:
+            logger.error("No Exchange token - cannot delegate mailboxes")
+            return 0
+
+        emails = [mb["email"] for mb in mailbox_data]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.exchange_service.delegate_mailboxes_bulk(emails, licensed_user_upn)
+            )
+            delegated = len(result.get("delegated", []))
+        finally:
+            loop.close()
 
         return delegated
 
