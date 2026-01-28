@@ -530,6 +530,54 @@ class BrowserWorker:
         
         logger.warning(f"[W{worker_id}] ⚠️ Page still empty/short after {timeout}s! Length: {len(page_text)}")
         return page_text
+
+    def _wait_for_password_change_complete(self, timeout: int = LONG_WAIT) -> bool:
+        """
+        Wait for the password change page to transition.
+
+        Success when either:
+        - URL no longer contains 'update' or 'password'
+        - MFA setup page keywords are present
+        """
+        worker_id = getattr(self, 'worker_id', 0)
+        mfa_keywords = [
+            "protect your account",
+            "authenticator",
+            "action required",
+            "more information required",
+            "keep your account secure",
+        ]
+
+        def password_change_complete(driver) -> bool:
+            url = driver.current_url.lower()
+            url_moved_on = "update" not in url and "password" not in url
+
+            try:
+                page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+            except Exception:
+                page_text = ""
+
+            has_mfa_keywords = any(keyword in page_text for keyword in mfa_keywords)
+            return url_moved_on or has_mfa_keywords
+
+        try:
+            WebDriverWait(self.driver, timeout, poll_frequency=1).until(password_change_complete)
+            url = self.driver.current_url.lower()
+            try:
+                page_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+            except Exception:
+                page_text = ""
+
+            url_moved_on = "update" not in url and "password" not in url
+            matched_keywords = [keyword for keyword in mfa_keywords if keyword in page_text]
+            logger.info(
+                f"[W{worker_id}] ✓ Password change transition detected: "
+                f"url_moved_on={url_moved_on}, keywords={matched_keywords}"
+            )
+            return True
+        except Exception as e:
+            logger.warning(f"[W{worker_id}] Password change transition not detected within {timeout}s: {e}")
+            return False
     
     def _extract_totp_with_retry(self, max_attempts: int = 3) -> Optional[str]:
         """
@@ -1688,9 +1736,11 @@ class BrowserWorker:
                                      self._click("//button[contains(.,'Change')]", 3)
                     logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Submit button clicked: {submit_clicked}")
                 
-                # Longer wait after password change submission
-                logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Waiting 5 seconds for redirect...")
-                time.sleep(5)
+                # Longer explicit wait after password change submission
+                logger.info(
+                    f"[W{self.worker_id}] [PASSWORD CHANGE] Waiting for page transition (up to {LONG_WAIT}s)..."
+                )
+                self._wait_for_password_change_complete(timeout=LONG_WAIT)
                 self._screenshot("08_after_password_change")
                 logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] After submit URL: {self.driver.current_url}")
                 
