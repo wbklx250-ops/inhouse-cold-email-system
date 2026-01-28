@@ -353,30 +353,34 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
     )
     password_field.clear()
     password_field.send_keys(admin_password + Keys.RETURN)
-    
-    # IMPORTANT: Wait for MFA prompt to appear - don't check immediately!
-    # Railway headless is slower, so we must explicitly wait for the MFA input field
-    logger.info(f"[{domain}] Waiting for MFA prompt to appear (up to 30s)...")
-    
+    time.sleep(3)
+
+    # Detect MFA prompt by page text OR input field
+    page_text = driver.page_source.lower()
+    mfa_indicators = [
+        "verify your identity",
+        "verification code",
+        "use the authenticator",
+        "enter code",
+        "sign in with a code",
+    ]
+    mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
+
     code_input = None
-    
-    # Method 1: Wait for the specific Microsoft MFA input ID (most reliable)
-    try:
-        code_input = WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.ID, "idTxtBx_SAOTCC_OTC"))
+    if mfa_detected:
+        logger.info(f"[{domain}] MFA detected, waiting for TOTP input...")
+        code_input = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.NAME, "otc"))
         )
-        logger.info(f"[{domain}] MFA input detected via ID (idTxtBx_SAOTCC_OTC)")
-    except Exception:
-        logger.info(f"[{domain}] MFA input not found via ID, trying name='otc'...")
-        # Method 2: Fallback to name="otc"
+    else:
+        # Still check if the code input shows up even without text indicators
         try:
             code_input = WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.NAME, "otc"))
             )
-            logger.info(f"[{domain}] MFA input detected via name='otc'")
+            logger.info(f"[{domain}] MFA input found without explicit indicators")
         except Exception:
             code_input = None
-            logger.info(f"[{domain}] No MFA code input detected after waiting")
 
     if code_input:
         code = pyotp.TOTP(totp_secret).now()
@@ -419,8 +423,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     logger.info(f"[{domain}] Creating browser with headless={headless}")
     worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
     driver = worker._create_driver()
-    driver.implicitly_wait(30)  # Increased from 15 for Railway headless
-    driver.set_page_load_timeout(90)  # Increased from 60 for Railway headless
+    driver.implicitly_wait(15)  # Increased from 10
+    driver.set_page_load_timeout(60)  # Add page load timeout
     logger.info(f"[{domain}] Browser initialized successfully")
     
     # ===== STEP 1: LOGIN =====
@@ -442,24 +446,14 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     logger.info(f"[{domain}] Step 2: Navigate to domains page")
     driver.get("https://admin.microsoft.com/#/Domains")
     wait_for_page_load(driver, timeout=30)
-    time.sleep(10)  # Increased from 8 for Railway headless - page fully render
+    time.sleep(8)  # Increased from 5 for page to fully render
     
-    # Explicit wait for domain page elements before URL check
-    try:
-        WebDriverWait(driver, 15).until(
-            lambda d: "domains" in d.current_url.lower() or 
-                      "domain" in d.find_element(By.TAG_NAME, "body").text.lower()
-        )
-        logger.info(f"[{domain}] Domain page elements detected")
-    except Exception as e:
-        logger.warning(f"[{domain}] Explicit wait for domain page timed out: {e}")
-    
-    # Verify we're on domains page with increased wait between attempts
+    # Verify we're on domains page
     for check_attempt in range(10):
         if "domains" in driver.current_url.lower():
             logger.info(f"[{domain}] Successfully reached domains page")
             break
-        time.sleep(3)  # Increased from 1s to 3s for Railway headless
+        time.sleep(1)
     else:
         raise Exception("Could not reach domains page after 10 attempts")
     

@@ -24,7 +24,7 @@ from queue import Queue, Empty
 logger = logging.getLogger(__name__)
 
 # Configuration
-MAX_BROWSERS = 2  # Reduced from 3 for Railway to give each browser more resources
+MAX_BROWSERS = 3
 DNS_CHECK_INTERVAL = 120  # 2 minutes
 MAX_DNS_WAIT_TIME = 1200  # 20 minutes (10 attempts x 2 minutes)
 MAX_RETRY_ATTEMPTS = 10

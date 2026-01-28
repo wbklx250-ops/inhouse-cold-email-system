@@ -10,7 +10,6 @@ This is MUCH faster than clicking through the UI for bulk operations.
 import json
 import time
 import logging
-import requests
 from typing import Optional, Dict, Any
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -616,103 +615,91 @@ class TokenExtractor:
             return None
 
     def extract_exchange_token(self) -> Optional[str]:
-        """Extract token by testing ALL tokens against Exchange API."""
+        """Extract Exchange token by intercepting actual API calls."""
         
-        logger.info("Extracting Exchange token...")
+        logger.info("Extracting Exchange token via network interception...")
         
-        # Navigate to Exchange Admin to ensure tokens are populated
-        self.driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
-        time.sleep(10)  # Wait for full page load and API calls
-        
-        # Get ALL tokens from storage - including encrypted JWE tokens
-        script = '''
-            let tokens = new Set();  // Use Set to avoid duplicates
-            const storages = [localStorage, sessionStorage];
+        # First inject the interceptor
+        setup_script = '''
+            window.__exchangeToken = null;
             
-            for (const storage of storages) {
-                for (let i = 0; i < storage.length; i++) {
-                    const key = storage.key(i);
-                    const value = storage.getItem(key);
-                    if (!value) continue;
-                    
-                    // Method 1: Parse as JSON and get secret/accessToken
-                    try {
-                        const parsed = JSON.parse(value);
-                        const token = parsed.secret || parsed.accessToken || parsed.access_token;
-                        if (token && token.startsWith('eyJ') && token.length > 500) {
-                            tokens.add(token);
-                        }
-                    } catch(e) {}
-                    
-                    // Method 2: Raw token in value
-                    if (value.startsWith('eyJ') && value.length > 500) {
-                        tokens.add(value);
-                    }
-                    
-                    // Method 3: Token embedded in larger string
-                    const matches = value.match(/eyJ[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+/g);
-                    if (matches) {
-                        matches.forEach(m => {
-                            if (m.length > 500) tokens.add(m);
-                        });
+            // Intercept XMLHttpRequest
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+            
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__url = url;
+                return origOpen.apply(this, arguments);
+            };
+            
+            XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                if (name.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+                    if (this.__url && (
+                        this.__url.includes('outlook.office365.com') ||
+                        this.__url.includes('outlook.office.com')
+                    )) {
+                        window.__exchangeToken = value.replace('Bearer ', '');
+                        console.log('Captured Exchange token from XHR');
                     }
                 }
-            }
+                return origSetHeader.apply(this, arguments);
+            };
             
-            return Array.from(tokens);
+            // Intercept fetch
+            const origFetch = window.fetch;
+            window.fetch = function(url, options) {
+                const urlStr = (typeof url === 'string') ? url : url.toString();
+                if (urlStr.includes('outlook.office365.com') || urlStr.includes('outlook.office.com')) {
+                    if (options && options.headers) {
+                        const headers = options.headers;
+                        let auth = null;
+                        if (typeof headers.get === 'function') {
+                            auth = headers.get('Authorization');
+                        } else {
+                            auth = headers['Authorization'] || headers['authorization'];
+                        }
+                        if (auth && auth.startsWith('Bearer ')) {
+                            window.__exchangeToken = auth.replace('Bearer ', '');
+                            console.log('Captured Exchange token from fetch');
+                        }
+                    }
+                }
+                return origFetch.apply(this, arguments);
+            };
+            
+            return 'Interceptors installed';
         '''
         
-        tokens = self.driver.execute_script(script) or []
-        logger.info(f"Found {len(tokens)} potential tokens to test")
-        
-        if not tokens:
-            logger.error("No tokens found in browser storage")
-            return None
-        
-        # Test each token against Exchange API
-        # Try multiple Exchange endpoints
-        test_endpoints = [
-            "https://outlook.office365.com/adminapi/beta/Mailbox?$top=1",
-            "https://outlook.office365.com/adminapi/beta/Me",
-            "https://admin.exchange.microsoft.com/beta/Recipient?$top=1"
-        ]
-        
-        for i, token in enumerate(tokens):
-            token_preview = token[:50] + "..." if len(token) > 50 else token
-            logger.info(f"Testing token {i+1}/{len(tokens)}: {token_preview}")
+        try:
+            # Install interceptors
+            self.driver.execute_script(setup_script)
             
-            for endpoint in test_endpoints:
-                try:
-                    response = requests.get(
-                        endpoint,
-                        headers={
-                            "Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json",
-                            "Accept": "application/json"
-                        },
-                        timeout=15
-                    )
-                    
-                    logger.info(f"  {endpoint.split('/')[-1]}: {response.status_code}")
-                    
-                    if response.status_code == 200:
-                        logger.info(f" Token {i+1} WORKS with Exchange API!")
-                        return token
-                    elif response.status_code == 401:
-                        # This token doesn't work, try next
-                        break  # No point trying other endpoints with same token
-                    elif response.status_code == 403:
-                        # Might work for other operations, keep testing
-                        continue
-                        
-                except requests.exceptions.RequestException as e:
-                    logger.debug(f"  Request failed: {e}")
-                    continue
+            # Navigate to Exchange Admin - this triggers API calls
+            self.driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
+            time.sleep(10)  # Wait for page to load and make API calls
+            
+            # Check if we captured a token
+            token = self.driver.execute_script("return window.__exchangeToken;")
+            
+            if token:
+                logger.info(f" Captured Exchange token (length: {len(token)})")
+                return token
+            
+            # Try refreshing to trigger more API calls
+            logger.info("No token yet, refreshing page...")
+            self.driver.refresh()
+            time.sleep(8)
+            
+            token = self.driver.execute_script("return window.__exchangeToken;")
+            
+            if token:
+                logger.info(f" Captured Exchange token on refresh (length: {len(token)})")
+                return token
+                
+        except Exception as e:
+            logger.error(f"Token interception failed: {e}")
         
-        # If no token worked, log the 401 responses for debugging
-        logger.error("No working Exchange token found after testing all tokens")
-        logger.error("This likely means the Exchange Admin session tokens don't have API permissions")
-        
+        logger.error("No Exchange token captured from network")
         return None
 
     def _capture_exchange_token_from_network(self) -> Optional[str]:
