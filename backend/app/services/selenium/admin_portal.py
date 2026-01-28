@@ -5,6 +5,8 @@ import json
 import pyotp
 import tempfile
 import uuid
+import shutil
+from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -19,6 +21,69 @@ SCREENSHOTS = "C:/temp/screenshots"
 STATUS_DIR = "C:/temp/automation_status"
 os.makedirs(SCREENSHOTS, exist_ok=True)
 os.makedirs(STATUS_DIR, exist_ok=True)
+SCREENSHOT_DIR = "/tmp/screenshots"
+os.makedirs(SCREENSHOT_DIR, exist_ok=True)
+
+
+class BrowserWorker:
+    """Single browser for tenant automation."""
+
+    def __init__(self, worker_id: int, headless: bool = True):
+        self.worker_id = worker_id
+        self.headless = headless
+        self.driver = None
+        self.tenant_id = None  # Set during process() for screenshot naming
+
+    def _screenshot(self, step_name: str) -> str:
+        """Take screenshot and return path. Always captures current state."""
+        if not self.driver:
+            return ""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"{timestamp}_{self.tenant_id}_{step_name}.png"
+            path = os.path.join(SCREENSHOT_DIR, filename)
+            self.driver.save_screenshot(path)
+            logger.info(f"[W{self.worker_id}] =ø Screenshot: {path}")
+            return path
+        except Exception as e:
+            logger.error(f"[W{self.worker_id}] Screenshot failed: {e}")
+            return ""
+
+    def _create_driver(self):
+        opts = Options()
+        if self.headless:
+            opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--disable-blink-features=AutomationControlled")
+        profile_dir = tempfile.mkdtemp(prefix=f"chrome-profile-{self.worker_id}-{uuid.uuid4()}-")
+        opts.add_argument(f"--user-data-dir={profile_dir}")
+        opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+
+        driver = webdriver.Chrome(options=opts)
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        driver._profile_dir = profile_dir
+        return driver
+
+
+def _cleanup_driver(driver):
+    """Properly close driver and cleanup temp profile directory."""
+    if not driver:
+        return
+    profile_dir = getattr(driver, '_profile_dir', None)
+    try:
+        driver.quit()
+    except Exception as e:
+        logger.warning(f"Error closing driver: {e}")
+    if profile_dir:
+        try:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+            logger.debug(f"Cleaned up profile dir: {profile_dir}")
+        except Exception as e:
+            logger.warning(f"Could not cleanup profile dir {profile_dir}: {e}")
+
 
 def screenshot(driver, name, domain):
     try:
@@ -394,21 +459,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     result = {"success": False, "verified": False, "dns_configured": False, "error": None}
     
     # ===== SETUP BROWSER =====
-    opts = Options()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    profile_dir = tempfile.mkdtemp(prefix=f"chrome-profile-admin-{uuid.uuid4()}-")
-    opts.add_argument(f"--user-data-dir={profile_dir}")
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-    
-    driver = webdriver.Chrome(options=opts)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-    driver._profile_dir = profile_dir
+    worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
+    driver = worker._create_driver()
     driver.implicitly_wait(15)  # Increased from 10
     driver.set_page_load_timeout(60)  # Add page load timeout
     logger.info(f"[{domain}] Browser initialized successfully")
@@ -1156,11 +1208,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     time.sleep(3)
     
     # ===== CLOSE BROWSER =====
-    if driver:
-        try:
-            driver.quit()
-            logger.info(f"[{domain}] Browser closed")
-        except:
-            pass
+    _cleanup_driver(driver)
+    logger.info(f"[{domain}] Browser closed and profile cleaned up")
     
     return result
+
