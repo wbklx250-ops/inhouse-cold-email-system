@@ -9,12 +9,10 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
 import logging
-import subprocess
 
 logger = logging.getLogger(__name__)
 SCREENSHOTS = "C:/temp/screenshots"
@@ -396,13 +394,6 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     result = {"success": False, "verified": False, "dns_configured": False, "error": None}
     
     # ===== SETUP BROWSER =====
-    # Cleanup any orphaned Chrome/Chromedriver processes (Railway runs Linux)
-    try:
-        subprocess.run(["pkill", "-f", "chrome"], capture_output=True)
-        subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True)
-        time.sleep(2)
-    except Exception as e:
-        logger.warning(f"[{domain}] Chrome cleanup failed: {e}")
     opts = Options()
     if headless:
         opts.add_argument("--headless=new")
@@ -415,8 +406,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     opts.add_argument(f"--user-data-dir={profile_dir}")
     opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     
-    service = Service(log_path="/tmp/chromedriver.log")
-    driver = webdriver.Chrome(service=service, options=opts)
+    driver = webdriver.Chrome(options=opts)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     driver._profile_dir = profile_dir
     driver.implicitly_wait(15)  # Increased from 10

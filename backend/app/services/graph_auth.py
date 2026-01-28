@@ -77,23 +77,55 @@ def get_graph_token_device_code(driver: webdriver.Chrome, tenant_domain: str) ->
                 EC.element_to_be_clickable((By.ID, "idSIButton9"))
             )
             next_btn.click()
-            time.sleep(3)
+            time.sleep(5)
+
+            # Handle "Pick an account" page - click the signed-in account
+            try:
+                # Look for the account tile (the signed-in user)
+                account_tile = WebDriverWait(driver, 15).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".table[data-test-id]"))
+                )
+                account_tile.click()
+                logger.info("Clicked signed-in account")
+                time.sleep(5)
+            except Exception:
+                # Try alternative selectors
+                try:
+                    # Click on the account row
+                    account = driver.find_element(
+                        By.XPATH,
+                        "//div[contains(@class, 'table')]//div[contains(@data-test-id, 'admin@') or contains(text(), 'Signed in')]",
+                    )
+                    account.click()
+                    logger.info("Clicked account via alternative selector")
+                    time.sleep(5)
+                except Exception:
+                    try:
+                        # Click first account in list
+                        account = driver.find_element(By.CSS_SELECTOR, "[data-test-id*='@']")
+                        account.click()
+                        logger.info("Clicked first account")
+                        time.sleep(5)
+                    except Exception:
+                        logger.warning(
+                            "Could not find account to click, may proceed automatically"
+                        )
 
             # Should auto-approve since already logged in
             # Look for Continue or confirmation
             try:
-                continue_btn = WebDriverWait(driver, 10).until(
+                continue_btn = WebDriverWait(driver, 15).until(
                     EC.element_to_be_clickable((By.ID, "idSIButton9"))
                 )
                 continue_btn.click()
                 logger.info("Clicked Continue button")
-                time.sleep(3)
+                time.sleep(5)
             except Exception:
                 pass  # May not need to click anything else
 
             # Check for success message
             try:
-                WebDriverWait(driver, 10).until(
+                WebDriverWait(driver, 15).until(
                     EC.presence_of_element_located(
                         (
                             By.XPATH,
