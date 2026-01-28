@@ -37,6 +37,7 @@ from selenium.webdriver.support import expected_conditions as EC
 
 import pyotp
 from PIL import Image
+from uuid import UUID
 
 try:
     from pyzbar.pyzbar import decode as decode_qr
@@ -89,6 +90,46 @@ _progress = {"completed": 0, "failed": 0, "total": 0}
 _progress_lock = threading.Lock()
 
 
+# === CRITICAL: Save TOTP immediately (sync helper for thread workers) ===
+def _save_totp_immediately_sync(
+    tenant_id: str,
+    totp_secret: str,
+    new_password: Optional[str],
+    worker_id: int = 0,
+) -> bool:
+    """
+    Save TOTP (and new password if present) immediately from a sync thread.
+    Uses an async session via asyncio.run to persist before MFA enrollment finishes.
+    """
+    async def _save():
+        from app.db.session import async_session_factory
+        from app.models.tenant import Tenant
+
+        async with async_session_factory() as session:
+            tenant = await session.get(Tenant, UUID(tenant_id))
+            if not tenant:
+                logger.error(f"[W{worker_id}] ❌ Tenant not found for immediate TOTP save")
+                return False
+
+            tenant.totp_secret = totp_secret
+            if new_password:
+                tenant.admin_password = new_password
+                tenant.password_changed = True
+
+            await session.commit()
+            logger.info(f"[W{worker_id}] ✅ SAVED {tenant.name} to DB")
+            return True
+
+    try:
+        return asyncio.run(_save())
+    except RuntimeError as e:
+        logger.error(f"[W{worker_id}] ❌ Immediate TOTP save failed (event loop): {e}")
+        return False
+    except Exception as e:
+        logger.error(f"[W{worker_id}] ❌ Immediate TOTP save failed: {e}")
+        return False
+
+
 # === CRITICAL: Save TOTP immediately helper ===
 async def _save_totp_immediately(db, tenant_id: str, totp_secret: str, worker_id: int = 0) -> bool:
     """
@@ -98,6 +139,9 @@ async def _save_totp_immediately(db, tenant_id: str, totp_secret: str, worker_id
     from sqlalchemy import text
     
     try:
+        logger.info(
+            f"[W{worker_id}] 💾 Saving TOTP to DB: {totp_secret[:4]}*** for tenant={tenant_id}"
+        )
         # Save the TOTP
         await db.execute(
             text("""
@@ -109,6 +153,7 @@ async def _save_totp_immediately(db, tenant_id: str, totp_secret: str, worker_id
             {"secret": totp_secret, "tenant_id": tenant_id}
         )
         await db.commit()
+        logger.info(f"[W{worker_id}] ✅ TOTP COMMIT SUCCESSFUL")
         
         # VERIFY it was actually saved
         result = await db.execute(
@@ -1794,6 +1839,15 @@ class BrowserWorker:
                 if totp:
                     logger.info(f"[W{self.worker_id}] ✓ TOTP secret extracted successfully")
                     result.totp_secret = totp
+                    # CRITICAL: Save immediately BEFORE completing MFA enrollment
+                    saved = _save_totp_immediately_sync(
+                        tenant_id=tenant_id,
+                        totp_secret=totp,
+                        new_password=result.new_password,
+                        worker_id=self.worker_id,
+                    )
+                    if not saved:
+                        raise Exception("Failed to save TOTP to database before MFA enrollment")
                     code = pyotp.TOTP(totp).now()
                     logger.info(f"[W{self.worker_id}] Generated MFA code: {code}")
                     
@@ -2281,6 +2335,11 @@ async def process_tenant(tenant, db, worker_id: int = 0) -> dict:
                 logger.warning(f"[W{worker_id}] Unknown state, waiting...")
                 time.sleep(3)
         
+        logger.info(
+            f"[W{worker_id}] 💾 Saving to DB: totp="
+            f"{tenant.totp_secret[:4] if tenant.totp_secret else 'NONE'}***, "
+            "password_changed=True, first_login_completed=True"
+        )
         # Mark complete - update all relevant fields
         tenant.first_login_completed = True
         tenant.first_login_at = datetime.utcnow()
@@ -2290,6 +2349,15 @@ async def process_tenant(tenant, db, worker_id: int = 0) -> dict:
         tenant.setup_error = None  # Clear any previous errors
         tenant.security_defaults_disabled = False  # We're keeping Security Defaults ENABLED
         await db.commit()
+        logger.info(f"[W{worker_id}] ✅ DB COMMIT SUCCESSFUL")
+
+        # Verify save
+        await db.refresh(tenant)
+        logger.info(
+            f"[W{worker_id}] Verified: totp={tenant.totp_secret is not None}, "
+            f"pwd_changed={tenant.password_changed}, "
+            f"first_login_completed={tenant.first_login_completed}"
+        )
         
         result["status"] = "success"
         logger.info(f"[W{worker_id}] ========== COMPLETED {tenant.id} ==========")

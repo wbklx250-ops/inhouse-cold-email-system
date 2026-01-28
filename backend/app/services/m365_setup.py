@@ -38,9 +38,10 @@ from app.models.tenant import Tenant, TenantStatus
 from app.models.domain import Domain, DomainStatus
 from app.services.cloudflare import cloudflare_service, CloudflareError
 
-# Load MAX_PARALLEL_BROWSERS from properly loaded settings (reads from .env)
+# Load settings from .env
 _settings = get_settings()
 MAX_PARALLEL_BROWSERS = _settings.max_parallel_browsers
+STEP5_HEADLESS = _settings.step5_headless
 
 logger = logging.getLogger(__name__)
 
@@ -487,7 +488,6 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         await db.commit()
         return result
     
-    # Prepare tenant data
     tenant_data = {
         "tenant_id": str(tenant.id),
         "domain_id": str(domain.id),

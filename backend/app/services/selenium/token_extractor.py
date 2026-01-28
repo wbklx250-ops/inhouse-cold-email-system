@@ -15,6 +15,7 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,14 @@ class TokenExtractor:
 
             # Navigate to Users page in M365 Admin
             self.driver.get("https://admin.microsoft.com/#/users")
-            time.sleep(3)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Inject interceptor and trigger refresh
             script = """
@@ -217,7 +225,14 @@ class TokenExtractor:
 
             # Go back to original page
             self.driver.get(original_url)
-            time.sleep(2)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             if token and token.startswith('eyJ'):
                 return token
@@ -252,7 +267,13 @@ class TokenExtractor:
             self.driver.get(auth_url)
 
             # Wait for redirect (should auto-auth since we're already logged in)
-            time.sleep(5)
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Check URL fragment for token
             current_url = self.driver.current_url
@@ -264,11 +285,26 @@ class TokenExtractor:
 
                 # Go back
                 self.driver.get(original_url)
-                time.sleep(2)
+                # Wait for page to load
+                try:
+                    WebDriverWait(self.driver, 30).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(0.5)
+                except:
+                    pass
 
                 return token
 
             self.driver.get(original_url)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             return None
 
         except Exception as e:
@@ -285,7 +321,14 @@ class TokenExtractor:
 
             # Open Graph Explorer in same session
             self.driver.get("https://developer.microsoft.com/en-us/graph/graph-explorer")
-            time.sleep(3)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Graph Explorer shows the access token in the UI when signed in
             # Look for the token in the page or network requests
@@ -293,11 +336,18 @@ class TokenExtractor:
             # Check if we can get token from the access token tab
             try:
                 # Click on "Access token" tab if visible
-                access_token_tab = WebDriverWait(self.driver, 5).until(
+                access_token_tab = WebDriverWait(self.driver, 10).until(
                     EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Access token')]"))
                 )
                 access_token_tab.click()
-                time.sleep(1)
+                # Wait for token to be displayed
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "pre.token-value, textarea.token-value, code"))
+                    )
+                    time.sleep(0.3)
+                except:
+                    pass
 
                 # Get token from textarea or pre element
                 token_element = self.driver.find_element(By.CSS_SELECTOR, "pre.token-value, textarea.token-value, code")
@@ -313,7 +363,14 @@ class TokenExtractor:
 
             # Restore original URL
             self.driver.get(original_url)
-            time.sleep(2)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             return None
 
         except Exception as e:
@@ -328,7 +385,14 @@ class TokenExtractor:
         try:
             # Navigate to a page that triggers Graph API calls
             self.driver.get("https://admin.microsoft.com/#/users")
-            time.sleep(3)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Execute script to intercept fetch requests and extract auth headers
             script = """
@@ -376,7 +440,14 @@ class TokenExtractor:
 
             # Navigate to Exchange Admin Center
             self.driver.get("https://admin.exchange.microsoft.com")
-            time.sleep(5)
+            # Wait for page to fully load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Exchange Admin uses its own token in sessionStorage
             script = """
@@ -426,7 +497,14 @@ class TokenExtractor:
             # Restore original URL if needed
             if original_url != self.driver.current_url:
                 self.driver.get(original_url)
-                time.sleep(2)
+                # Wait for page to load
+                try:
+                    WebDriverWait(self.driver, 30).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(0.5)
+                except:
+                    pass
 
             return token
 
@@ -439,7 +517,14 @@ class TokenExtractor:
         try:
             # Trigger an Exchange API call by navigating
             self.driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
-            time.sleep(3)
+            # Wait for page to load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
 
             # Similar interception technique
             script = """

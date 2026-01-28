@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from uuid import UUID
 import csv
 import io
+import logging
 
 from app.db.session import get_db_session as get_db, async_engine, get_db_session_with_retry, RetryableSession, SessionLocal, async_session_factory
 from app.services.tenant_import import tenant_import_service
@@ -40,6 +41,8 @@ from app.services.mailbox_setup import (
 )
 
 router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
+
+logger = logging.getLogger(__name__)
 
 # Store active automation jobs
 active_jobs = {}
@@ -1046,10 +1049,12 @@ async def start_automation(
             "already_running": True
         }
     
+    # STEP 4 FIX: Exclude tenants that already have TOTP saved to prevent re-enrollment
     tenants = (await db.execute(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
-            Tenant.first_login_completed == False
+            Tenant.first_login_completed == False,
+            Tenant.totp_secret.is_(None)  # Skip already-completed tenants
         )
     )).scalars().all()
     
@@ -1080,8 +1085,8 @@ async def start_automation(
     async def run():
         try:
             results = await process_tenants_parallel(tenant_data, new_password, max_workers)
-            async with AsyncSession(async_engine, expire_on_commit=False) as session:
-                for r in results:
+            for r in results:
+                async with AsyncSession(async_engine, expire_on_commit=False) as session:
                     t = await session.get(Tenant, UUID(r["tenant_id"]))
                     if t:
                         t.first_login_completed = r["success"]
@@ -1095,7 +1100,8 @@ async def start_automation(
                                 t.admin_password = r["new_password"]
                                 t.password_changed = True  # CRITICAL: Mark password as changed!
                             t.first_login_at = datetime.utcnow()
-                await session.commit()
+                        await session.commit()
+                        logger.info(" SAVED %s to DB", t.name)
             
             # Mark job as completed
             step4_jobs[job_id]["status"] = "completed"
@@ -1207,8 +1213,8 @@ async def retry_tenant_first_login(
     
     async def run_retry():
         results = await process_tenants_parallel(tenant_data, new_password, max_workers=1)
-        async with AsyncSession(async_engine, expire_on_commit=False) as session:
-            for r in results:
+        for r in results:
+            async with AsyncSession(async_engine, expire_on_commit=False) as session:
                 t = await session.get(Tenant, UUID(r["tenant_id"]))
                 if t:
                     t.first_login_completed = r["success"]
@@ -1219,7 +1225,8 @@ async def retry_tenant_first_login(
                         t.admin_password = r["new_password"]
                         t.password_changed = True
                         t.first_login_at = datetime.utcnow()
-            await session.commit()
+                    await session.commit()
+                    logger.info(" SAVED %s to DB", t.name)
     
     background_tasks.add_task(run_retry)
     

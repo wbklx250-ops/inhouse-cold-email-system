@@ -104,20 +104,22 @@ def safe_click(driver, element, description="element"):
         time.sleep(0.3)
         element.click()
         logger.info(f"Clicked: {description}")
+        time.sleep(2)  # Slow enough to watch
         return True
     except ElementClickInterceptedException:
         pass
     except:
         pass
-    
+
     try:
         # Method 2: JavaScript click
         driver.execute_script("arguments[0].click();", element)
         logger.info(f"JS Clicked: {description}")
+        time.sleep(2)  # Slow enough to watch
         return True
     except:
         pass
-    
+
     logger.error(f"Failed to click: {description}")
     return False
 
@@ -224,8 +226,9 @@ def do_login(driver):
             logger.info("Entering email...")
             email_field = wait_and_find(driver, By.NAME, "loginfmt", timeout=5)
             if email_field:
-                email_field.clear()
+            email_field.clear()
                 email_field.send_keys(ADMIN_EMAIL)
+                time.sleep(1)  # Pause after typing
                 email_field.send_keys(Keys.RETURN)
                 time.sleep(3)
             continue
@@ -704,6 +707,7 @@ def main():
     # Create browser
     options = Options()
     # NOT headless - we want to see what's happening!
+    options.add_argument("--start-maximized")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1920,1080")

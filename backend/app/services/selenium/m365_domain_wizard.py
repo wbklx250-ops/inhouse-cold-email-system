@@ -11,6 +11,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 import logging
 
 logger = logging.getLogger(__name__)
@@ -57,31 +58,62 @@ def do_login(driver, admin_email, admin_password, totp_secret):
     """Login to M365. Returns True/False."""
     logger.info("=== LOGGING IN ===")
     driver.get("https://admin.microsoft.com")
-    time.sleep(3)
+    # Wait for page load
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     
-    # Email
-    driver.find_element(By.NAME, "loginfmt").send_keys(admin_email + Keys.RETURN)
-    time.sleep(3)
+    # Email - wait for element
+    email_field = WebDriverWait(driver, 30).until(
+        EC.element_to_be_clickable((By.NAME, "loginfmt"))
+    )
+    email_field.send_keys(admin_email + Keys.RETURN)
+    # Wait for password page
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     
-    # Password
-    driver.find_element(By.NAME, "passwd").send_keys(admin_password + Keys.RETURN)
-    time.sleep(3)
+    # Password - wait for element
+    password_field = WebDriverWait(driver, 30).until(
+        EC.element_to_be_clickable((By.NAME, "passwd"))
+    )
+    password_field.send_keys(admin_password + Keys.RETURN)
+    # Wait for MFA or next page
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     
-    # MFA
+    # MFA - wait for element
     try:
-        totp_field = driver.find_element(By.NAME, "otc")
+        totp_field = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.NAME, "otc"))
+        )
         code = pyotp.TOTP(totp_secret).now()
         logger.info(f"MFA code: {code[:2]}***")
         totp_field.send_keys(code + Keys.RETURN)
-        time.sleep(3)
-    except:
+        # Wait for verification
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
+    except TimeoutException:
         pass
     
     # Stay signed in - No
     try:
-        driver.find_element(By.ID, "idBtn_Back").click()
-        time.sleep(2)
-    except:
+        no_btn = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.ID, "idBtn_Back"))
+        )
+        no_btn.click()
+        # Wait for page transition
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
+    except TimeoutException:
         pass
     
     return "admin" in driver.current_url.lower()
@@ -97,35 +129,56 @@ def get_txt_value(driver, domain):
     # Go to Domains page
     logger.info("Navigating to Domains...")
     driver.get("https://admin.microsoft.com/#/Domains")
-    time.sleep(5)
+    # Wait for page to fully load
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     screenshot(driver, "01_domains_page", domain)
     
-    # Click Add domain
+    # Click Add domain - wait for button
     logger.info("Clicking Add domain...")
     try:
-        add_btn = driver.find_element(By.XPATH, "//button[contains(., 'Add domain')]")
+        add_btn = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Add domain')]"))
+        )
         add_btn.click()
-    except:
+    except TimeoutException:
         driver.get("https://admin.microsoft.com/#/Domains/Wizard")
-    time.sleep(3)
+    # Wait for wizard page
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     screenshot(driver, "02_add_domain_clicked", domain)
     
-    # Enter domain name
+    # Enter domain name - wait for input
     logger.info(f"Entering domain: {domain}")
-    domain_input = driver.find_element(By.XPATH, "//input[@type='text']")
+    domain_input = WebDriverWait(driver, 30).until(
+        EC.element_to_be_clickable((By.XPATH, "//input[@type='text']"))
+    )
     domain_input.clear()
+    time.sleep(0.2)
     domain_input.send_keys(domain)
-    time.sleep(1)
+    time.sleep(0.3)
     screenshot(driver, "03_domain_entered", domain)
     
-    # Click Use this domain / Continue
+    # Click Use this domain / Continue - wait for button
     try:
-        btn = driver.find_element(By.XPATH, "//button[contains(., 'Use this domain')]")
+        btn = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Use this domain')]"))
+        )
         btn.click()
     except:
-        btn = driver.find_element(By.XPATH, "//button[contains(., 'Continue')]")
+        btn = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Continue')]"))
+        )
         btn.click()
-    time.sleep(3)
+    # Wait for next page
+    WebDriverWait(driver, 30).until(
+        lambda d: d.execute_script("return document.readyState") == "complete"
+    )
+    time.sleep(0.5)
     
     # ===== STEP 5: DETECT PAGE STATE AFTER ENTERING DOMAIN =====
     screenshot(driver, "04_after_domain_entry", domain)
@@ -140,13 +193,19 @@ def get_txt_value(driver, domain):
         # Click "More options" to show TXT option
         logger.info(f"[{domain}] Step 5a: Clicking 'More options'")
         try:
-            more_opts = driver.find_element(By.XPATH, "//*[contains(text(), 'More options')]")
+            more_opts = WebDriverWait(driver, 30).until(
+                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'More options')]"))
+            )
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", more_opts)
-            time.sleep(0.5)
+            time.sleep(0.3)
             driver.execute_script("arguments[0].click();", more_opts)
             logger.info(f"[{domain}] Clicked 'More options'")
-            time.sleep(2)
-        except Exception as e:
+            # Wait for options to appear
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except TimeoutException as e:
             logger.warning(f"[{domain}] Could not click More options: {e}")
         
         screenshot(driver, "05_more_options_clicked", domain)
@@ -169,16 +228,22 @@ def get_txt_value(driver, domain):
         except Exception as e:
             logger.warning(f"[{domain}] Could not select TXT option: {e}")
         
-        time.sleep(1)
+        time.sleep(0.3)
         screenshot(driver, "06_txt_selected", domain)
         
-        # Click Continue
+        # Click Continue - wait for button
         logger.info(f"[{domain}] Step 5c: Clicking Continue")
         try:
-            cont_btn = driver.find_element(By.XPATH, "//button[contains(., 'Continue')]")
+            cont_btn = WebDriverWait(driver, 30).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Continue')]"))
+            )
             driver.execute_script("arguments[0].click();", cont_btn)
-            time.sleep(3)
-        except:
+            # Wait for TXT value page
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except TimeoutException:
             pass
         
         screenshot(driver, "07_txt_value_page", domain)
@@ -220,29 +285,41 @@ def get_txt_value(driver, domain):
         # Try clicking "More options" anyway
         logger.info(f"[{domain}] Attempting More options click...")
         try:
-            more_opt = driver.find_element(By.XPATH, "//*[contains(text(), 'More options')]")
+            more_opt = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'More options')]"))
+            )
             driver.execute_script("arguments[0].click();", more_opt)
-            time.sleep(2)
-        except Exception as e:
+            WebDriverWait(driver, 10).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except TimeoutException as e:
             logger.warning(f"[{domain}] More options not found: {e}")
         
         # Try selecting TXT option
         logger.info(f"[{domain}] Attempting TXT option selection...")
         try:
-            txt_opt = driver.find_element(By.XPATH, "//*[contains(text(), 'Add a TXT record')]")
+            txt_opt = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Add a TXT record')]"))
+            )
             driver.execute_script("arguments[0].click();", txt_opt)
-            time.sleep(2)
-        except Exception as e:
+            time.sleep(0.3)
+        except TimeoutException as e:
             logger.warning(f"[{domain}] TXT option not found: {e}")
         
         screenshot(driver, "05_txt_option_selected", domain)
         
         # Click Continue
         try:
-            cont = driver.find_element(By.XPATH, "//button[contains(., 'Continue')]")
+            cont = WebDriverWait(driver, 30).until(
+                EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Continue')]"))
+            )
             driver.execute_script("arguments[0].click();", cont)
-            time.sleep(3)
-        except:
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except TimeoutException:
             pass
         
         screenshot(driver, "06_txt_value_page", domain)
@@ -288,9 +365,9 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     
     # Scroll down to make sure page is fully loaded
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
+    time.sleep(0.5)
     driver.execute_script("window.scrollTo(0, 0);")
-    time.sleep(1)
+    time.sleep(0.3)
     
     page_text = driver.find_element(By.TAG_NAME, "body").text
     
@@ -298,15 +375,17 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     # Click on "MX Records", "CNAME Records", "TXT Records" to expand them
     for section_name in ["MX Records", "CNAME Records", "TXT Records"]:
         try:
-            section = driver.find_element(By.XPATH, f"//*[contains(text(), '{section_name}')]")
+            section = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, f"//*[contains(text(), '{section_name}')]"))
+            )
             section.click()
-            time.sleep(1)
+            time.sleep(0.3)
             logger.info(f"[{domain}] Expanded {section_name}")
-        except:
+        except TimeoutException:
             pass
     
     screenshot(driver, "31_sections_expanded", domain)
-    time.sleep(2)
+    time.sleep(0.5)
     page_text = driver.find_element(By.TAG_NAME, "body").text
     
     # === STEP 2: EXTRACT MX VALUE ===
@@ -343,16 +422,18 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     
     # Scroll down to find Advanced options
     driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-    time.sleep(2)
+    time.sleep(0.5)
     screenshot(driver, "32_scrolled_to_advanced", domain)
     
     # Try to expand "Advanced options" if it's collapsed
     try:
-        advanced = driver.find_element(By.XPATH, "//*[contains(text(), 'Advanced options')]")
+        advanced = WebDriverWait(driver, 10).until(
+            EC.element_to_be_clickable((By.XPATH, "//*[contains(text(), 'Advanced options')]"))
+        )
         advanced.click()
-        time.sleep(1)
+        time.sleep(0.3)
         logger.info(f"[{domain}] Clicked Advanced options")
-    except:
+    except TimeoutException:
         logger.info(f"[{domain}] Advanced options may already be expanded")
     
     # CHECK THE DKIM CHECKBOX
@@ -393,7 +474,7 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     except Exception as e:
         logger.warning(f"[{domain}] Could not find/check DKIM: {e}")
     
-    time.sleep(2)
+    time.sleep(0.5)
     screenshot(driver, "33_after_dkim_check", domain)
     
     # === STEP 6: EXTRACT DKIM VALUES ===
@@ -445,18 +526,24 @@ def handle_dns_records_page(driver, domain, zone_id) -> dict:
     
     # === STEP 8: CLICK CONTINUE ===
     logger.info(f"[{domain}] Clicking Continue...")
-    time.sleep(2)  # Wait for Cloudflare DNS to start propagating
+    time.sleep(0.5)  # Brief pause for Cloudflare DNS to start propagating
     
     try:
-        continue_btn = driver.find_element(By.XPATH, "//button[contains(., 'Continue')]")
+        continue_btn = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Continue')]"))
+        )
         driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", continue_btn)
-        time.sleep(0.5)
+        time.sleep(0.3)
         continue_btn.click()
         logger.info(f"[{domain}] Clicked Continue")
-    except Exception as e:
+        # Wait for next page
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
+    except TimeoutException as e:
         logger.error(f"[{domain}] Could not click Continue: {e}")
     
-    time.sleep(5)
     screenshot(driver, "34_after_dns_continue", domain)
     
     return extracted
@@ -482,16 +569,18 @@ def click_verify_and_confirm(driver, domain) -> tuple:
     
     for selector in verify_selectors:
         try:
-            verify_btn = driver.find_element(By.XPATH, selector)
+            verify_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, selector))
+            )
             if verify_btn.is_displayed() and verify_btn.is_enabled():
                 # Scroll to button and click
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", verify_btn)
-                time.sleep(0.5)
+                time.sleep(0.3)
                 verify_btn.click()
                 verify_clicked = True
                 logger.info(f"[{domain}] Clicked Verify button")
                 break
-        except Exception as e:
+        except TimeoutException:
             continue
     
     if not verify_clicked:
@@ -499,7 +588,13 @@ def click_verify_and_confirm(driver, domain) -> tuple:
         return False, "Could not find Verify button"
     
     # Wait for verification to process
-    time.sleep(10)
+    try:
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
+    except:
+        pass
     screenshot(driver, "21_after_verify_click", domain)
     
     # Check for verification result
@@ -530,7 +625,13 @@ def click_verify_and_confirm(driver, domain) -> tuple:
         
         # Still processing
         logger.info(f"[{domain}] Verification in progress, waiting... (attempt {attempt + 1})")
-        time.sleep(5)
+        try:
+            WebDriverWait(driver, 5).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except:
+            pass
+        time.sleep(0.5)
         screenshot(driver, f"21_verify_wait_{attempt}", domain)
     
     # Timeout - check if we made it to DNS page anyway
@@ -558,13 +659,21 @@ def complete_wizard(driver, domain) -> bool:
         # Click any Continue/Done/Finish buttons
         for btn_text in ["Continue", "Done", "Finish", "Close", "Got it"]:
             try:
-                btn = driver.find_element(By.XPATH, f"//button[contains(., '{btn_text}')]")
+                btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, f"//button[contains(., '{btn_text}')]"))
+                )
                 if btn.is_displayed():
                     btn.click()
                     logger.info(f"[{domain}] Clicked {btn_text}")
-                    time.sleep(3)
+                    try:
+                        WebDriverWait(driver, 10).until(
+                            lambda d: d.execute_script("return document.readyState") == "complete"
+                        )
+                        time.sleep(0.5)
+                    except:
+                        pass
                     break
-            except:
+            except TimeoutException:
                 continue
     
     screenshot(driver, "41_wizard_final", domain)
@@ -621,7 +730,13 @@ def run_full_domain_setup(domain: str, zone_id: str, admin_email: str,
             # Step 4: Wait for DNS
             logger.info(f"[{domain}] === STEP 4: WAIT 45s FOR DNS ===")
             pause_for_debug(driver, "TXT added to Cloudflare - now waiting 45s for DNS propagation")
-            time.sleep(45)
+            # Wait for DNS propagation
+            try:
+                WebDriverWait(driver, 45).until(
+                    lambda d: False  # Just use this as a timer
+                )
+            except TimeoutException:
+                pass  # Expected timeout after 45 seconds
             
             # Step 5: Click Verify
             logger.info(f"[{domain}] === STEP 5: CLICK VERIFY ===")

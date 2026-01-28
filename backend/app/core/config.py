@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # Start conservative at 3, can increase to 5-6 once confirmed stable
     # Each headless Chrome uses ~200-300MB RAM, so 3 = ~1GB RAM needed
     max_parallel_browsers: int = 3
+    
+    # Step 5 Browser Display Mode
+    # False = visible browsers (useful for debugging/testing)
+    # True = headless mode (faster, no GUI, for production)
+    step5_headless: bool = True
 
     allowed_origins: str = ""
     

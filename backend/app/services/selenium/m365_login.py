@@ -8,6 +8,9 @@ from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 import logging
 
 logger = logging.getLogger(__name__)
@@ -49,52 +52,95 @@ def login_to_m365(admin_email: str, admin_password: str, totp_secret: str):
         driver = create_browser()
         logger.info(f"Opening admin.microsoft.com...")
         driver.get("https://admin.microsoft.com")
-        time.sleep(3)
+        
+        # Wait for page to fully load
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
         screenshot(driver, "01_start")
         
-        # Enter email
+        # Enter email - wait for element
         logger.info(f"Entering email: {admin_email}")
-        email_field = driver.find_element(By.NAME, "loginfmt")
+        email_field = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.NAME, "loginfmt"))
+        )
         email_field.clear()
+        time.sleep(0.2)
         email_field.send_keys(admin_email)
+        time.sleep(0.3)
         email_field.send_keys(Keys.RETURN)
-        time.sleep(3)
+        
+        # Wait for password page
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
         screenshot(driver, "02_after_email")
         
-        # Enter password
+        # Enter password - wait for element
         logger.info("Entering password...")
-        password_field = driver.find_element(By.NAME, "passwd")
+        password_field = WebDriverWait(driver, 30).until(
+            EC.element_to_be_clickable((By.NAME, "passwd"))
+        )
         password_field.clear()
+        time.sleep(0.2)
         password_field.send_keys(admin_password)
+        time.sleep(0.3)
         password_field.send_keys(Keys.RETURN)
-        time.sleep(3)
+        
+        # Wait for MFA or next page
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
         screenshot(driver, "03_after_password")
         
-        # Check for MFA
+        # Check for MFA - wait for element
         try:
-            totp_field = driver.find_element(By.NAME, "otc")
+            totp_field = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.NAME, "otc"))
+            )
             totp = pyotp.TOTP(totp_secret)
             code = totp.now()
             logger.info(f"Entering TOTP code: {code[:2]}***")
+            totp_field.clear()
+            time.sleep(0.2)
             totp_field.send_keys(code)
+            time.sleep(0.3)
             totp_field.send_keys(Keys.RETURN)
-            time.sleep(3)
+            
+            # Wait for verification
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
             screenshot(driver, "04_after_mfa")
-        except:
+        except TimeoutException:
             logger.info("No MFA prompt")
         
-        # Handle "Stay signed in?"
+        # Handle "Stay signed in?" - wait for element
         try:
-            no_btn = driver.find_element(By.ID, "idBtn_Back")
+            no_btn = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.ID, "idBtn_Back"))
+            )
             no_btn.click()
-            time.sleep(2)
-        except:
+            
+            # Wait for final page load
+            WebDriverWait(driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except TimeoutException:
             pass
         
         screenshot(driver, "05_after_login")
         
-        # Verify login worked
-        time.sleep(3)
+        # Verify login worked - wait for final page
+        WebDriverWait(driver, 30).until(
+            lambda d: d.execute_script("return document.readyState") == "complete"
+        )
+        time.sleep(0.5)
         current_url = driver.current_url
         logger.info(f"Current URL: {current_url}")
         

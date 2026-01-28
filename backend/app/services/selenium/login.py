@@ -120,7 +120,14 @@ class MicrosoftLoginAutomation:
     
     def detect_state(self) -> LoginState:
         """Detect current page state."""
-        time.sleep(1)
+        # Wait for page to be ready before detecting state
+        try:
+            WebDriverWait(self.driver, 5).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)  # Brief settle time
+        except:
+            pass
         
         url = self.driver.current_url.lower()
         page = self.driver.page_source.lower()
@@ -190,16 +197,24 @@ class MicrosoftLoginAutomation:
         email_input = self._find_element([
             (By.NAME, "loginfmt"),
             (By.ID, "i0116"),
-        ])
+        ], timeout=30)
         
         if not email_input:
             return False
         
         email_input.clear()
+        time.sleep(0.2)
         email_input.send_keys(email)
-        time.sleep(0.5)
+        time.sleep(0.3)
         email_input.send_keys(Keys.RETURN)
-        time.sleep(2)
+        
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except:
+            pass
         return True
     
     def handle_password(self, password: str) -> bool:
@@ -209,16 +224,24 @@ class MicrosoftLoginAutomation:
         pwd_input = self._find_element([
             (By.NAME, "passwd"),
             (By.ID, "i0118"),
-        ])
+        ], timeout=30)
         
         if not pwd_input:
             return False
         
         pwd_input.clear()
+        time.sleep(0.2)
         pwd_input.send_keys(password)
-        time.sleep(0.5)
+        time.sleep(0.3)
         pwd_input.send_keys(Keys.RETURN)
-        time.sleep(3)
+        
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except:
+            pass
         return True
     
     def handle_password_change(self, current: str, new: str) -> bool:
@@ -231,28 +254,32 @@ class MicrosoftLoginAutomation:
             (By.NAME, "oldPassword"),
             (By.NAME, "currentPassword"),
             (By.ID, "currentPassword"),
-        ])
+        ], timeout=30)
         if curr_input:
             curr_input.clear()
+            time.sleep(0.2)
             curr_input.send_keys(current)
         
         # New password
         new_input = self._find_element([
             (By.NAME, "newPassword"),
             (By.ID, "newPassword"),
-        ])
+        ], timeout=30)
         if new_input:
             new_input.clear()
+            time.sleep(0.2)
             new_input.send_keys(new)
         
         # Confirm password
         confirm_input = self._find_element([
             (By.NAME, "confirmPassword"),
             (By.NAME, "reenterPassword"),
-        ])
+        ], timeout=30)
         if confirm_input:
             confirm_input.clear()
+            time.sleep(0.2)
             confirm_input.send_keys(new)
+            time.sleep(0.3)
             confirm_input.send_keys(Keys.RETURN)
         else:
             self._click_if_exists([
@@ -260,7 +287,13 @@ class MicrosoftLoginAutomation:
                 (By.CSS_SELECTOR, "button[type='submit']"),
             ])
         
-        time.sleep(4)
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+        except:
+            pass
         return True
     
     def extract_totp_only(self) -> Optional[str]:
@@ -320,7 +353,14 @@ class MicrosoftLoginAutomation:
         # STEP 1: Click first Next (Action Required / Security Defaults page)
         logger.info(f"[W{worker_id}] --- Step 1: Click first Next (Action Required page) ---")
         self._click_next_button()
-        time.sleep(2)
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
         self._screenshot("mfa_after_first_next")
         
         # STEP 2: Detect "Install Microsoft Authenticator" page and click "different app" BEFORE Next
@@ -356,7 +396,14 @@ class MicrosoftLoginAutomation:
                         logger.error(f"[W{worker_id}]   BUTTON {i}: text='{btn.text}'")
                 except Exception as e:
                     logger.error(f"[W{worker_id}]   Error listing buttons: {e}")
-            time.sleep(2)
+            # Wait for page to transition
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             self._screenshot("mfa_after_different_app_click")
         else:
             logger.info(f"[W{worker_id}] Not on 'Install Microsoft Authenticator' page, continuing...")
@@ -364,7 +411,14 @@ class MicrosoftLoginAutomation:
         # STEP 3: Click Next to proceed (now we should be in TOTP flow)
         logger.info(f"[W{worker_id}] --- Step 3: Click Next to proceed to QR/secret page ---")
         self._click_next_button()
-        time.sleep(2)
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
         self._screenshot("mfa_after_second_next")
         
         # STEP 4: Handle any additional pages (some flows have more steps)
@@ -383,7 +437,14 @@ class MicrosoftLoginAutomation:
             # Try clicking Next if available
             if self._click_next_button(timeout=2):
                 logger.info(f"[W{worker_id}] Clicked additional Next button (iteration {i})")
-                time.sleep(2)
+                # Wait for page to transition
+                try:
+                    WebDriverWait(self.driver, 30).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(0.5)
+                except:
+                    pass
             else:
                 logger.info(f"[W{worker_id}] No more Next buttons, breaking loop")
                 break
@@ -409,7 +470,14 @@ class MicrosoftLoginAutomation:
             self._screenshot("mfa_ERROR_cant_scan")
             return None
 
-        time.sleep(2)
+        # Wait for secret to be revealed
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
         self._screenshot("mfa_secret_page")
         # Extract TOTP secret
         logger.info(f"[W{worker_id}] --- Extracting TOTP secret ---")
@@ -441,7 +509,14 @@ class MicrosoftLoginAutomation:
         logger.info(f"[W{worker_id}] --- Clicking Next to go to code entry ---")
         next_to_code = self._click_next_button()
         logger.info(f"[W{worker_id}] Next to code entry clicked: {next_to_code}")
-        time.sleep(2)
+        # Wait for code entry page
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
 
         code = pyotp.TOTP(totp_secret).now()
         logger.info(f"[W{worker_id}] Generated MFA code: {code}")
@@ -459,9 +534,10 @@ class MicrosoftLoginAutomation:
 
         logger.info(f"[W{worker_id}] Found code input field")
         code_input.clear()
+        time.sleep(0.2)
         code_input.send_keys(code)
-        logger.info(f"[W{worker_id}]  Entered code: {code}")
-        time.sleep(1)
+        logger.info(f"[W{worker_id}]  Entered code: {code}")
+        time.sleep(0.3)
 
         logger.info(f"[W{worker_id}] --- Clicking Verify/Next ---")
         verify_clicked = self._click_if_exists([
@@ -476,7 +552,14 @@ class MicrosoftLoginAutomation:
             (By.XPATH, "//button[contains(text(), 'Next')]"),
         ])
         logger.info(f"[W{worker_id}] Verify/Next clicked: {verify_clicked}")
-        time.sleep(3)
+        # Wait for verification to process
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
         logger.info(f"[W{worker_id}] After verify URL: {self.driver.current_url}")
         self._screenshot("mfa_after_verify")
 
@@ -489,8 +572,15 @@ class MicrosoftLoginAutomation:
                 (By.ID, "idSIButton9"),
             ])
             if done_clicked:
-                logger.info(f"[W{worker_id}]  Clicked completion button (iteration {i})")
-            time.sleep(1)
+                logger.info(f"[W{worker_id}]  Clicked completion button (iteration {i})")
+                # Wait for page to transition
+                try:
+                    WebDriverWait(self.driver, 30).until(
+                        lambda d: d.execute_script("return document.readyState") == "complete"
+                    )
+                    time.sleep(0.5)
+                except:
+                    pass
 
         logger.info(f"[W{worker_id}] ======= MFA SETUP COMPLETE =======")
         logger.info(f"[W{worker_id}] Final URL: {self.driver.current_url}")
@@ -526,19 +616,27 @@ class MicrosoftLoginAutomation:
         code_input = self._find_element([
             (By.CSS_SELECTOR, "input[name='otc']"),
             (By.CSS_SELECTOR, "input[type='tel']"),
-        ])
+        ], timeout=30)
         
         if code_input:
             code_input.clear()
+            time.sleep(0.2)
             code_input.send_keys(code)
-            time.sleep(0.5)
+            time.sleep(0.3)
             
             self._click_if_exists([
                 (By.XPATH, "//button[contains(text(), 'Verify')]"),
                 (By.XPATH, "//button[contains(text(), 'Sign in')]"),
                 (By.CSS_SELECTOR, "input[type='submit']"),
             ])
-            time.sleep(3)
+            # Wait for verification
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             return True
         
         return False
@@ -551,7 +649,14 @@ class MicrosoftLoginAutomation:
             (By.ID, "idBtn_Back"),  # "No" button
             (By.XPATH, "//button[contains(text(), 'No')]"),
         ])
-        time.sleep(2)
+        # Wait for page to transition
+        try:
+            WebDriverWait(self.driver, 30).until(
+                lambda d: d.execute_script("return document.readyState") == "complete"
+            )
+            time.sleep(0.5)
+        except:
+            pass
         return True
     
     def disable_security_defaults(self) -> bool:
@@ -560,7 +665,14 @@ class MicrosoftLoginAutomation:
         
         try:
             self.driver.get("https://entra.microsoft.com/#view/Microsoft_AAD_IAM/SecurityDefaultsBlade")
-            time.sleep(5)
+            # Wait for page to fully load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             
             self._screenshot("security_defaults_page")
             
@@ -575,21 +687,27 @@ class MicrosoftLoginAutomation:
             self._click_if_exists([
                 (By.XPATH, "//label[contains(., 'Disabled')]"),
                 (By.XPATH, "//span[text()='Disabled']/ancestor::div[@role='radio']"),
-            ])
-            time.sleep(1)
+            ], timeout=30)
             
             # Select reason
             self._click_if_exists([
                 (By.XPATH, "//option[contains(., 'Other')]"),
-            ])
+            ], timeout=30)
             
             # Save
             self._click_if_exists([
                 (By.XPATH, "//button[contains(., 'Save')]"),
                 (By.CSS_SELECTOR, "button[type='submit']"),
-            ])
+            ], timeout=30)
             
-            time.sleep(4)
+            # Wait for save to complete
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             self._screenshot("security_defaults_saved")
             return True
             
@@ -615,7 +733,14 @@ class MicrosoftLoginAutomation:
         try:
             self.driver = create_driver(self.headless)
             self.driver.get("https://portal.azure.com")
-            time.sleep(3)
+            # Wait for initial page load
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    lambda d: d.execute_script("return document.readyState") == "complete"
+                )
+                time.sleep(0.5)
+            except:
+                pass
             
             totp_secret = existing_totp
             current_password = initial_password
@@ -652,9 +777,17 @@ class MicrosoftLoginAutomation:
                 elif state == LoginState.NEEDS_STAY_SIGNED_IN:
                     self.handle_stay_signed_in()
                 elif state == LoginState.UNKNOWN:
-                    time.sleep(2)
+                    # Wait a bit for page to stabilize
+                    try:
+                        WebDriverWait(self.driver, 5).until(
+                            lambda d: d.execute_script("return document.readyState") == "complete"
+                        )
+                        time.sleep(0.5)
+                    except:
+                        pass
                 
-                time.sleep(1)
+                # Brief pause between state checks
+                time.sleep(0.5)
             
             # Final check
             if self.detect_state() == LoginState.LOGGED_IN:

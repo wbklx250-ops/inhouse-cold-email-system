@@ -1204,8 +1204,12 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
       }
       return <span className="text-green-500" title="Completed">✅</span>;
     }
-    if (tenant.setup_error) {
-      return <span className="text-red-500" title={tenant.setup_error}>❌</span>;
+    if (tenant.setup_error || tenant.status === "error") {
+      return (
+        <span className="text-red-500" title={tenant.setup_error || "Automation error"}>
+          ❌
+        </span>
+      );
     }
     if (automating) {
       return <span className="text-yellow-500 animate-pulse" title="Processing">⏳</span>;
@@ -1271,10 +1275,10 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
   };
 
   // Get failed tenants (have error but not completed/skipped)
-  const failedTenants = tenants.filter(t => 
-    t.setup_error && 
-    !t.first_login_completed && 
-    !t.setup_error.startsWith('SKIPPED:')
+  const failedTenants = tenants.filter(t =>
+    (t.setup_error || t.status === "error") &&
+    !t.first_login_completed &&
+    !t.setup_error?.startsWith('SKIPPED:')
   );
 
   // Phase 1: Import UI (no tenants yet)
@@ -1604,8 +1608,11 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
               </thead>
               <tbody className="divide-y">
                 {tenants.map((tenant) => {
-                  const hasFailed = tenant.setup_error && !tenant.first_login_completed;
+                  const hasFailed =
+                    (tenant.setup_error || tenant.status === "error") &&
+                    !tenant.first_login_completed;
                   const isSkipped = tenant.setup_error?.startsWith('SKIPPED:');
+                  const errorMessage = tenant.setup_error || (tenant.status === "error" ? "Automation error" : null);
                   
                   return (
                     <tr 
@@ -1631,12 +1638,12 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
                         )}
                       </td>
                       <td className="px-3 py-2 text-xs max-w-[180px]">
-                        {tenant.setup_error ? (
+                        {errorMessage ? (
                           <span 
                             className={`truncate block ${isSkipped ? 'text-yellow-600' : 'text-red-600'}`}
-                            title={tenant.setup_error}
+                            title={errorMessage}
                           >
-                            {tenant.setup_error}
+                            {errorMessage}
                           </span>
                         ) : (
                           <span className="text-gray-400">-</span>
