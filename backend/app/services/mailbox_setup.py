@@ -165,48 +165,39 @@ class Step6Orchestrator:
 
             # Step 2: Extract Exchange token
             update_progress(self.tenant_id, "token", "in_progress", "Extracting API tokens")
-            tokens = TokenExtractor(self.driver).extract_all_tokens()
 
-            if tokens.get("exchange_token"):
-                self.exchange_service = ExchangeAPIService(tokens["exchange_token"])
-                update_progress(self.tenant_id, "token", "partial", "Exchange token OK")
+            extractor = TokenExtractor(self.driver)
+            exchange_token = extractor.extract_exchange_token()
+            if exchange_token:
+                self.exchange_service = ExchangeAPIService(exchange_token)
+                logger.info("[%s]  Exchange token extracted", self.domain)
+            else:
+                logger.error("[%s]  No Exchange token", self.domain)
+                raise Exception("Exchange token required - cannot proceed")
 
-            if tokens.get("graph_token"):
-                self.graph_service = GraphAPIService(tokens["graph_token"])
+            from app.services.graph_auth import get_graph_token_via_auth_code
+
+            logger.info("[%s] Getting Graph token via Azure App...", self.domain)
+            graph_token = get_graph_token_via_auth_code(self.driver, self.onmicrosoft_domain)
+
+            if graph_token:
+                self.graph_service = GraphAPIService(graph_token)
+                logger.info("[%s]  Graph token obtained via Azure App", self.domain)
                 update_progress(
                     self.tenant_id,
                     "token",
                     "complete",
-                    "Graph + Exchange tokens OK",
+                    "Exchange + Graph tokens ",
                 )
             else:
-                logger.info(
-                    "[%s] Selenium Graph extraction failed, trying ROPC...",
-                    self.domain,
+                logger.error("[%s]  Failed to get Graph token", self.domain)
+                update_progress(
+                    self.tenant_id,
+                    "token",
+                    "partial",
+                    "Exchange only - Graph failed",
                 )
-
-                from app.services.graph_auth import get_graph_token_ropc_sync
-
-                graph_token = get_graph_token_ropc_sync(self.admin_email, self.admin_password)
-
-                if graph_token:
-                    self.graph_service = GraphAPIService(graph_token)
-                    update_progress(
-                        self.tenant_id,
-                        "token",
-                        "complete",
-                        "All tokens acquired (ROPC)",
-                    )
-                else:
-                    update_progress(
-                        self.tenant_id,
-                        "token",
-                        "partial",
-                        "Exchange only (Graph failed)",
-                    )
-
-            if not self.exchange_service:
-                raise Exception("No Exchange token available")
+                raise Exception("Graph token required for user operations - cannot proceed")
 
             # Step 3: Create licensed user (me1)
             update_progress(

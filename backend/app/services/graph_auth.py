@@ -1,141 +1,139 @@
 """
-Graph API Authentication using ROPC Flow
+Graph API Authentication using Azure App Registration
 
-Uses admin credentials already stored in database.
-No manual setup required.
+Uses Authorization Code flow after Selenium handles MFA.
 """
 
-import aiohttp
 import logging
+import os
+import time
+import urllib.parse
 from typing import Optional
+
+import requests
+from selenium import webdriver
 
 logger = logging.getLogger(__name__)
 
-# Microsoft's public client IDs that support ROPC
-# Azure PowerShell - widely used, supports ROPC
-AZURE_POWERSHELL_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
+# Azure App credentials
+CLIENT_ID = os.getenv("AZURE_CLIENT_ID", "ffc66428-dce1-47d2-82b8-b2ee8345f76e")
+CLIENT_SECRET = os.getenv(
+    "AZURE_CLIENT_SECRET",
+    "bpd8Q~w.mmfgYOOEPm1_KggfK8NKfa-UvsCT_aqM",
+)
+REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 
-# Alternative: Azure CLI client ID
-AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
-
-async def get_graph_token_ropc(
-    admin_email: str,
-    admin_password: str,
-    client_id: str = AZURE_POWERSHELL_CLIENT_ID,
+def get_graph_token_via_auth_code(
+    driver: webdriver.Chrome,
+    tenant_domain: str,
 ) -> Optional[str]:
     """
-    Get Microsoft Graph API token using Resource Owner Password Credentials flow.
+    Get Graph token using Authorization Code flow.
 
-    This uses the admin credentials we already have stored - no setup needed.
-
-    Args:
-        admin_email: Admin email (e.g., admin@tenant.onmicrosoft.com)
-        admin_password: Admin password
-        client_id: Public client ID to use (default: Azure PowerShell)
-
-    Returns:
-        Access token string or None if failed
+    Selenium is already logged in (MFA done). We use that session to get an auth code,
+    then exchange it for tokens using our app's client secret.
     """
-    if "@" not in admin_email:
-        logger.error("Invalid admin email format: %s", admin_email)
+    logger.info("Getting Graph token via Auth Code flow for %s", tenant_domain)
+
+    scope = (
+        "https://graph.microsoft.com/User.ReadWrite.All "
+        "https://graph.microsoft.com/Directory.ReadWrite.All "
+        "offline_access"
+    )
+
+    auth_url = (
+        f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/authorize?"
+        f"client_id={CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+        f"&scope={urllib.parse.quote(scope)}"
+        f"&response_mode=query"
+        f"&prompt=none"
+    )
+
+    try:
+        original_url = driver.current_url
+        logger.info("Original URL: %s", original_url)
+        logger.info("Navigating to OAuth URL...")
+
+        driver.get(auth_url)
+        time.sleep(5)
+
+        current_url = driver.current_url
+        logger.info("Redirect URL: %s", current_url)
+
+        if "code=" in current_url:
+            parsed = urllib.parse.urlparse(current_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            auth_code = params.get("code", [None])[0]
+
+            if auth_code:
+                logger.info("✓ Got auth code, length: %s", len(auth_code))
+                token = _exchange_code_for_token(auth_code, tenant_domain)
+                driver.get(original_url)
+                time.sleep(2)
+                return token
+
+        if "error" in current_url:
+            parsed = urllib.parse.urlparse(current_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            error = params.get("error", ["unknown"])[0]
+            error_desc = params.get("error_description", ["no description"])[0]
+            logger.error("OAuth error: %s", error)
+            logger.error("Description: %s", urllib.parse.unquote(error_desc))
+            if error in {"interaction_required", "consent_required"}:
+                consent_url = (
+                    f"https://login.microsoftonline.com/{tenant_domain}/adminconsent?"
+                    f"client_id={CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+                )
+                logger.error("Admin consent required. Visit: %s", consent_url)
+        else:
+            logger.error("No code in URL. Full URL: %s", current_url)
+
+        driver.get(original_url)
+        time.sleep(2)
         return None
 
-    tenant_domain = admin_email.split("@", 1)[1]
+    except Exception as exc:
+        logger.error("Auth code flow failed: %s", exc)
+        import traceback
+
+        logger.error(traceback.format_exc())
+        return None
+
+
+def _exchange_code_for_token(auth_code: str, tenant_domain: str) -> Optional[str]:
+    """Exchange authorization code for access token."""
+
     token_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/token"
 
     payload = {
-        "grant_type": "password",
-        "client_id": client_id,
-        "scope": "https://graph.microsoft.com/.default offline_access",
-        "username": admin_email,
-        "password": admin_password,
+        "client_id": CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": auth_code,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "https://graph.microsoft.com/.default",
     }
 
-    logger.info("Requesting Graph token via ROPC for %s", admin_email)
+    logger.info("Exchanging auth code for token at %s", token_url)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                token_url,
-                data=payload,
-                timeout=aiohttp.ClientTimeout(total=30),
-            ) as response:
-                response_text = await response.text()
+        response = requests.post(token_url, data=payload, timeout=30)
 
-                if response.status == 200:
-                    data = await response.json()
-                    token = data.get("access_token")
-                    if token:
-                        logger.info(
-                            "✓ Graph token obtained via ROPC, length: %s",
-                            len(token),
-                        )
-                        return token
-                    logger.error("Token response missing access_token field")
-                    return None
+        if response.status_code == 200:
+            data = response.json()
+            token = data.get("access_token")
+            if token:
+                logger.info("✓ SUCCESS! Graph token obtained, length: %s", len(token))
+                return token
+            logger.error("No access_token in response: %s", data)
+            return None
 
-                logger.error(
-                    "ROPC token request failed (%s): %s",
-                    response.status,
-                    response_text,
-                )
-
-                if client_id == AZURE_POWERSHELL_CLIENT_ID:
-                    logger.info("Retrying with Azure CLI client ID...")
-                    return await get_graph_token_ropc(
-                        admin_email,
-                        admin_password,
-                        AZURE_CLI_CLIENT_ID,
-                    )
-
-                return None
-
-    except aiohttp.ClientError as exc:
-        logger.error("HTTP error during ROPC auth: %s", exc)
+        logger.error("Token exchange failed (%s): %s", response.status_code, response.text)
         return None
+
     except Exception as exc:
-        logger.error("Unexpected error during ROPC auth: %s", exc)
+        logger.error("Token exchange error: %s", exc)
         return None
-
-
-def get_graph_token_ropc_sync(admin_email: str, admin_password: str) -> Optional[str]:
-    """Synchronous wrapper for get_graph_token_ropc."""
-    import asyncio
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        return loop.run_until_complete(get_graph_token_ropc(admin_email, admin_password))
-    finally:
-        loop.close()
-
-
-if __name__ == "__main__":
-    import asyncio
-    import sys
-
-    logging.basicConfig(level=logging.INFO)
-
-    print("=" * 60)
-    print("ROPC TOKEN TEST")
-    print("=" * 60)
-
-    if len(sys.argv) != 3:
-        print("Usage: python graph_auth.py <admin_email> <admin_password>")
-        sys.exit(1)
-
-    email = sys.argv[1]
-    password = sys.argv[2]
-
-    print(f"\nTesting ROPC for: {email}")
-
-    async def test():
-        token = await get_graph_token_ropc(email, password)
-        if token:
-            print(f"\n✓ SUCCESS! Token length: {len(token)}")
-            print(f"Token preview: {token[:50]}...")
-        else:
-            print("\n✗ FAILED to get token")
-
-    asyncio.run(test())

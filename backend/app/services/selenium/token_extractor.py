@@ -31,35 +31,34 @@ class TokenExtractor:
         Extract Microsoft Graph API access token from browser.
         """
         try:
-            # Method 1: Navigate to Graph Explorer (auto-auth)
+            # Method 1: OAuth implicit flow (most reliable with MFA)
+            logger.info("Trying OAuth implicit flow...")
+            token = self.extract_graph_token_via_oauth()
+            if token:
+                return token
+
+            # Method 2: Navigate to Graph Explorer (auto-auth)
             logger.info("Trying Graph Explorer method...")
             token = self._get_token_via_graph_explorer()
             if token:
                 logger.info("Got Graph token via Graph Explorer")
                 return token
 
-            # Method 2: Implicit OAuth flow (Graph Explorer client)
-            logger.info("Trying implicit OAuth flow...")
-            token = self.get_graph_token_via_implicit_flow()
-            if token:
-                logger.info("Got Graph token via implicit OAuth flow")
-                return token
-
-            # Method 2: Try to get from sessionStorage/localStorage
+            # Method 3: Try to get from sessionStorage/localStorage
             logger.info("Trying storage extraction...")
             token = self._get_token_from_storage()
             if token:
                 logger.info("Got Graph token from browser storage")
                 return token
 
-            # Method 3: Intercept from Users page API calls
+            # Method 4: Intercept from Users page API calls
             logger.info("Trying Users page API interception...")
             token = self._get_graph_token_via_users_api()
             if token:
                 logger.info("Got Graph token via Users API interception")
                 return token
 
-            # Method 4: Use the portal's own API calls
+            # Method 5: Use the portal's own API calls
             logger.info("Trying portal API interception...")
             token = self._get_token_via_portal_api()
             if token:
@@ -71,6 +70,64 @@ class TokenExtractor:
 
         except Exception as e:
             logger.error(f"Error extracting Graph token: {e}")
+            return None
+
+    def extract_graph_token_via_oauth(self) -> Optional[str]:
+        """
+        Get Graph token by triggering OAuth implicit flow.
+        Since we're already authenticated, this should auto-complete.
+        """
+        import urllib.parse
+
+        # Use Microsoft's Graph Explorer client ID (public, allows implicit flow)
+        client_id = "de8bc8b5-d9f9-48b1-a8ad-b748da725064"
+        redirect_uri = "https://developer.microsoft.com/en-us/graph/graph-explorer"
+        scope = "User.ReadWrite.All Directory.ReadWrite.All Mail.ReadWrite"
+
+        # Build OAuth URL for implicit flow (returns token in URL fragment)
+        auth_url = (
+            "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"
+            f"client_id={client_id}"
+            f"&response_type=token"
+            f"&redirect_uri={urllib.parse.quote(redirect_uri)}"
+            f"&scope={urllib.parse.quote(scope)}"
+            "&response_mode=fragment"
+            "&prompt=none"  # Don't prompt - use existing session
+        )
+
+        try:
+            logger.info("Triggering OAuth implicit flow for Graph token...")
+            original_url = self.driver.current_url
+
+            self.driver.get(auth_url)
+            time.sleep(5)
+
+            # Token should be in URL fragment after redirect
+            current_url = self.driver.current_url
+            logger.info(f"OAuth redirect URL: {current_url[:100]}...")
+
+            if "#access_token=" in current_url:
+                # Parse token from URL fragment
+                fragment = current_url.split("#")[1]
+                params = dict(param.split("=") for param in fragment.split("&") if "=" in param)
+                token = params.get("access_token")
+
+                if token:
+                    # URL decode the token
+                    token = urllib.parse.unquote(token)
+                    logger.info(f"✓ Got Graph token via OAuth, length: {len(token)}")
+                    self.driver.get(original_url)
+                    return token
+
+            # Check for error
+            if "error=" in current_url:
+                logger.error(f"OAuth error in URL: {current_url}")
+
+            self.driver.get(original_url)
+            return None
+
+        except Exception as e:
+            logger.error(f"OAuth implicit flow failed: {e}")
             return None
 
     def _get_token_from_storage(self) -> Optional[str]:

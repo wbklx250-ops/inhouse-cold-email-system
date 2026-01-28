@@ -330,6 +330,7 @@ async def process_batch(
     batch_id: str,
     config: SetupConfig,
     max_workers: int = 10,
+    chunk_size: int = 5,
     on_progress: Callable[[int, int], None] = None
 ):
     """Process all tenants in a batch."""
@@ -366,6 +367,17 @@ async def process_batch(
             if on_progress:
                 on_progress(completed, len(tenants))
     
-    await asyncio.gather(*[process_one(t) for t in tenants], return_exceptions=True)
+    # Process tenants in chunks to avoid scheduling everything at once
+    for i in range(0, len(tenants), chunk_size):
+        chunk = tenants[i:i + chunk_size]
+        logger.info(
+            "Processing tenant chunk %s (%s-%s of %s)",
+            (i // chunk_size) + 1,
+            i + 1,
+            min(i + chunk_size, len(tenants)),
+            len(tenants),
+        )
+        await asyncio.gather(*[process_one(t) for t in chunk], return_exceptions=True)
+        await asyncio.sleep(2)
     
     return {"total": len(tenants), "completed": completed}
