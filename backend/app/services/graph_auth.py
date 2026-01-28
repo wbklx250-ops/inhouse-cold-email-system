@@ -52,44 +52,59 @@ def get_graph_token_via_auth_code(
         f"&prompt=none"
     )
 
+    consent_url = (
+        f"https://login.microsoftonline.com/{tenant_domain}/adminconsent?"
+        f"client_id={CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+    )
+
     try:
         original_url = driver.current_url
         logger.info("Original URL: %s", original_url)
         logger.info("Navigating to OAuth URL...")
 
-        driver.get(auth_url)
-        time.sleep(5)
+        def _try_auth_code_flow() -> Optional[str]:
+            driver.get(auth_url)
+            time.sleep(5)
 
-        current_url = driver.current_url
-        logger.info("Redirect URL: %s", current_url)
+            current_url = driver.current_url
+            logger.info("Redirect URL: %s", current_url)
 
-        if "code=" in current_url:
-            parsed = urllib.parse.urlparse(current_url)
-            params = urllib.parse.parse_qs(parsed.query)
-            auth_code = params.get("code", [None])[0]
+            if "code=" in current_url:
+                parsed = urllib.parse.urlparse(current_url)
+                params = urllib.parse.parse_qs(parsed.query)
+                auth_code = params.get("code", [None])[0]
 
-            if auth_code:
-                logger.info("✓ Got auth code, length: %s", len(auth_code))
-                token = _exchange_code_for_token(auth_code, tenant_domain)
-                driver.get(original_url)
-                time.sleep(2)
-                return token
+                if auth_code:
+                    logger.info("✓ Got auth code, length: %s", len(auth_code))
+                    return _exchange_code_for_token(auth_code, tenant_domain)
 
-        if "error" in current_url:
-            parsed = urllib.parse.urlparse(current_url)
-            params = urllib.parse.parse_qs(parsed.query)
-            error = params.get("error", ["unknown"])[0]
-            error_desc = params.get("error_description", ["no description"])[0]
-            logger.error("OAuth error: %s", error)
-            logger.error("Description: %s", urllib.parse.unquote(error_desc))
-            if error in {"interaction_required", "consent_required"}:
-                consent_url = (
-                    f"https://login.microsoftonline.com/{tenant_domain}/adminconsent?"
-                    f"client_id={CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
-                )
-                logger.error("Admin consent required. Visit: %s", consent_url)
-        else:
-            logger.error("No code in URL. Full URL: %s", current_url)
+            if "error" in current_url:
+                parsed = urllib.parse.urlparse(current_url)
+                params = urllib.parse.parse_qs(parsed.query)
+                error = params.get("error", ["unknown"])[0]
+                error_desc = params.get("error_description", ["no description"])[0]
+                logger.error("OAuth error: %s", error)
+                logger.error("Description: %s", urllib.parse.unquote(error_desc))
+                if error in {"interaction_required", "consent_required"}:
+                    return "CONSENT_REQUIRED"
+            else:
+                logger.error("No code in URL. Full URL: %s", current_url)
+
+            return None
+
+        token = _try_auth_code_flow()
+
+        if token == "CONSENT_REQUIRED":
+            logger.warning("Admin consent required. Auto-navigating to consent URL...")
+            driver.get(consent_url)
+            time.sleep(8)
+
+            token = _try_auth_code_flow()
+
+        if token and token != "CONSENT_REQUIRED":
+            driver.get(original_url)
+            time.sleep(2)
+            return token
 
         driver.get(original_url)
         time.sleep(2)
