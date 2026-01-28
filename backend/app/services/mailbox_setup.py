@@ -6,14 +6,14 @@ Coordinates all Step 6 operations for a tenant:
 2. Generate email addresses
 3. Create shared mailboxes
 4. Fix display names
-5. Enable accounts
-6. Set passwords
-7. Fix UPNs
+5. Fix UPNs
+6. Enable accounts
+7. Set passwords
 8. Delegate to licensed user
 
 Uses hybrid approach:
 - Exchange REST API for mailbox operations (fast)
-- Selenium UI for user operations (reliable)
+- Microsoft Graph API for user operations (fast, reliable)
 """
 
 import asyncio
@@ -36,8 +36,8 @@ from app.models.mailbox import Mailbox
 from app.models.batch import SetupBatch
 from app.services.email_generator import generate_emails_for_domain
 from app.services.exchange_api import ExchangeAPIService
-from app.services.selenium.user_operations import UserOperationsService
-from app.services.selenium.token_extractor import get_tokens_after_login
+from app.services.graph_api import GraphAPIService
+from app.services.selenium.token_extractor import TokenExtractor
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +98,7 @@ class Step6Orchestrator:
 
         self.driver: Optional[webdriver.Chrome] = None
         self.exchange_service: Optional[ExchangeAPIService] = None
-        self.user_ops: Optional[UserOperationsService] = None
+        self.graph_service: Optional[GraphAPIService] = None
 
         # Results tracking
         self.results = {
@@ -165,17 +165,27 @@ class Step6Orchestrator:
 
             # Step 2: Extract Exchange token
             update_progress(self.tenant_id, "token", "in_progress", "Extracting API tokens")
-            tokens = get_tokens_after_login(self.driver)
+            tokens = TokenExtractor(self.driver).extract_all_tokens()
 
             if tokens.get("exchange_token"):
                 self.exchange_service = ExchangeAPIService(tokens["exchange_token"])
-                update_progress(self.tenant_id, "token", "complete", "Exchange token extracted")
-            else:
-                logger.warning("[%s] No Exchange token - will use UI fallback", self.domain)
-                update_progress(self.tenant_id, "token", "partial", "No Exchange token - using UI")
+                update_progress(self.tenant_id, "token", "partial", "Exchange token OK")
 
-            # Initialize user operations service
-            self.user_ops = UserOperationsService(self.driver)
+            if tokens.get("graph_token"):
+                self.graph_service = GraphAPIService(tokens["graph_token"])
+                update_progress(
+                    self.tenant_id,
+                    "token",
+                    "complete",
+                    "Graph + Exchange tokens OK",
+                )
+            else:
+                update_progress(
+                    self.tenant_id,
+                    "token",
+                    "partial",
+                    "Exchange only (Graph failed)",
+                )
 
             # Step 3: Create licensed user (me1)
             update_progress(
@@ -252,7 +262,23 @@ class Step6Orchestrator:
                 f"Fixed {fixed} display names",
             )
 
-            # Step 7: Enable accounts
+            # Step 7: Fix UPNs
+            update_progress(
+                self.tenant_id,
+                "fix_upns",
+                "in_progress",
+                "Fixing UPNs (0/50)",
+            )
+            upns_fixed = self._fix_upns(mailbox_data)
+            self.results["upns_fixed"] = upns_fixed
+            update_progress(
+                self.tenant_id,
+                "fix_upns",
+                "complete",
+                f"Fixed {upns_fixed} UPNs",
+            )
+
+            # Step 8: Enable accounts
             update_progress(
                 self.tenant_id,
                 "enable_accounts",
@@ -268,7 +294,7 @@ class Step6Orchestrator:
                 f"Enabled {enabled} accounts",
             )
 
-            # Step 8: Set passwords
+            # Step 9: Set passwords
             update_progress(
                 self.tenant_id,
                 "set_passwords",
@@ -282,22 +308,6 @@ class Step6Orchestrator:
                 "set_passwords",
                 "complete",
                 f"Set {pwd_set} passwords",
-            )
-
-            # Step 9: Fix UPNs
-            update_progress(
-                self.tenant_id,
-                "fix_upns",
-                "in_progress",
-                "Fixing UPNs (0/50)",
-            )
-            upns_fixed = self._fix_upns(mailbox_data)
-            self.results["upns_fixed"] = upns_fixed
-            update_progress(
-                self.tenant_id,
-                "fix_upns",
-                "complete",
-                f"Fixed {upns_fixed} UPNs",
             )
 
             # Step 10: Delegate to licensed user
@@ -357,11 +367,22 @@ class Step6Orchestrator:
 
     def _create_licensed_user(self) -> Dict[str, Any]:
         """Create the licensed user (me1)."""
-        return self.user_ops.create_licensed_user(
-            onmicrosoft_domain=self.onmicrosoft_domain,
-            display_name=self.display_name,
-            password=LICENSED_USER_PASSWORD,
-        )
+        if not self.graph_service:
+            return {"success": False, "error": "No Graph API token available"}
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                self.graph_service.create_licensed_user(
+                    onmicrosoft_domain=self.onmicrosoft_domain,
+                    display_name=self.display_name,
+                    password=LICENSED_USER_PASSWORD,
+                )
+            )
+            return result
+        finally:
+            loop.close()
 
     def _create_mailboxes(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Create shared mailboxes via Exchange API or UI."""
@@ -424,30 +445,64 @@ class Step6Orchestrator:
         return fixed
 
     def _enable_accounts(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Enable user accounts via Selenium UI."""
-        emails = [mb["email"] for mb in mailbox_data]
-        result = self.user_ops.enable_accounts_bulk(emails)
-        return len(result.get("enabled", []))
+        """Enable user accounts via Graph API."""
+        if not self.graph_service:
+            logger.warning("No Graph token - skipping account enable")
+            return 0
+
+        upns = [f"{mb['local_part']}@{self.onmicrosoft_domain}" for mb in mailbox_data]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(self.graph_service.enable_users_bulk(upns))
+            return len(result.get("enabled", []))
+        finally:
+            loop.close()
 
     def _set_passwords(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Set passwords via Selenium UI."""
-        users = [{"email": mb["email"], "password": mb["password"]} for mb in mailbox_data]
-        result = self.user_ops.set_passwords_bulk(users)
-        return len(result.get("set", []))
+        """Set passwords via Graph API."""
+        if not self.graph_service:
+            logger.warning("No Graph token - skipping password set")
+            return 0
+
+        users = [
+            {
+                "upn": f"{mb['local_part']}@{self.onmicrosoft_domain}",
+                "password": mb["password"],
+            }
+            for mb in mailbox_data
+        ]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(self.graph_service.set_passwords_bulk(users))
+            return len(result.get("set", []))
+        finally:
+            loop.close()
 
     def _fix_upns(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Fix UPNs via Selenium UI."""
-        users = []
-        for mb in mailbox_data:
-            users.append(
-                {
-                    "current_upn": f"{mb['local_part']}@{self.onmicrosoft_domain}",
-                    "target_email": mb["email"],
-                }
-            )
+        """Fix UPNs via Graph API."""
+        if not self.graph_service:
+            logger.warning("No Graph token - skipping UPN fix")
+            return 0
 
-        result = self.user_ops.fix_upns_bulk(users)
-        return len(result.get("fixed", []))
+        users = [
+            {
+                "current_upn": f"{mb['local_part']}@{self.onmicrosoft_domain}",
+                "new_upn": mb["email"],
+            }
+            for mb in mailbox_data
+        ]
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(self.graph_service.update_upns_bulk(users))
+            return len(result.get("updated", []))
+        finally:
+            loop.close()
 
     def _delegate_mailboxes(self, mailbox_data: List[Dict[str, Any]], licensed_user_upn: str) -> int:
         """Delegate mailboxes to licensed user via Exchange API."""

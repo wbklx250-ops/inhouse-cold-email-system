@@ -31,32 +31,32 @@ class TokenExtractor:
         Extract Microsoft Graph API access token from browser.
         """
         try:
-            # Method 1: Try to get from sessionStorage/localStorage
+            # Method 1: Navigate to Graph Explorer (auto-auth)
+            logger.info("Trying Graph Explorer method...")
+            token = self._get_token_via_graph_explorer()
+            if token:
+                logger.info("Got Graph token via Graph Explorer")
+                return token
+
+            # Method 2: Try to get from sessionStorage/localStorage
             logger.info("Trying storage extraction...")
             token = self._get_token_from_storage()
             if token:
                 logger.info("Got Graph token from browser storage")
                 return token
 
-            # Method 2: Intercept from Users page API calls
+            # Method 3: Intercept from Users page API calls
             logger.info("Trying Users page API interception...")
             token = self._get_graph_token_via_users_api()
             if token:
                 logger.info("Got Graph token via Users API interception")
                 return token
 
-            # Method 3: Use the portal's own API calls
+            # Method 4: Use the portal's own API calls
             logger.info("Trying portal API interception...")
             token = self._get_token_via_portal_api()
             if token:
                 logger.info("Got Graph token via portal API interception")
-                return token
-
-            # Method 4: Navigate to Graph Explorer
-            logger.info("Trying Graph Explorer method...")
-            token = self._get_token_via_graph_explorer()
-            if token:
-                logger.info("Got Graph token via Graph Explorer")
                 return token
 
             logger.error("Could not extract Graph token with any method")
@@ -321,56 +321,74 @@ class TokenExtractor:
 
             # Open Graph Explorer in same session
             self.driver.get("https://developer.microsoft.com/en-us/graph/graph-explorer")
-            # Wait for page to load
-            try:
-                WebDriverWait(self.driver, 30).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                time.sleep(0.5)
-            except:
-                pass
+            time.sleep(5)
 
-            # Graph Explorer shows the access token in the UI when signed in
-            # Look for the token in the page or network requests
+            # First try storage extraction inside Graph Explorer context
+            token = self.driver.execute_script(
+                """
+                const tryParseJwt = (value) => {
+                    if (!value || !value.startsWith('eyJ')) return null;
+                    try {
+                        const payload = JSON.parse(atob(value.split('.')[1]));
+                        if (payload.aud && payload.aud.includes('graph.microsoft.com')) {
+                            return value;
+                        }
+                    } catch (e) {}
+                    return null;
+                };
 
-            # Check if we can get token from the access token tab
-            try:
-                # Click on "Access token" tab if visible
-                access_token_tab = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Access token')]"))
-                )
-                access_token_tab.click()
-                # Wait for token to be displayed
+                for (const storage of [sessionStorage, localStorage]) {
+                    for (let i = 0; i < storage.length; i++) {
+                        const key = storage.key(i);
+                        const value = storage.getItem(key);
+
+                        const direct = tryParseJwt(value);
+                        if (direct) return direct;
+
+                        try {
+                            const parsed = JSON.parse(value);
+                            if (parsed && parsed.secret) {
+                                const secretToken = tryParseJwt(parsed.secret);
+                                if (secretToken) return secretToken;
+                            }
+                            if (parsed && parsed.accessToken) {
+                                const accessToken = tryParseJwt(parsed.accessToken);
+                                if (accessToken) return accessToken;
+                            }
+                        } catch (e) {}
+                    }
+                }
+
+                return null;
+                """
+            )
+
+            if not token:
+                # Try to open Access token tab and read from UI
                 try:
-                    WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((By.CSS_SELECTOR, "pre.token-value, textarea.token-value, code"))
+                    access_token_tab = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable(
+                            (By.XPATH, "//button[contains(text(), 'Access token')]"),
+                        )
                     )
-                    time.sleep(0.3)
-                except:
-                    pass
+                    access_token_tab.click()
+                    time.sleep(2)
 
-                # Get token from textarea or pre element
-                token_element = self.driver.find_element(By.CSS_SELECTOR, "pre.token-value, textarea.token-value, code")
-                token = token_element.text.strip()
-
-                if token and token.startswith('eyJ'):
-                    # Restore original URL
-                    self.driver.get(original_url)
-                    return token
-
-            except Exception as e:
-                logger.debug(f"Graph Explorer UI extraction failed: {e}")
+                    token_element = self.driver.find_element(
+                        By.CSS_SELECTOR,
+                        ".access-token-value, pre, code, textarea",
+                    )
+                    token = token_element.text.strip()
+                except Exception as e:
+                    logger.debug(f"Graph Explorer UI extraction failed: {e}")
 
             # Restore original URL
             self.driver.get(original_url)
-            # Wait for page to load
-            try:
-                WebDriverWait(self.driver, 30).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                time.sleep(0.5)
-            except:
-                pass
+            time.sleep(2)
+
+            if token and token.startswith("eyJ"):
+                return token
+
             return None
 
         except Exception as e:
