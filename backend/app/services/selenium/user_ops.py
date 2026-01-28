@@ -164,67 +164,31 @@ class UserOpsSelenium:
 
             time.sleep(1)
 
-            # UNCHECK "Automatically create a password"
-            try:
-                auto_pwd_checkbox = self.driver.find_element(By.XPATH, "//input[@type='checkbox' and following-sibling::*[contains(text(), 'Automatically create')]]")
-                if auto_pwd_checkbox.is_selected():
-                    auto_pwd_checkbox.click()
-                    logger.info("Unchecked 'Automatically create a password'")
-                    time.sleep(1)
-            except:
-                # Try clicking the label instead
+            # After filling username, FORCE uncheck the auto-password checkbox with JS
+
+            # Keep trying until password field appears
+            for attempt in range(10):
+                # Check if password field exists
                 try:
-                    auto_pwd_label = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Automatically create a password')]/ancestor::div[contains(@class, 'checkbox') or contains(@class, 'Checkbox')]")
-                    auto_pwd_label.click()
-                    logger.info("Unchecked auto-password via label")
-                    time.sleep(1)
+                    pwd_field = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+                    if pwd_field.is_displayed():
+                        logger.info("Password field visible!")
+                        break
                 except:
-                    # Try another approach - find checkbox near the text
-                    try:
-                        auto_text = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Automatically create')]")
-                        parent = auto_text.find_element(By.XPATH, "./ancestor::div[contains(@class, 'ms-Checkbox')]")
-                        parent.click()
-                        logger.info("Unchecked auto-password via parent ms-Checkbox")
-                        time.sleep(1)
-                    except:
-                        logger.warning("Could not uncheck auto-password checkbox")
+                    pass
+                
+                # Force uncheck with JavaScript
+                self.driver.execute_script("""
+                    document.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                        if (cb.checked) cb.click();
+                    });
+                """)
+                time.sleep(1)
 
-            # UNCHECK "Require this user to change their password when they first sign in"
-            try:
-                require_change_checkbox = self.driver.find_element(By.XPATH, "//input[@type='checkbox' and following-sibling::*[contains(text(), 'Require this user')]]")
-                if require_change_checkbox.is_selected():
-                    require_change_checkbox.click()
-                    logger.info("Unchecked 'Require password change'")
-                    time.sleep(1)
-            except:
-                try:
-                    require_label = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Require this user to change')]/ancestor::div[contains(@class, 'checkbox') or contains(@class, 'Checkbox')]")
-                    require_label.click()
-                    logger.info("Unchecked require-change via label")
-                    time.sleep(1)
-                except:
-                    # Try another approach
-                    try:
-                        require_text = self.driver.find_element(By.XPATH, "//span[contains(text(), 'Require this user')]")
-                        parent = require_text.find_element(By.XPATH, "./ancestor::div[contains(@class, 'ms-Checkbox')]")
-                        parent.click()
-                        logger.info("Unchecked require-change via parent ms-Checkbox")
-                        time.sleep(1)
-                    except:
-                        logger.warning("Could not uncheck require-change checkbox")
-
-            time.sleep(1)
-
-            # Now password field should be visible - enter password
-            try:
-                pwd_input = WebDriverWait(self.driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='password']"))
-                )
-                pwd_input.clear()
-                pwd_input.send_keys(password)
-                logger.info("Entered password")
-            except Exception as e:
-                logger.error(f"Could not enter password: {e}")
+            # Enter password
+            pwd_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+            pwd_input.send_keys(password)
+            logger.info("Entered password")
 
             self._screenshot("form_filled")
 
@@ -258,13 +222,32 @@ class UserOpsSelenium:
             time.sleep(2)
             self._screenshot("review_page")
             
-            # Review and finish - click "Finish adding"
-            finish_clicked = self._wait_and_click(By.XPATH, "//button[contains(., 'Finish')]")
-            if not finish_clicked:
-                self._wait_and_click(By.XPATH, "//button[contains(., 'Add')]")
-            
-            time.sleep(5)
-            self._screenshot("user_created")
+            # On the Review and finish page, click "Finish adding"
+            try:
+                finish_btn = WebDriverWait(self.driver, 10).until(
+                    EC.element_to_be_clickable((By.XPATH, "//button[contains(., 'Finish adding')]"))
+                )
+                finish_btn.click()
+                logger.info("Clicked 'Finish adding' button")
+                time.sleep(5)
+            except:
+                # Try alternative selectors
+                try:
+                    finish_btn = self.driver.find_element(By.CSS_SELECTOR, "button.ms-Button--primary")
+                    finish_btn.click()
+                    logger.info("Clicked primary button")
+                    time.sleep(5)
+                except:
+                    # Last resort - JS click
+                    self.driver.execute_script("""
+                        const btn = document.querySelector('button.ms-Button--primary') || 
+                                    [...document.querySelectorAll('button')].find(b => b.textContent.includes('Finish'));
+                        if (btn) btn.click();
+                    """)
+                    logger.info("Clicked finish via JS")
+                    time.sleep(5)
+
+            self._screenshot("user_created_final")
             
             # Close any success dialog
             try:

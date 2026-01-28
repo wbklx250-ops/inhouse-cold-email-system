@@ -3,8 +3,8 @@ Database session configuration for Neon Serverless PostgreSQL.
 
 Neon is a serverless PostgreSQL provider with specific connection requirements:
 - SSL is required (handled via ssl context in connect_args)
-- Connection pooling is important due to connection limits on free tier
-- pool_pre_ping ensures connections are valid before use (serverless cold start)
+- NullPool is used to disable local connection pooling - Neon's built-in PgBouncer handles pooling
+- This prevents stale/dropped connection issues common with serverless databases
 - Retry logic handles transient connection drops in serverless environments
 """
 import ssl
@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import NullPool
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from app.core.config import get_settings
@@ -77,19 +78,13 @@ def prepare_database_url(url: str) -> tuple[str, dict]:
 # Prepare the database URL and connect_args
 database_url, connect_args = prepare_database_url(settings.database_url)
 
-# Create async engine with Neon-optimized settings
-# CRITICAL: Neon free tier has ~10 max connections
-# Increased pool size to handle parallel browser tasks + API requests + background jobs
+# Create async engine with NullPool for Neon serverless
+# NullPool disables local connection pooling - Neon's built-in pooler (PgBouncer) handles this
+# This prevents stale connection issues common with serverless databases
 engine = create_async_engine(
     database_url,
+    poolclass=NullPool,  # Don't pool connections locally - Neon handles this
     echo=settings.debug,
-    # Connection pool settings optimized for Neon serverless
-    pool_pre_ping=True,    # Check connection health before using (handles cold starts)
-    pool_size=5,           # Increased from 3 - handles parallel automation better
-    max_overflow=5,        # Increased from 2 (total max: 10 connections = Neon limit)
-    pool_timeout=60,       # Increased from 30 - give more time during high load
-    pool_recycle=180,      # Reduced from 300 - serverless can drop connections faster
-    pool_reset_on_return='rollback',  # Clean connection state on return to pool
     connect_args=connect_args,
 )
 
@@ -181,13 +176,8 @@ sync_connect_args = {"sslmode": "require"} if connect_args.get("ssl") else {}
 
 sync_engine = create_engine(
     database_url.replace("postgresql+asyncpg", "postgresql+psycopg2"),
+    poolclass=NullPool,  # Don't pool connections locally - Neon handles this
     echo=settings.debug,
-    pool_pre_ping=True,
-    pool_size=3,
-    max_overflow=2,
-    pool_timeout=60,
-    pool_recycle=180,
-    pool_reset_on_return="rollback",
     connect_args=sync_connect_args,
 )
 
