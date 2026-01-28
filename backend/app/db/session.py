@@ -177,6 +177,8 @@ async def execute_with_retry(
 async_engine = engine
 
 # Sync engine/session for thread-safe operations (e.g., Selenium workers)
+sync_connect_args = {"sslmode": "require"} if connect_args.get("ssl") else {}
+
 sync_engine = create_engine(
     database_url.replace("postgresql+asyncpg", "postgresql+psycopg2"),
     echo=settings.debug,
@@ -186,7 +188,7 @@ sync_engine = create_engine(
     pool_timeout=60,
     pool_recycle=180,
     pool_reset_on_return="rollback",
-    connect_args=connect_args,
+    connect_args=sync_connect_args,
 )
 
 SyncSessionLocal = sessionmaker(
