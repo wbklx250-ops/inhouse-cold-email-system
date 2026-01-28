@@ -1,195 +1,125 @@
 """
-Graph API Authentication using Device Code Flow.
+Graph API Authentication with admin consent flow.
 
-Uses the Azure CLI client ID (pre-consented in all tenants).
+Uses the Email Platform app registration that requires admin consent per tenant.
 """
 
 import logging
 import time
+import urllib.parse
 from typing import Optional
 
 import requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 logger = logging.getLogger(__name__)
 
-# Use Azure CLI client ID - pre-consented in all tenants
-CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
+CLIENT_ID = "ffc66428-dce1-47d2-82b8-b2ee8345f76e"
+CLIENT_SECRET = "bpd8Q~w.mmfgYOOEPm1_KggfK8NKfa-UvsCT_aqM"
+REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 
 
-def get_graph_token_device_code(driver: webdriver.Chrome, tenant_domain: str) -> Optional[str]:
-    """
-    Get Graph token using Device Code Flow.
+def get_graph_token_with_consent(driver: webdriver.Chrome, tenant_domain: str) -> Optional[str]:
+    """Get Graph token, forcing consent prompt."""
+    
+    logger.info(f"Getting Graph token for {tenant_domain}")
+    original_url = driver.current_url
+    
+    # Use prompt=consent to force the consent screen
+    scope = "https://graph.microsoft.com/User.ReadWrite.All https://graph.microsoft.com/Directory.ReadWrite.All offline_access"
+    
+    auth_url = (
+        f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/authorize?"
+        f"client_id={CLIENT_ID}"
+        f"&response_type=code"
+        f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+        f"&scope={urllib.parse.quote(scope)}"
+        f"&response_mode=query"
+        f"&prompt=consent"  # Force consent screen
+    )
+    
+    logger.info("Navigating to OAuth with consent prompt...")
+    driver.get(auth_url)
+    time.sleep(5)
+    
+    current_url = driver.current_url
+    logger.info(f"Current URL: {current_url[:100]}")
+    
+    # Look for and click Accept button on consent screen
+    try:
+        from selenium.webdriver.common.by import By
+        from selenium.webdriver.support.ui import WebDriverWait
+        from selenium.webdriver.support import expected_conditions as EC
+        
+        # Wait for Accept button
+        accept_btn = WebDriverWait(driver, 15).until(
+            EC.element_to_be_clickable((By.ID, "idBtn_Accept"))
+        )
+        logger.info("Found Accept button, clicking...")
+        accept_btn.click()
+        time.sleep(5)
+        logger.info("Clicked Accept")
+        
+    except Exception as e:
+        logger.warning(f"No Accept button found: {e}")
+        # Maybe already consented or auto-approved
+    
+    # Check for auth code in URL
+    current_url = driver.current_url
+    logger.info(f"After consent URL: {current_url[:150]}")
+    
+    if "code=" in current_url:
+        parsed = urllib.parse.urlparse(current_url)
+        params = urllib.parse.parse_qs(parsed.query)
+        code = params.get("code", [None])[0]
+        
+        if code:
+            logger.info(f"✓ Got auth code, length: {len(code)}")
+            token = _exchange_code_for_token(code, tenant_domain)
+            driver.get(original_url)
+            time.sleep(2)
+            return token
+    
+    if "error" in current_url:
+        parsed = urllib.parse.urlparse(current_url)
+        params = urllib.parse.parse_qs(parsed.query)
+        error = params.get("error", [""])[0]
+        desc = params.get("error_description", [""])[0]
+        logger.error(f"Auth error: {error} - {urllib.parse.unquote(desc)}")
+    
+    driver.get(original_url)
+    time.sleep(2)
+    return None
 
-    Since Selenium is already logged in, we can auto-complete the device login.
-    """
-    logger.info("Getting Graph token via Device Code Flow for %s", tenant_domain)
 
-    # Step 1: Request device code
-    device_code_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/devicecode"
+def _exchange_code_for_token(code: str, tenant_domain: str) -> Optional[str]:
+    """Exchange auth code for access token."""
+
+    token_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/token"
 
     payload = {
         "client_id": CLIENT_ID,
-        "scope": (
-            "https://graph.microsoft.com/User.ReadWrite.All "
-            "https://graph.microsoft.com/Directory.ReadWrite.All "
-            "offline_access"
-        ),
+        "client_secret": CLIENT_SECRET,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": REDIRECT_URI,
+        "scope": "https://graph.microsoft.com/.default",
     }
 
     try:
-        response = requests.post(device_code_url, data=payload, timeout=30)
-        if response.status_code != 200:
-            logger.error("Device code request failed: %s", response.text)
-            return None
+        response = requests.post(token_url, data=payload, timeout=30)
 
-        data = response.json()
-        user_code = data.get("user_code")
-        device_code = data.get("device_code")
-        verification_uri = data.get("verification_uri", "https://microsoft.com/devicelogin")
-        interval = data.get("interval", 5)
-        expires_in = data.get("expires_in", 900)
-
-        logger.info("Got device code. User code: %s", user_code)
-
-        # Step 2: Navigate to device login page in authenticated browser
-        original_url = driver.current_url
-        logger.info("Navigating to %s...", verification_uri)
-
-        driver.get(verification_uri)
-        time.sleep(3)
-
-        # Step 3: Enter the user code
-        try:
-            # Find code input field
-            code_input = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "otc"))
-            )
-            code_input.clear()
-            code_input.send_keys(user_code)
-            logger.info("Entered user code: %s", user_code)
-
-            # Click Next button
-            next_btn = WebDriverWait(driver, 5).until(
-                EC.element_to_be_clickable((By.ID, "idSIButton9"))
-            )
-            next_btn.click()
-            time.sleep(5)
-
-            # Handle "Pick an account" page - click the signed-in account
-            try:
-                # Look for the account tile (the signed-in user)
-                account_tile = WebDriverWait(driver, 15).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, ".table[data-test-id]"))
-                )
-                account_tile.click()
-                logger.info("Clicked signed-in account")
-                time.sleep(5)
-            except Exception:
-                # Try alternative selectors
-                try:
-                    # Click on the account row
-                    account = driver.find_element(
-                        By.XPATH,
-                        "//div[contains(@class, 'table')]//div[contains(@data-test-id, 'admin@') or contains(text(), 'Signed in')]",
-                    )
-                    account.click()
-                    logger.info("Clicked account via alternative selector")
-                    time.sleep(5)
-                except Exception:
-                    try:
-                        # Click first account in list
-                        account = driver.find_element(By.CSS_SELECTOR, "[data-test-id*='@']")
-                        account.click()
-                        logger.info("Clicked first account")
-                        time.sleep(5)
-                    except Exception:
-                        logger.warning(
-                            "Could not find account to click, may proceed automatically"
-                        )
-
-            # Should auto-approve since already logged in
-            # Look for Continue or confirmation
-            try:
-                continue_btn = WebDriverWait(driver, 15).until(
-                    EC.element_to_be_clickable((By.ID, "idSIButton9"))
-                )
-                continue_btn.click()
-                logger.info("Clicked Continue button")
-                time.sleep(5)
-            except Exception:
-                pass  # May not need to click anything else
-
-            # Check for success message
-            try:
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located(
-                        (
-                            By.XPATH,
-                            "//*[contains(text(), 'signed in') "
-                            "or contains(text(), 'success') "
-                            "or contains(text(), 'close')]",
-                        )
-                    )
-                )
-                logger.info("Device login completed successfully")
-            except Exception:
-                logger.warning("Could not confirm success, proceeding to poll for token...")
-
-        except Exception as exc:
-            logger.error("Failed to enter device code: %s", exc)
-            driver.get(original_url)
-            return None
-
-        # Step 4: Poll for token
-        token_url = f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/token"
-
-        token_payload = {
-            "client_id": CLIENT_ID,
-            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-            "device_code": device_code,
-        }
-
-        logger.info("Polling for token...")
-        max_attempts = expires_in // interval
-
-        for attempt in range(max_attempts):
-            time.sleep(interval)
-
-            response = requests.post(token_url, data=token_payload, timeout=30)
+        if response.status_code == 200:
             data = response.json()
-
-            if "access_token" in data:
-                token = data["access_token"]
-                logger.info("✓ SUCCESS! Got Graph token via Device Code Flow, length: %s", len(token))
-                driver.get(original_url)
-                time.sleep(2)
+            token = data.get("access_token")
+            if token:
+                logger.info("✓ SUCCESS! Graph token obtained, length: %s", len(token))
                 return token
 
-            error = data.get("error")
-            if error == "authorization_pending":
-                logger.debug("Polling attempt %s... waiting for authorization", attempt + 1)
-                continue
-            if error == "authorization_declined":
-                logger.error("User declined authorization")
-                break
-            if error == "expired_token":
-                logger.error("Device code expired")
-                break
-
-            logger.warning("Unexpected response: %s", data)
-
-        driver.get(original_url)
-        time.sleep(2)
-        logger.error("Device code flow timed out")
+        logger.error("Token exchange failed: %s", response.text)
         return None
 
     except Exception as exc:
-        logger.error("Device code flow failed: %s", exc)
-        import traceback
-
-        logger.error(traceback.format_exc())
+        logger.error("Token exchange error: %s", exc)
         return None

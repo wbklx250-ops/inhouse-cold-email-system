@@ -12,8 +12,9 @@ Coordinates all Step 6 operations for a tenant:
 8. Delegate to licensed user
 
 Uses hybrid approach:
-- Exchange REST API for mailbox operations (fast)
-- Microsoft Graph API for user operations (fast, reliable)
+- Exchange REST API for mailbox operations (create mailboxes, fix display names, delegation)
+- Selenium UI for user operations (create licensed user, enable accounts, set passwords, fix UPNs)
+- NO Graph API needed
 """
 
 import asyncio
@@ -36,8 +37,8 @@ from app.models.mailbox import Mailbox
 from app.models.batch import SetupBatch
 from app.services.email_generator import generate_emails_for_domain
 from app.services.exchange_api import ExchangeAPIService
-from app.services.graph_api import GraphAPIService
 from app.services.selenium.token_extractor import TokenExtractor
+from app.services.selenium.user_ops import UserOpsSelenium
 
 logger = logging.getLogger(__name__)
 
@@ -98,7 +99,7 @@ class Step6Orchestrator:
 
         self.driver: Optional[webdriver.Chrome] = None
         self.exchange_service: Optional[ExchangeAPIService] = None
-        self.graph_service: Optional[GraphAPIService] = None
+        self.user_ops: Optional[UserOpsSelenium] = None
 
         # Results tracking
         self.results = {
@@ -175,29 +176,16 @@ class Step6Orchestrator:
                 logger.error("[%s]  No Exchange token", self.domain)
                 raise Exception("Exchange token required - cannot proceed")
 
-            from app.services.graph_auth import get_graph_token_device_code
-
-            logger.info("[%s] Getting Graph token via Device Code Flow...", self.domain)
-            graph_token = get_graph_token_device_code(self.driver, self.onmicrosoft_domain)
-
-            if graph_token:
-                self.graph_service = GraphAPIService(graph_token)
-                logger.info("[%s]  Graph token obtained via Device Code Flow", self.domain)
-                update_progress(
-                    self.tenant_id,
-                    "token",
-                    "complete",
-                    "Exchange + Graph tokens ",
-                )
-            else:
-                logger.error("[%s]  Failed to get Graph token", self.domain)
-                update_progress(
-                    self.tenant_id,
-                    "token",
-                    "partial",
-                    "Exchange only - Graph failed",
-                )
-                raise Exception("Graph token required for user operations - cannot proceed")
+            # Initialize Selenium UI operations (no Graph API needed)
+            self.user_ops = UserOpsSelenium(self.driver, self.domain)
+            logger.info("[%s]  UserOpsSelenium initialized (using UI instead of Graph API)", self.domain)
+            
+            update_progress(
+                self.tenant_id,
+                "token",
+                "complete",
+                "Exchange token + UI ready",
+            )
 
             # Step 3: Create licensed user (me1)
             update_progress(
@@ -378,23 +366,18 @@ class Step6Orchestrator:
             return False
 
     def _create_licensed_user(self) -> Dict[str, Any]:
-        """Create the licensed user (me1)."""
-        if not self.graph_service:
-            return {"success": False, "error": "No Graph API token available"}
+        """Create the licensed user (me1) via Selenium UI."""
+        if not self.user_ops:
+            return {"success": False, "error": "UserOpsSelenium not initialized"}
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                self.graph_service.create_licensed_user(
-                    onmicrosoft_domain=self.onmicrosoft_domain,
-                    display_name=self.display_name,
-                    password=LICENSED_USER_PASSWORD,
-                )
-            )
-            return result
-        finally:
-            loop.close()
+        # Use Selenium UI to create licensed user (no Graph API needed)
+        result = self.user_ops.create_licensed_user(
+            username="me1",
+            display_name=self.display_name,
+            password=LICENSED_USER_PASSWORD,
+            onmicrosoft_domain=self.onmicrosoft_domain,
+        )
+        return result
 
     def _create_mailboxes(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Create shared mailboxes via Exchange API or UI."""
@@ -441,64 +424,56 @@ class Step6Orchestrator:
         return fixed
 
     def _enable_accounts(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Enable user accounts via Graph API."""
-        if not self.graph_service:
-            logger.error("No Graph token - skipping account enable")
+        """Enable user accounts via Selenium UI."""
+        if not self.user_ops:
+            logger.error("UserOpsSelenium not initialized - skipping account enable")
             return 0
 
+        # Build list of UPNs (using onmicrosoft domain since UPNs not fixed yet)
         upns = [f"{mb['local_part']}@{self.onmicrosoft_domain}" for mb in mailbox_data]
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(self.graph_service.enable_users_bulk(upns))
-            return len(result.get("enabled", []))
-        finally:
-            loop.close()
+        # Use Selenium UI to enable accounts (no Graph API needed)
+        result = self.user_ops.enable_users_bulk(upns)
+        return len(result.get("enabled", []))
 
     def _set_passwords(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Set passwords via Graph API."""
-        if not self.graph_service:
-            logger.error("No Graph token - skipping password set")
+        """Set passwords via Selenium UI."""
+        if not self.user_ops:
+            logger.error("UserOpsSelenium not initialized - skipping password set")
             return 0
 
+        # Build list of users with UPNs and passwords
+        # Note: After UPN fix, emails should be using custom domain
         users = [
             {
-                "upn": f"{mb['local_part']}@{self.onmicrosoft_domain}",
+                "upn": mb["email"],  # After UPN fix, use custom domain email
                 "password": mb["password"],
             }
             for mb in mailbox_data
         ]
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(self.graph_service.set_passwords_bulk(users))
-            return len(result.get("set", []))
-        finally:
-            loop.close()
+        # Use Selenium UI to set passwords (no Graph API needed)
+        result = self.user_ops.set_passwords_bulk(users)
+        return len(result.get("set", []))
 
     def _fix_upns(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Fix UPNs via Graph API."""
-        if not self.graph_service:
-            logger.error("No Graph token - skipping UPN fix")
+        """Fix UPNs via Selenium UI."""
+        if not self.user_ops:
+            logger.error("UserOpsSelenium not initialized - skipping UPN fix")
             return 0
 
+        # Build list of users with current and new UPNs
         users = [
             {
                 "current_upn": f"{mb['local_part']}@{self.onmicrosoft_domain}",
-                "new_upn": mb["email"],
+                "new_upn": mb["email"],  # Custom domain email
             }
             for mb in mailbox_data
         ]
 
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(self.graph_service.update_upns_bulk(users))
-            return len(result.get("updated", []))
-        finally:
-            loop.close()
+        # Use Selenium UI to fix UPNs (no Graph API needed)
+        result = self.user_ops.update_upns_bulk(users)
+        return len(result.get("updated", []))
 
     def _delegate_mailboxes(self, mailbox_data: List[Dict[str, Any]], licensed_user_upn: str) -> int:
         """Delegate mailboxes to licensed user via Exchange API."""
