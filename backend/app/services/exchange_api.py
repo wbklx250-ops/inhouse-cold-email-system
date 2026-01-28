@@ -35,6 +35,26 @@ class ExchangeAPIService:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+        
+        # Log token info for debugging (helps identify wrong token issues)
+        import base64
+        import json
+        try:
+            parts = access_token.split('.')
+            if len(parts) >= 2:
+                # Decode JWT payload (add padding for base64)
+                payload = json.loads(base64.b64decode(parts[1] + '=='))
+                aud = payload.get('aud', 'unknown')
+                app_name = payload.get('app_displayname', payload.get('appid', 'unknown'))
+                logger.info(f"ExchangeAPIService initialized - Token audience: {aud}")
+                logger.info(f"ExchangeAPIService initialized - Token app: {app_name}")
+                
+                # Warn if this looks like a Graph token (wrong audience)
+                if 'graph.microsoft.com' in str(aud).lower():
+                    logger.warning("[WARNING] This looks like a Graph token, not an Exchange token!")
+                    logger.warning("[WARNING] Exchange API calls will likely fail with 401")
+        except Exception as e:
+            logger.warning(f"Could not decode token for debugging: {e}")
 
     async def _request(
         self,
@@ -54,14 +74,38 @@ class ExchangeAPIService:
                 json=data,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as response:
+                response_text = await response.text()
+                
+                if response.status == 401:
+                    # Log EVERYTHING for debugging
+                    logger.error(f"=== 401 ERROR DETAILS ===")
+                    logger.error(f"URL: {url}")
+                    logger.error(f"Response body: {response_text}")
+                    logger.error(f"Response headers: {dict(response.headers)}")
+                    logger.error(f"Token (first 100 chars): {self.access_token[:100]}")
+                    
+                    # Decode token to check audience
+                    import base64
+                    import json as json_mod
+                    try:
+                        parts = self.access_token.split('.')
+                        payload = json_mod.loads(base64.b64decode(parts[1] + '=='))
+                        logger.error(f"Token audience (aud): {payload.get('aud')}")
+                        logger.error(f"Token issuer (iss): {payload.get('iss')}")
+                        logger.error(f"Token expiry (exp): {payload.get('exp')}")
+                    except Exception as e:
+                        logger.error(f"Could not decode token: {e}")
+                    
+                    logger.error(f"=========================")
+                    raise Exception(f"Exchange API 401: {response_text}")
+                
                 if response.status >= 400:
-                    error_text = await response.text()
-                    logger.error(f"Exchange API error {response.status}: {error_text}")
-                    raise Exception(f"Exchange API error {response.status}: {error_text}")
+                    logger.error(f"Exchange API error {response.status}: {response_text}")
+                    raise Exception(f"Exchange API error {response.status}: {response_text}")
 
                 if response.content_type == "application/json":
                     return await response.json()
-                return {"status": response.status, "text": await response.text()}
+                return {"status": response.status, "text": response_text}
 
     # =========================================================================
     # MAILBOX OPERATIONS

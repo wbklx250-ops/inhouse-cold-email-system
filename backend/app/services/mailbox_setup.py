@@ -35,6 +35,7 @@ from selenium.webdriver.chrome.options import Options
 from app.models.tenant import Tenant
 from app.models.mailbox import Mailbox
 from app.models.batch import SetupBatch
+from app.db.session import SyncSessionLocal
 from app.services.email_generator import generate_emails_for_domain
 from app.services.exchange_api import ExchangeAPIService
 from app.services.selenium.token_extractor import TokenExtractor
@@ -96,6 +97,11 @@ class Step6Orchestrator:
         self.admin_email = tenant_data["admin_email"]
         self.admin_password = tenant_data["admin_password"]
         self.totp_secret = tenant_data.get("totp_secret")
+        
+        # Licensed user info (for re-run idempotency)
+        self.licensed_user_created = tenant_data.get("licensed_user_created", False)
+        self.licensed_user_upn = tenant_data.get("licensed_user_upn")
+        self.licensed_user_password = tenant_data.get("licensed_user_password")
 
         self.driver: Optional[webdriver.Chrome] = None
         self.exchange_service: Optional[ExchangeAPIService] = None
@@ -138,6 +144,40 @@ class Step6Orchestrator:
                 self.driver.save_screenshot(path)
             except Exception:
                 pass
+
+    def _refresh_exchange_token(self) -> bool:
+        """
+        Refresh the Exchange token before making API calls.
+        
+        The Exchange token expires in ~1 hour, so we need to refresh it
+        before making bulk mailbox operations to avoid 401 errors.
+        
+        Returns:
+            True if token was refreshed successfully, False otherwise.
+        """
+        try:
+            logger.info(f"[{self.domain}] Refreshing Exchange token before mailbox operations...")
+            
+            # Navigate to Exchange Admin Center to get fresh session/token
+            self.driver.get("https://admin.exchange.microsoft.com/#/recipients")
+            time.sleep(8)  # Wait for page to load and authenticate
+            
+            # Re-extract the token
+            extractor = TokenExtractor(self.driver)
+            fresh_exchange_token = extractor.extract_exchange_token()
+            
+            if fresh_exchange_token:
+                # Update the Exchange service with fresh token
+                self.exchange_service = ExchangeAPIService(fresh_exchange_token)
+                logger.info(f"[{self.domain}]  Refreshed Exchange token, length: {len(fresh_exchange_token)}")
+                return True
+            else:
+                logger.error(f"[{self.domain}] Failed to refresh Exchange token")
+                return False
+                
+        except Exception as e:
+            logger.error(f"[{self.domain}] Error refreshing Exchange token: {e}")
+            return False
 
     def run(self) -> Dict[str, Any]:
         """
@@ -194,20 +234,68 @@ class Step6Orchestrator:
                 "in_progress",
                 "Creating licensed user (me1)",
             )
-            licensed_user = self._create_licensed_user()
-            self.results["licensed_user"] = licensed_user
-
-            if not licensed_user.get("success"):
-                raise Exception(
-                    f"Failed to create licensed user: {licensed_user.get('error')}"
+            
+            # Check database if licensed user already exists
+            logger.info(f"[{self.domain}] Checking if licensed user already exists...")
+            logger.info(f"[{self.domain}] licensed_user_created = {self.licensed_user_created}")
+            logger.info(f"[{self.domain}] licensed_user_upn = {self.licensed_user_upn}")
+            
+            if self.licensed_user_created and self.licensed_user_upn:
+                logger.info(f"[{self.domain}]  Licensed user already exists: {self.licensed_user_upn} - SKIPPING creation")
+                licensed_user = {
+                    "success": True,
+                    "email": self.licensed_user_upn,
+                    "password": self.licensed_user_password or LICENSED_USER_PASSWORD,
+                    "skipped": True,
+                }
+                update_progress(
+                    self.tenant_id,
+                    "licensed_user",
+                    "complete",
+                    f"Already exists: {self.licensed_user_upn}",
                 )
-
-            update_progress(
-                self.tenant_id,
-                "licensed_user",
-                "complete",
-                f"Created {licensed_user['email']}",
-            )
+            else:
+                logger.info(f"[{self.domain}] Creating licensed user...")
+                # Create new licensed user
+                licensed_user = self._create_licensed_user()
+                if not licensed_user.get("success"):
+                    raise Exception(
+                        f"Failed to create licensed user: {licensed_user.get('error')}"
+                    )
+                
+                # IMPORTANT: Save to database immediately after successful creation
+                try:
+                    licensed_upn = f"me1@{self.domain}"
+                    with SyncSessionLocal() as db:
+                        db.execute(
+                            update(Tenant)
+                            .where(Tenant.id == self.tenant_id)
+                            .values(
+                                licensed_user_created=True,
+                                licensed_user_upn=licensed_upn,
+                                licensed_user_password=LICENSED_USER_PASSWORD
+                            )
+                        )
+                        db.commit()
+                    
+                    # Update local state as well
+                    self.licensed_user_created = True
+                    self.licensed_user_upn = licensed_upn
+                    self.licensed_user_password = LICENSED_USER_PASSWORD
+                    
+                    logger.info(f"[{self.domain}]  Licensed user created and saved to DB: {licensed_upn}")
+                except Exception as db_err:
+                    logger.error(f"[{self.domain}] Failed to save licensed user to DB: {db_err}")
+                    # Don't raise - the user was created, just DB save failed
+                
+                update_progress(
+                    self.tenant_id,
+                    "licensed_user",
+                    "complete",
+                    f"Created {licensed_user['email']}",
+                )
+            
+            self.results["licensed_user"] = licensed_user
 
             # Step 4: Generate email addresses
             update_progress(
@@ -237,6 +325,11 @@ class Step6Orchestrator:
                 "in_progress",
                 "Creating shared mailboxes (0/50)",
             )
+            
+            # Refresh Exchange token before mailbox creation (token may have expired)
+            if not self._refresh_exchange_token():
+                raise Exception("Could not refresh Exchange token before mailbox creation")
+            
             created = self._create_mailboxes(mailbox_data)
             self.results["mailboxes_created"] = created
             update_progress(
@@ -317,6 +410,11 @@ class Step6Orchestrator:
                 "in_progress",
                 "Adding delegation (0/50)",
             )
+            
+            # Refresh Exchange token before delegation (token may have expired during previous steps)
+            if not self._refresh_exchange_token():
+                logger.warning(f"[{self.domain}] Could not refresh token before delegation, trying with existing token...")
+            
             delegated = self._delegate_mailboxes(mailbox_data, licensed_user["email"])
             self.results["delegations_done"] = delegated
             update_progress(
@@ -574,6 +672,10 @@ async def run_step6_for_batch(
                 "admin_email": tenant.admin_email,
                 "admin_password": tenant.admin_password,
                 "totp_secret": tenant.totp_secret,
+                # Licensed user info (for re-run idempotency)
+                "licensed_user_created": tenant.licensed_user_created,
+                "licensed_user_upn": tenant.licensed_user_upn,
+                "licensed_user_password": tenant.licensed_user_password,
             }
         )
 

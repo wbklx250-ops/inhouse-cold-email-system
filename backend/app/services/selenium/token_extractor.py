@@ -85,7 +85,7 @@ class TokenExtractor:
             token = self.driver.execute_script(script)
 
             if token:
-                logger.info(f"✓ Got Graph token from Entra ID storage, length: {len(token)}")
+                logger.info(f"[OK] Got Graph token from Entra ID storage, length: {len(token)}")
                 self.driver.get(original_url)
                 time.sleep(2)
                 return token
@@ -112,7 +112,7 @@ class TokenExtractor:
                                 if auth_header.startswith('Bearer '):
                                     token = auth_header.replace('Bearer ', '')
                                     logger.info(
-                                        f"✓ Got Graph token from network logs, length: {len(token)}"
+                                        f"[OK] Got Graph token from network logs, length: {len(token)}"
                                     )
                                     self.driver.get(original_url)
                                     return token
@@ -175,7 +175,7 @@ class TokenExtractor:
                 if token:
                     # URL decode the token
                     token = urllib.parse.unquote(token)
-                    logger.info(f"✓ Got Graph token via OAuth, length: {len(token)}")
+                    logger.info(f"[OK] Got Graph token via OAuth, length: {len(token)}")
                     self.driver.get(original_url)
                     return token
 
@@ -615,87 +615,92 @@ class TokenExtractor:
             return None
 
     def extract_exchange_token(self) -> Optional[str]:
-        """
-        Extract Exchange Admin Center access token.
-
-        The Exchange Admin Center uses a different token than Graph API.
-        """
-        try:
-            original_url = self.driver.current_url
-
-            # Navigate to Exchange Admin Center
-            self.driver.get("https://admin.exchange.microsoft.com")
-            # Wait for page to fully load
-            try:
-                WebDriverWait(self.driver, 30).until(
-                    lambda d: d.execute_script("return document.readyState") == "complete"
-                )
-                time.sleep(0.5)
-            except:
-                pass
-
-            # Exchange Admin uses its own token in sessionStorage
-            script = """
-                let tokens = [];
-                for (let i = 0; i < sessionStorage.length; i++) {
-                    let key = sessionStorage.key(i);
-                    let value = sessionStorage.getItem(key);
-                    if (value && value.includes('eyJ')) {
-                        tokens.push({key: key, value: value});
+        """Extract Exchange token by intercepting actual API calls."""
+        
+        logger.info("Extracting Exchange token via network interception...")
+        
+        # First inject the interceptor
+        setup_script = '''
+            window.__exchangeToken = null;
+            
+            // Intercept XMLHttpRequest
+            const origOpen = XMLHttpRequest.prototype.open;
+            const origSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+            
+            XMLHttpRequest.prototype.open = function(method, url) {
+                this.__url = url;
+                return origOpen.apply(this, arguments);
+            };
+            
+            XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+                if (name.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+                    if (this.__url && (
+                        this.__url.includes('outlook.office365.com') ||
+                        this.__url.includes('outlook.office.com')
+                    )) {
+                        window.__exchangeToken = value.replace('Bearer ', '');
+                        console.log('Captured Exchange token from XHR');
                     }
                 }
-
-                // Also check for EXO-specific storage
-                try {
-                    let exoToken = sessionStorage.getItem('exchange_token') ||
-                                   sessionStorage.getItem('ests.access_token') ||
-                                   sessionStorage.getItem('EXO_TOKEN');
-                    if (exoToken) {
-                        tokens.push({key: 'exchange_direct', value: exoToken});
+                return origSetHeader.apply(this, arguments);
+            };
+            
+            // Intercept fetch
+            const origFetch = window.fetch;
+            window.fetch = function(url, options) {
+                const urlStr = (typeof url === 'string') ? url : url.toString();
+                if (urlStr.includes('outlook.office365.com') || urlStr.includes('outlook.office.com')) {
+                    if (options && options.headers) {
+                        const headers = options.headers;
+                        let auth = null;
+                        if (typeof headers.get === 'function') {
+                            auth = headers.get('Authorization');
+                        } else {
+                            auth = headers['Authorization'] || headers['authorization'];
+                        }
+                        if (auth && auth.startsWith('Bearer ')) {
+                            window.__exchangeToken = auth.replace('Bearer ', '');
+                            console.log('Captured Exchange token from fetch');
+                        }
                     }
-                } catch(e) {}
-
-                return JSON.stringify(tokens);
-            """
-
-            result = self.driver.execute_script(script)
-
-            if result:
-                tokens = json.loads(result)
-                for token_obj in tokens:
-                    value = token_obj.get('value', '')
-                    # Try to parse as JSON
-                    try:
-                        parsed = json.loads(value)
-                        if 'secret' in parsed:
-                            return parsed['secret']
-                        if 'accessToken' in parsed:
-                            return parsed['accessToken']
-                    except:
-                        # Check if it's a raw JWT
-                        if value.startswith('eyJ'):
-                            return value
-
-            # If still no token, try to capture from network
-            token = self._capture_exchange_token_from_network()
-
-            # Restore original URL if needed
-            if original_url != self.driver.current_url:
-                self.driver.get(original_url)
-                # Wait for page to load
-                try:
-                    WebDriverWait(self.driver, 30).until(
-                        lambda d: d.execute_script("return document.readyState") == "complete"
-                    )
-                    time.sleep(0.5)
-                except:
-                    pass
-
-            return token
-
+                }
+                return origFetch.apply(this, arguments);
+            };
+            
+            return 'Interceptors installed';
+        '''
+        
+        try:
+            # Install interceptors
+            self.driver.execute_script(setup_script)
+            
+            # Navigate to Exchange Admin - this triggers API calls
+            self.driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
+            time.sleep(10)  # Wait for page to load and make API calls
+            
+            # Check if we captured a token
+            token = self.driver.execute_script("return window.__exchangeToken;")
+            
+            if token:
+                logger.info(f" Captured Exchange token (length: {len(token)})")
+                return token
+            
+            # Try refreshing to trigger more API calls
+            logger.info("No token yet, refreshing page...")
+            self.driver.refresh()
+            time.sleep(8)
+            
+            token = self.driver.execute_script("return window.__exchangeToken;")
+            
+            if token:
+                logger.info(f" Captured Exchange token on refresh (length: {len(token)})")
+                return token
+                
         except Exception as e:
-            logger.error(f"Error extracting Exchange token: {e}")
-            return None
+            logger.error(f"Token interception failed: {e}")
+        
+        logger.error("No Exchange token captured from network")
+        return None
 
     def _capture_exchange_token_from_network(self) -> Optional[str]:
         """Capture Exchange token from network requests."""
@@ -773,9 +778,9 @@ class TokenExtractor:
         # Log what we got
         for name, token in tokens.items():
             if token:
-                logger.info(f"✓ {name}: Extracted (length: {len(token)})")
+                logger.info(f"[OK] {name}: Extracted (length: {len(token)})")
             else:
-                logger.warning(f"✗ {name}: Failed to extract")
+                logger.warning(f"[FAILED] {name}: Failed to extract")
 
         return tokens
 
@@ -844,11 +849,11 @@ if __name__ == "__main__":
 
         for name, token in tokens.items():
             if token:
-                print(f"\n✓ {name}:")
+                print(f"\n[OK] {name}:")
                 print(f"  Length: {len(token)}")
                 print(f"  Preview: {token[:50]}...")
             else:
-                print(f"\n✗ {name}: NOT FOUND")
+                print(f"\n[FAILED] {name}: NOT FOUND")
 
     finally:
         print("\n\nClosing browser in 5 seconds...")

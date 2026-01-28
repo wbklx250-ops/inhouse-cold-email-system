@@ -4,6 +4,7 @@ Graph API Authentication with admin consent flow.
 Uses the Email Platform app registration that requires admin consent per tenant.
 """
 
+import json
 import logging
 import time
 import urllib.parse
@@ -123,3 +124,86 @@ def _exchange_code_for_token(code: str, tenant_domain: str) -> Optional[str]:
     except Exception as exc:
         logger.error("Token exchange error: %s", exc)
         return None
+
+
+def extract_exchange_token(driver: webdriver.Chrome) -> Optional[str]:
+    """Extract Exchange token using Chrome DevTools Protocol."""
+    
+    logger.info("Extracting Exchange token via CDP...")
+    
+    try:
+        # Enable network tracking via CDP
+        driver.execute_cdp_cmd('Network.enable', {})
+        
+        # Store to capture token
+        driver.execute_script("window.__capturedExchangeToken = null;")
+        
+        # Set up request interception
+        driver.execute_cdp_cmd('Network.setRequestInterception', {
+            'patterns': [{'urlPattern': '*outlook.office365.com*'}]
+        })
+    except Exception as e:
+        logger.warning(f"CDP setup failed, trying alternative: {e}")
+    
+    # Navigate to Exchange Admin to trigger API calls
+    driver.get("https://admin.exchange.microsoft.com/#/mailboxes")
+    time.sleep(5)
+    
+    # Try to get token from performance logs
+    try:
+        logs = driver.get_log('performance')
+        
+        for entry in logs:
+            try:
+                log_data = json.loads(entry['message'])
+                message = log_data.get('message', {})
+                
+                if message.get('method') == 'Network.requestWillBeSent':
+                    params = message.get('params', {})
+                    request = params.get('request', {})
+                    headers = request.get('headers', {})
+                    url = request.get('url', '')
+                    
+                    # Check if it's an Exchange API call
+                    if 'outlook.office365.com' in url or 'outlook.office.com' in url:
+                        auth = headers.get('Authorization', headers.get('authorization', ''))
+                        if auth.startswith('Bearer '):
+                            token = auth.replace('Bearer ', '')
+                            logger.info(f"✓ Got Exchange token from CDP logs (length: {len(token)})")
+                            return token
+            except:
+                continue
+                
+    except Exception as e:
+        logger.warning(f"Performance log extraction failed: {e}")
+    
+    # Fallback: Try the old storage method but grab ANY token that works
+    logger.info("Trying fallback storage extraction...")
+    
+    script = '''
+        const storages = [localStorage, sessionStorage];
+        for (const storage of storages) {
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                const value = storage.getItem(key);
+                if (!value) continue;
+                
+                try {
+                    const parsed = JSON.parse(value);
+                    const token = parsed.secret || parsed.accessToken;
+                    if (token && token.startsWith('eyJ') && token.length > 1000) {
+                        return token;
+                    }
+                } catch(e) {}
+            }
+        }
+        return null;
+    '''
+    
+    token = driver.execute_script(script)
+    if token:
+        logger.info(f"✓ Got token from storage fallback (length: {len(token)})")
+        return token
+    
+    logger.error("No Exchange token found")
+    return None

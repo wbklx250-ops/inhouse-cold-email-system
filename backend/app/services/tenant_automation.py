@@ -216,6 +216,10 @@ class BrowserWorker:
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         
+        # Enable performance logging for CDP (Chrome DevTools Protocol)
+        # This captures all network requests including Authorization headers
+        opts.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+        
         driver = webdriver.Chrome(options=opts)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         driver._profile_dir = profile_dir
