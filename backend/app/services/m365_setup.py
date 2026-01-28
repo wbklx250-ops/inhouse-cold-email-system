@@ -250,60 +250,84 @@ async def run_step5_for_batch(
     logger.info(f"Phase 1 complete: {len(tenants_data)} tenants ready for processing")
     
     # ============================================================
-    # PHASE 2: RUN SELENIUM IN THREADS (Sync, thread pool)
+    # PHASE 2: RUN SELENIUM IN THREADS (Sync, thread pool) - CHUNKED
     # ============================================================
-    
+
     logger.info(f"Phase 2: Starting parallel Selenium automation with {MAX_PARALLEL_BROWSERS} workers...")
-    
+
     # Results from threads (domain -> result dict)
     thread_results = {}
-    
+
     loop = asyncio.get_event_loop()
-    
-    with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BROWSERS) as executor:
-        # Submit all tasks to thread pool
-        future_to_domain = {}
-        
-        for tenant_data in tenants_data:
-            domain_name = tenant_data["domain"]
-            
-            # Use run_in_executor for proper asyncio integration
-            future = loop.run_in_executor(
-                executor,
-                _sync_setup_domain,
-                tenant_data
-            )
-            future_to_domain[future] = {
-                "domain": domain_name,
-                "tenant_data": tenant_data
-            }
-        
-        # Wait for all futures and collect results
-        logger.info(f"Waiting for {len(future_to_domain)} Selenium tasks to complete...")
-        
-        for future in asyncio.as_completed(list(future_to_domain.keys())):
-            task_info = future_to_domain[future]
-            domain_name = task_info["domain"]
-            
-            try:
-                result = await future
-                thread_results[domain_name] = result
-                
-                if result.get("success"):
-                    logger.info(f"[{domain_name}] Selenium automation SUCCESS")
-                else:
-                    logger.warning(f"[{domain_name}] Selenium automation FAILED: {result.get('error')}")
-                    
-            except Exception as e:
-                logger.exception(f"[{domain_name}] Thread execution error: {e}")
-                thread_results[domain_name] = {
-                    "success": False,
-                    "verified": False,
-                    "dns_configured": False,
-                    "error": str(e)
+    chunk_size = 3
+    total_chunks = (len(tenants_data) + chunk_size - 1) // chunk_size
+
+    for chunk_start in range(0, len(tenants_data), chunk_size):
+        chunk = tenants_data[chunk_start:chunk_start + chunk_size]
+        chunk_num = (chunk_start // chunk_size) + 1
+
+        logger.info(
+            "Processing chunk %s/%s (%s domains)",
+            chunk_num,
+            total_chunks,
+            len(chunk),
+        )
+
+        with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BROWSERS) as executor:
+            future_to_domain = {}
+
+            for tenant_data in chunk:
+                domain_name = tenant_data["domain"]
+
+                # Use run_in_executor for proper asyncio integration
+                future = loop.run_in_executor(
+                    executor,
+                    _sync_setup_domain,
+                    tenant_data
+                )
+                future_to_domain[future] = {
+                    "domain": domain_name,
+                    "tenant_data": tenant_data
                 }
-    
-    logger.info(f"Phase 2 complete: All Selenium tasks finished")
+
+            # Wait for this chunk to complete before continuing
+            logger.info(
+                "Waiting for %s Selenium tasks to complete in chunk %s/%s...",
+                len(future_to_domain),
+                chunk_num,
+                total_chunks,
+            )
+
+            for future in asyncio.as_completed(list(future_to_domain.keys())):
+                task_info = future_to_domain[future]
+                domain_name = task_info["domain"]
+
+                try:
+                    result = await future
+                    thread_results[domain_name] = result
+
+                    if result.get("success"):
+                        logger.info(f"[{domain_name}] Selenium automation SUCCESS")
+                    else:
+                        logger.warning(
+                            f"[{domain_name}] Selenium automation FAILED: {result.get('error')}"
+                        )
+
+                except Exception as e:
+                    logger.exception(f"[{domain_name}] Thread execution error: {e}")
+                    thread_results[domain_name] = {
+                        "success": False,
+                        "verified": False,
+                        "dns_configured": False,
+                        "error": str(e)
+                    }
+
+        logger.info("Chunk %s/%s complete", chunk_num, total_chunks)
+
+        if chunk_start + chunk_size < len(tenants_data):
+            await asyncio.sleep(2)
+
+    logger.info("Phase 2 complete: All Selenium tasks finished")
     
     # ============================================================
     # PHASE 3: UPDATE DATABASE (Async, main event loop)

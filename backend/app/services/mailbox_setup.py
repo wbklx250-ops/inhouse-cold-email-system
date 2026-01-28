@@ -175,14 +175,14 @@ class Step6Orchestrator:
                 logger.error("[%s]  No Exchange token", self.domain)
                 raise Exception("Exchange token required - cannot proceed")
 
-            from app.services.graph_auth import get_graph_token_via_auth_code
+            from app.services.graph_auth import get_graph_token_device_code
 
-            logger.info("[%s] Getting Graph token via Azure App...", self.domain)
-            graph_token = get_graph_token_via_auth_code(self.driver, self.onmicrosoft_domain)
+            logger.info("[%s] Getting Graph token via Device Code Flow...", self.domain)
+            graph_token = get_graph_token_device_code(self.driver, self.onmicrosoft_domain)
 
             if graph_token:
                 self.graph_service = GraphAPIService(graph_token)
-                logger.info("[%s]  Graph token obtained via Azure App", self.domain)
+                logger.info("[%s]  Graph token obtained via Device Code Flow", self.domain)
                 update_progress(
                     self.tenant_id,
                     "token",

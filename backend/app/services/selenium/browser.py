@@ -6,6 +6,7 @@ import uuid
 import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.desired_capabilities import DesiredCapabilities
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +36,11 @@ def create_driver(headless: bool = True) -> webdriver.Chrome:
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+
+    # Enable performance logging (for network token extraction)
+    caps = DesiredCapabilities.CHROME
+    caps["goog:loggingPrefs"] = {"performance": "ALL"}
+    opts.set_capability("goog:loggingPrefs", {"performance": "ALL"})
 
     # Unique profile for isolation (lightweight, no BrowserWorker)
     user_data_dir = os.path.join(tempfile.gettempdir(), f"chrome_profile_{uuid.uuid4().hex[:8]}")

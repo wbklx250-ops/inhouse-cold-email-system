@@ -27,49 +27,109 @@ class TokenExtractor:
         self.driver = driver
 
     def extract_graph_token(self) -> Optional[str]:
-        """
-        Extract Microsoft Graph API access token from browser.
-        """
+        """Extract Graph token by navigating to Entra ID (uses Graph API)."""
+        logger.info("Extracting Graph token via Entra ID...")
+
         try:
-            # Method 1: OAuth implicit flow (most reliable with MFA)
-            logger.info("Trying OAuth implicit flow...")
-            token = self.extract_graph_token_via_oauth()
+            original_url = self.driver.current_url
+
+            # Navigate to Entra ID (Azure AD) - this page uses Graph API
+            self.driver.get(
+                "https://entra.microsoft.com/#view/Microsoft_AAD_UsersAndTenants/"
+                "UserManagementMenuBlade/~/AllUsers"
+            )
+            time.sleep(8)  # Let page load and make API calls
+
+            # Try to get token from storage
+            script = """
+                // Check localStorage and sessionStorage for Graph tokens
+                function findGraphToken() {
+                    const storages = [localStorage, sessionStorage];
+                    for (const storage of storages) {
+                        for (let i = 0; i < storage.length; i++) {
+                            const key = storage.key(i);
+                            const value = storage.getItem(key);
+
+                            // Look for tokens
+                            if (value && value.includes('eyJ')) {
+                                try {
+                                    // Try parsing as JSON first
+                                    const parsed = JSON.parse(value);
+                                    const token = parsed.secret || parsed.accessToken || parsed.access_token;
+                                    if (token && token.startsWith('eyJ')) {
+                                        // Check if it's for Graph
+                                        const payload = JSON.parse(atob(token.split('.')[1]));
+                                        if (payload.aud && payload.aud.includes('graph.microsoft.com')) {
+                                            return token;
+                                        }
+                                    }
+                                } catch(e) {
+                                    // Try as raw token
+                                    if (value.startsWith('eyJ') && value.length > 500) {
+                                        try {
+                                            const payload = JSON.parse(atob(value.split('.')[1]));
+                                            if (payload.aud && payload.aud.includes('graph.microsoft.com')) {
+                                                return value;
+                                            }
+                                        } catch(e2) {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    return null;
+                }
+                return findGraphToken();
+            """
+
+            token = self.driver.execute_script(script)
+
             if token:
+                logger.info(f"✓ Got Graph token from Entra ID storage, length: {len(token)}")
+                self.driver.get(original_url)
+                time.sleep(2)
                 return token
 
-            # Method 2: Navigate to Graph Explorer (auto-auth)
-            logger.info("Trying Graph Explorer method...")
-            token = self._get_token_via_graph_explorer()
-            if token:
-                logger.info("Got Graph token via Graph Explorer")
-                return token
+            # If storage didn't work, try getting from performance logs
+            # (requires Chrome to be started with performance logging enabled)
+            logger.warning("No Graph token in storage, trying network interception...")
 
-            # Method 3: Try to get from sessionStorage/localStorage
-            logger.info("Trying storage extraction...")
-            token = self._get_token_from_storage()
-            if token:
-                logger.info("Got Graph token from browser storage")
-                return token
+            # Refresh page to capture new requests
+            self.driver.refresh()
+            time.sleep(5)
 
-            # Method 4: Intercept from Users page API calls
-            logger.info("Trying Users page API interception...")
-            token = self._get_graph_token_via_users_api()
-            if token:
-                logger.info("Got Graph token via Users API interception")
-                return token
+            # Check performance logs for Graph API calls
+            try:
+                logs = self.driver.get_log('performance')
+                for entry in logs:
+                    try:
+                        message = json.loads(entry['message'])['message']
+                        if message['method'] == 'Network.requestWillBeSent':
+                            url = message['params'].get('request', {}).get('url', '')
+                            headers = message['params'].get('request', {}).get('headers', {})
+                            if 'graph.microsoft.com' in url:
+                                auth_header = headers.get('Authorization', '')
+                                if auth_header.startswith('Bearer '):
+                                    token = auth_header.replace('Bearer ', '')
+                                    logger.info(
+                                        f"✓ Got Graph token from network logs, length: {len(token)}"
+                                    )
+                                    self.driver.get(original_url)
+                                    return token
+                    except Exception:
+                        continue
+            except Exception as e:
+                logger.debug(f"Performance log extraction failed: {e}")
 
-            # Method 5: Use the portal's own API calls
-            logger.info("Trying portal API interception...")
-            token = self._get_token_via_portal_api()
-            if token:
-                logger.info("Got Graph token via portal API interception")
-                return token
-
-            logger.error("Could not extract Graph token with any method")
+            self.driver.get(original_url)
+            time.sleep(2)
+            logger.error("Could not extract Graph token from Entra ID")
             return None
 
         except Exception as e:
-            logger.error(f"Error extracting Graph token: {e}")
+            logger.error(f"Graph token extraction failed: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return None
 
     def extract_graph_token_via_oauth(self) -> Optional[str]:
