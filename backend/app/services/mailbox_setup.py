@@ -12,7 +12,7 @@ Coordinates all Step 6 operations for a tenant:
 8. Delegate to licensed user
 
 Uses hybrid approach:
-- Exchange REST API for mailbox operations (create mailboxes, fix display names, delegation)
+- PowerShell device-code auth for mailbox creation + delegation
 - Selenium UI for user operations (create licensed user, enable accounts, set passwords, fix UPNs)
 - NO Graph API needed
 """
@@ -37,8 +37,7 @@ from app.models.mailbox import Mailbox
 from app.models.batch import SetupBatch
 from app.db.session import SyncSessionLocal
 from app.services.email_generator import generate_emails_for_domain
-from app.services.exchange_api import ExchangeAPIService
-from app.services.selenium.token_extractor import TokenExtractor
+from app.services.powershell_exchange import PowerShellExchangeService
 from app.services.selenium.user_ops import UserOpsSelenium
 
 logger = logging.getLogger(__name__)
@@ -104,7 +103,6 @@ class Step6Orchestrator:
         self.licensed_user_password = tenant_data.get("licensed_user_password")
 
         self.driver: Optional[webdriver.Chrome] = None
-        self.exchange_service: Optional[ExchangeAPIService] = None
         self.user_ops: Optional[UserOpsSelenium] = None
 
         # Results tracking
@@ -126,12 +124,14 @@ class Step6Orchestrator:
         opts = Options()
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--disable-software-rasterizer")
+        opts.add_argument("--disable-extensions")
         opts.add_argument("--window-size=1920,1080")
         opts.add_argument("--disable-blink-features=AutomationControlled")
 
         if headless:
             opts.add_argument("--headless=new")
-            opts.add_argument("--disable-gpu")
 
         return webdriver.Chrome(options=opts)
 
@@ -145,39 +145,65 @@ class Step6Orchestrator:
             except Exception:
                 pass
 
-    def _refresh_exchange_token(self) -> bool:
-        """
-        Refresh the Exchange token before making API calls.
-        
-        The Exchange token expires in ~1 hour, so we need to refresh it
-        before making bulk mailbox operations to avoid 401 errors.
-        
-        Returns:
-            True if token was refreshed successfully, False otherwise.
-        """
+    def _create_mailboxes_with_powershell(
+        self,
+        mailbox_data: List[Dict[str, Any]],
+        delegate_to: str,
+    ) -> Dict[str, Any]:
+        """Create and delegate mailboxes using PowerShell device-code auth."""
+
+        results: Dict[str, Any] = {
+            "created": [],
+            "failed": [],
+            "delegated": [],
+            "display_names_fixed": [],
+            "display_names_failed": [],
+        }
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        ps_service = PowerShellExchangeService(
+            driver=self.driver,
+            admin_email=self.admin_email,
+            admin_password=self.admin_password,
+            totp_secret=self.totp_secret,
+        )
+
         try:
-            logger.info(f"[{self.domain}] Refreshing Exchange token before mailbox operations...")
-            
-            # Navigate to Exchange Admin Center to get fresh session/token
-            self.driver.get("https://admin.exchange.microsoft.com/#/recipients")
-            time.sleep(8)  # Wait for page to load and authenticate
-            
-            # Re-extract the token
-            extractor = TokenExtractor(self.driver)
-            fresh_exchange_token = extractor.extract_exchange_token()
-            
-            if fresh_exchange_token:
-                # Update the Exchange service with fresh token
-                self.exchange_service = ExchangeAPIService(fresh_exchange_token)
-                logger.info(f"[{self.domain}]  Refreshed Exchange token, length: {len(fresh_exchange_token)}")
-                return True
-            else:
-                logger.error(f"[{self.domain}] Failed to refresh Exchange token")
-                return False
-                
-        except Exception as e:
-            logger.error(f"[{self.domain}] Error refreshing Exchange token: {e}")
-            return False
+            connected = loop.run_until_complete(ps_service.connect())
+            if not connected:
+                raise Exception("Failed to connect to Exchange Online via PowerShell")
+
+            mailbox_payload = [
+                {
+                    "email": mb["email"],
+                    "display_name": f"{mb['display_name']} {mb['index']}",
+                    "delegate_to": delegate_to,
+                }
+                for mb in mailbox_data
+            ]
+
+            results = loop.run_until_complete(ps_service.create_shared_mailboxes(mailbox_payload))
+
+            fix_payload = [
+                {"email": mb["email"], "display_name": mb["display_name"]}
+                for mb in mailbox_data
+            ]
+            fix_results = loop.run_until_complete(ps_service.fix_display_names(fix_payload))
+            results["display_names_fixed"] = fix_results.get("updated", [])
+            results["display_names_failed"] = fix_results.get("failed", [])
+
+        except Exception as exc:
+            logger.error("[%s] PowerShell mailbox creation failed: %s", self.domain, exc)
+            results["failed"].append({"error": str(exc)})
+        finally:
+            try:
+                loop.run_until_complete(ps_service.disconnect())
+            except Exception as exc:
+                logger.warning("[%s] PowerShell disconnect failed: %s", self.domain, exc)
+            loop.close()
+
+        return results
 
     def run(self) -> Dict[str, Any]:
         """
@@ -204,19 +230,8 @@ class Step6Orchestrator:
 
             update_progress(self.tenant_id, "login", "complete", "Logged in successfully")
 
-            # Step 2: Extract Exchange token
-            update_progress(self.tenant_id, "token", "in_progress", "Extracting API tokens")
-
-            extractor = TokenExtractor(self.driver)
-            exchange_token = extractor.extract_exchange_token()
-            if exchange_token:
-                self.exchange_service = ExchangeAPIService(exchange_token)
-                logger.info("[%s]  Exchange token extracted", self.domain)
-            else:
-                logger.error("[%s]  No Exchange token", self.domain)
-                raise Exception("Exchange token required - cannot proceed")
-
-            # Initialize Selenium UI operations (no Graph API needed)
+            # Step 2: Initialize Selenium UI operations (no Graph API needed)
+            update_progress(self.tenant_id, "token", "in_progress", "Preparing admin session")
             self.user_ops = UserOpsSelenium(self.driver, self.domain)
             logger.info("[%s]  UserOpsSelenium initialized (using UI instead of Graph API)", self.domain)
             
@@ -224,7 +239,7 @@ class Step6Orchestrator:
                 self.tenant_id,
                 "token",
                 "complete",
-                "Exchange token + UI ready",
+                "Admin session ready",
             )
 
             # Step 3: Create licensed user (me1)
@@ -325,13 +340,20 @@ class Step6Orchestrator:
                 "in_progress",
                 "Creating shared mailboxes (0/50)",
             )
-            
-            # Refresh Exchange token before mailbox creation (token may have expired)
-            if not self._refresh_exchange_token():
-                raise Exception("Could not refresh Exchange token before mailbox creation")
-            
-            created = self._create_mailboxes(mailbox_data)
+
+            ps_results = self._create_mailboxes_with_powershell(
+                mailbox_data,
+                licensed_user["email"],
+            )
+
+            created = len(ps_results.get("created", []))
+            delegated = len(ps_results.get("delegated", []))
+            fixed = len(ps_results.get("display_names_fixed", []))
+
             self.results["mailboxes_created"] = created
+            self.results["display_names_fixed"] = fixed
+            self.results["delegations_done"] = delegated
+
             update_progress(
                 self.tenant_id,
                 "create_mailboxes",
@@ -346,8 +368,6 @@ class Step6Orchestrator:
                 "in_progress",
                 "Fixing display names (0/50)",
             )
-            fixed = self._fix_display_names(mailbox_data)
-            self.results["display_names_fixed"] = fixed
             update_progress(
                 self.tenant_id,
                 "fix_display_names",
@@ -410,13 +430,6 @@ class Step6Orchestrator:
                 "in_progress",
                 "Adding delegation (0/50)",
             )
-            
-            # Refresh Exchange token before delegation (token may have expired during previous steps)
-            if not self._refresh_exchange_token():
-                logger.warning(f"[{self.domain}] Could not refresh token before delegation, trying with existing token...")
-            
-            delegated = self._delegate_mailboxes(mailbox_data, licensed_user["email"])
-            self.results["delegations_done"] = delegated
             update_progress(
                 self.tenant_id,
                 "delegation",
@@ -424,8 +437,21 @@ class Step6Orchestrator:
                 f"Delegated {delegated} mailboxes",
             )
 
+            if ps_results.get("failed"):
+                for failure in ps_results["failed"]:
+                    self.results["errors"].append(
+                        failure.get("error")
+                        or f"{failure.get('email', 'unknown')} failed"
+                    )
+            if ps_results.get("display_names_failed"):
+                for failure in ps_results["display_names_failed"]:
+                    self.results["errors"].append(
+                        failure.get("error")
+                        or f"Display name failed for {failure.get('email', 'unknown')}"
+                    )
+
             # Success!
-            self.results["success"] = True
+            self.results["success"] = not self.results["errors"]
             update_progress(self.tenant_id, "complete", "complete", "Step 6 complete!")
 
             return self.results
@@ -473,53 +499,10 @@ class Step6Orchestrator:
             username="me1",
             display_name=self.display_name,
             password=LICENSED_USER_PASSWORD,
-            onmicrosoft_domain=self.onmicrosoft_domain,
+            custom_domain=self.domain,
         )
         return result
 
-    def _create_mailboxes(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Create shared mailboxes via Exchange API or UI."""
-        created = 0
-
-        if not self.exchange_service:
-            logger.error("No Exchange token - cannot create mailboxes")
-            return 0
-
-        # Use Exchange API (fast)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                self.exchange_service.create_shared_mailboxes_bulk(mailbox_data)
-            )
-            created = len(result.get("created", [])) + len(result.get("skipped", []))
-        finally:
-            loop.close()
-
-        return created
-
-    def _fix_display_names(self, mailbox_data: List[Dict[str, Any]]) -> int:
-        """Fix display names (remove number suffixes)."""
-        fixed = 0
-
-        if not self.exchange_service:
-            logger.error("No Exchange token - cannot fix display names")
-            return 0
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                self.exchange_service.fix_display_names_bulk(
-                    mailbox_data,
-                    self.display_name,
-                )
-            )
-            fixed = len(result.get("fixed", []))
-        finally:
-            loop.close()
-
-        return fixed
 
     def _enable_accounts(self, mailbox_data: List[Dict[str, Any]]) -> int:
         """Enable user accounts via Selenium UI."""
@@ -573,26 +556,6 @@ class Step6Orchestrator:
         result = self.user_ops.update_upns_bulk(users)
         return len(result.get("updated", []))
 
-    def _delegate_mailboxes(self, mailbox_data: List[Dict[str, Any]], licensed_user_upn: str) -> int:
-        """Delegate mailboxes to licensed user via Exchange API."""
-        delegated = 0
-
-        if not self.exchange_service:
-            logger.error("No Exchange token - cannot delegate mailboxes")
-            return 0
-
-        emails = [mb["email"] for mb in mailbox_data]
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(
-                self.exchange_service.delegate_mailboxes_bulk(emails, licensed_user_upn)
-            )
-            delegated = len(result.get("delegated", []))
-        finally:
-            loop.close()
-
-        return delegated
 
 
 # =============================================================================

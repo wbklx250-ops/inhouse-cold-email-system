@@ -2249,6 +2249,11 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
   const [isStarting, setIsStarting] = useState(false);
   const [isAutomationRunning, setIsAutomationRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const summary = step6Status?.summary || {};
+  const totalTenants = summary?.total_tenants ?? 0;
+  const completedTenants = summary?.step6_complete ?? 0;
+  const readyForStep6 = summary?.ready_for_step6 ?? 0;
+  const step6Errors = summary?.step6_errors ?? 0;
 
   // Fetch step6 status
   const fetchStep6Status = useCallback(async () => {
@@ -2394,23 +2399,23 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
       {step6Status && (
         <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-gray-900">{step6Status.summary.total_tenants}</div>
+            <div className="text-3xl font-bold text-gray-900">{totalTenants}</div>
             <div className="text-sm text-gray-500">Total Tenants</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-blue-600">{step6Status.summary.step5_complete}</div>
+            <div className="text-3xl font-bold text-blue-600">{summary?.step5_complete ?? 0}</div>
             <div className="text-sm text-gray-500">Step 5 Complete</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-yellow-600">{step6Status.summary.ready_for_step6}</div>
+            <div className="text-3xl font-bold text-yellow-600">{readyForStep6}</div>
             <div className="text-sm text-gray-500">Ready for Step 6</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-green-600">{step6Status.summary.step6_complete}</div>
+            <div className="text-3xl font-bold text-green-600">{completedTenants}</div>
             <div className="text-sm text-gray-500">Step 6 Complete</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-red-600">{step6Status.summary.step6_errors}</div>
+            <div className="text-3xl font-bold text-red-600">{step6Errors}</div>
             <div className="text-sm text-gray-500">Errors</div>
           </div>
         </div>
@@ -2453,7 +2458,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
               {isStarting ? "Starting..." : isAutomationRunning ? "Automation Running..." : "🚀 Start Mailbox Creation"}
             </button>
 
-            {step6Status && step6Status.summary.step6_complete > 0 && (
+            {step6Status && completedTenants > 0 && (
               <button
                 onClick={handleDownloadCSV}
                 className="px-6 py-2 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
@@ -2472,7 +2477,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
               <span className="text-blue-800 font-medium">Automation in progress...</span>
             </div>
             <p className="mt-2 text-sm text-blue-600">
-              Processing {step6Status?.summary.ready_for_step6} tenant(s). This may take ~10 minutes per tenant.
+              Processing {readyForStep6} tenant(s). This may take ~10 minutes per tenant.
             </p>
           </div>
         )}
@@ -2605,15 +2610,16 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
           ← Back to Step 5
         </button>
 
-        {step6Status && step6Status.summary.step6_complete === step6Status.summary.total_tenants && (
+        {step6Status && completedTenants === totalTenants && (
           <div className="text-center">
-            <p className="text-green-600 font-medium mb-2">🎉 All tenants complete!</p>
-            <button
-              onClick={handleDownloadCSV}
-              className="px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
-            >
-              📥 Download All Mailboxes CSV
-            </button>
+            {completedTenants > 0 && (
+              <button
+                onClick={handleDownloadCSV}
+                className="px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
+              >
+                📥 Download All Mailboxes CSV
+              </button>
+            )}
           </div>
         )}
       </div>

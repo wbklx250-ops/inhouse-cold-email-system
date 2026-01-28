@@ -34,10 +34,11 @@ from app.services.orchestrator import process_batch, SetupConfig
 from app.services.m365_setup import run_step5_for_batch, run_step5_for_tenant, Step5Result
 from app.services.selenium.parallel_processor import run_parallel_step5, DomainTask
 from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress
-from app.services.mailbox_setup import (
-    run_step6_for_batch,
-    get_all_progress as get_step6_all_progress,
-    get_progress as get_step6_progress,
+from app.services.azure_step6 import (
+    run_step6_for_batch as run_azure_step6_for_batch,
+    run_step6_for_tenant as run_azure_step6_for_tenant,
+    get_all_progress as get_azure_step6_all_progress,
+    get_progress as get_azure_step6_progress,
 )
 
 router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
@@ -2195,80 +2196,82 @@ async def get_step6_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get Step 6 status for all tenants in batch."""
-
-    # Get batch info
-    batch_result = await db.execute(
-        select(SetupBatch).where(SetupBatch.id == batch_id)
-    )
-    batch = batch_result.scalar_one_or_none()
-    if not batch:
-        raise HTTPException(404, "Batch not found")
-
-    # Get tenants with mailbox counts
-    result = await db.execute(
-        select(Tenant).where(Tenant.batch_id == batch_id)
-    )
-    tenants = result.scalars().all()
-
-    tenant_statuses = []
-    for tenant in tenants:
-        # Count mailboxes for this tenant
-        mailbox_result = await db.execute(
-            select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+    try:
+        # Get batch info
+        batch_result = await db.execute(
+            select(SetupBatch).where(SetupBatch.id == batch_id)
         )
-        mailbox_count = mailbox_result.scalar() or 0
+        batch = batch_result.scalar_one_or_none()
+        if not batch:
+            raise HTTPException(404, "Batch not found")
 
-        # Get live progress if available
-        live_progress = get_step6_progress(str(tenant.id))
-
-        tenant_statuses.append(
-            {
-                "tenant_id": str(tenant.id),
-                "name": tenant.name,
-                "domain": tenant.custom_domain,
-                "onmicrosoft_domain": tenant.onmicrosoft_domain,
-                "step5_complete": tenant.domain_verified_in_m365 and tenant.dkim_enabled,
-                "step6_started": tenant.step6_started,
-                "step6_complete": tenant.step6_complete,
-                "step6_error": tenant.step6_error,
-                "licensed_user": tenant.licensed_user_upn,
-                "mailbox_count": mailbox_count,
-                "progress": {
-                    "mailboxes_created": tenant.step6_mailboxes_created,
-                    "display_names_fixed": tenant.step6_display_names_fixed,
-                    "accounts_enabled": tenant.step6_accounts_enabled,
-                    "passwords_set": tenant.step6_passwords_set,
-                    "upns_fixed": tenant.step6_upns_fixed,
-                    "delegations_done": tenant.step6_delegations_done,
-                },
-                "live_progress": {
-                    "step": live_progress.get("step", ""),
-                    "status": live_progress.get("status", ""),
-                    "detail": live_progress.get("detail", ""),
-                    "active": bool(live_progress),
-                },
-            }
+        # Get tenants with mailbox counts
+        result = await db.execute(
+            select(Tenant).where(Tenant.batch_id == batch_id)
         )
+        tenants = result.scalars().all()
 
-    # Summary stats
-    total = len(tenants)
-    step5_complete = sum(1 for t in tenant_statuses if t["step5_complete"])
-    step6_complete = sum(1 for t in tenant_statuses if t["step6_complete"])
-    step6_errors = sum(1 for t in tenant_statuses if t["step6_error"])
+        tenant_statuses = []
+        for tenant in tenants:
+            # Count mailboxes for this tenant
+            mailbox_result = await db.execute(
+                select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+            )
+            mailbox_count = mailbox_result.scalar() or 0
 
-    return {
-        "batch_id": str(batch_id),
-        "display_name": f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
-        or None,
-        "summary": {
-            "total_tenants": total,
-            "step5_complete": step5_complete,
-            "step6_complete": step6_complete,
-            "step6_errors": step6_errors,
-            "ready_for_step6": step5_complete - step6_complete - step6_errors,
-        },
-        "tenants": tenant_statuses,
-    }
+            # Get live progress if available
+            live_progress = get_azure_step6_progress(str(tenant.id))
+
+            tenant_statuses.append(
+                {
+                    "tenant_id": str(tenant.id),
+                    "name": tenant.name,
+                    "domain": tenant.custom_domain,
+                    "onmicrosoft_domain": tenant.onmicrosoft_domain,
+                    "step5_complete": tenant.domain_verified_in_m365 and tenant.dkim_enabled,
+                    "step6_started": tenant.step6_started,
+                    "step6_complete": tenant.step6_complete,
+                    "step6_error": tenant.step6_error if not tenant.step6_complete else None,
+                    "licensed_user": tenant.licensed_user_upn,
+                    "mailbox_count": mailbox_count,
+                    "progress": {
+                        "mailboxes_created": tenant.step6_mailboxes_created,
+                        "display_names_fixed": tenant.step6_display_names_fixed,
+                        "accounts_enabled": tenant.step6_accounts_enabled,
+                        "passwords_set": tenant.step6_passwords_set,
+                        "upns_fixed": tenant.step6_upns_fixed,
+                        "delegations_done": tenant.step6_delegations_done,
+                    },
+                    "live_progress": {
+                        "step": live_progress.get("step", ""),
+                        "status": live_progress.get("status", ""),
+                        "detail": live_progress.get("detail", ""),
+                        "active": bool(live_progress),
+                    },
+                }
+            )
+
+        # Summary stats
+        total = len(tenants)
+        step5_complete = sum(1 for t in tenant_statuses if t["step5_complete"])
+        step6_complete = sum(1 for t in tenant_statuses if t["step6_complete"])
+        step6_errors = sum(1 for t in tenant_statuses if t["step6_error"])
+
+        return {
+            "batch_id": str(batch_id),
+            "display_name": f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
+            or None,
+            "summary": {
+                "total_tenants": total,
+                "step5_complete": step5_complete,
+                "step6_complete": step6_complete,
+                "step6_errors": step6_errors,
+                "ready_for_step6": step5_complete - step6_complete - step6_errors,
+            },
+            "tenants": tenant_statuses,
+        }
+    except Exception as e:
+        return {"status": "polling_error", "message": str(e)}
 
 
 @router.post("/batches/{batch_id}/step6/start")
@@ -2309,8 +2312,8 @@ async def start_step6_automation(
             400, "No eligible tenants for Step 6 (need Step 5 complete, Step 6 not complete)"
         )
 
-    # Start automation in background
-    background_tasks.add_task(run_step6_for_batch, batch_id, display_name, db)
+    # Start Azure Automation in background
+    background_tasks.add_task(run_azure_step6_for_batch, batch_id, display_name)
 
     return {
         "success": True,
@@ -2333,7 +2336,7 @@ async def get_step6_automation_status(
     tenants = result.scalars().all()
 
     # Get live progress
-    all_progress = get_step6_all_progress()
+    all_progress = get_azure_step6_all_progress()
 
     statuses = []
     for tenant in tenants:
@@ -2456,21 +2459,8 @@ async def retry_step6_for_tenant(
     tenant.step6_error = None
     await db.commit()
 
-    # Prepare tenant data
-    tenant_data = {
-        "id": str(tenant.id),
-        "name": tenant.name,
-        "custom_domain": tenant.custom_domain,
-        "onmicrosoft_domain": tenant.onmicrosoft_domain,
-        "admin_email": tenant.admin_email,
-        "admin_password": tenant.admin_password,
-        "totp_secret": tenant.totp_secret,
-    }
-
     # Run in background
-    from app.services.mailbox_setup import run_step6_for_tenant_sync
-
-    background_tasks.add_task(run_step6_for_tenant_sync, tenant_data, display_name)
+    background_tasks.add_task(run_azure_step6_for_tenant, tenant.id)
 
     return {
         "success": True,

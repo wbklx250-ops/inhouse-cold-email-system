@@ -203,7 +203,8 @@ class PowerShellService:
         admin_password: str,
         email: str,
         password: str,
-        licensed_user_upn: str
+        licensed_user_upn: str,
+        skip_delegation: bool = False,
     ) -> Dict:
         """
         Configure a mailbox:
@@ -236,7 +237,8 @@ class PowerShellService:
             "AdminPassword": admin_password,
             "Email": email,
             "Password": password,
-            "LicensedUserEmail": licensed_user_upn
+            "LicensedUserEmail": licensed_user_upn,
+            "SkipDelegation": str(skip_delegation)
         })
         
         if result["success"]:

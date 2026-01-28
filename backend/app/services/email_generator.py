@@ -6,63 +6,74 @@ NO numbers, NO random suffixes - strictly name-based patterns only.
 """
 
 import secrets
-import string
 from typing import List, Dict
 
 
-# The 50 email patterns in EXACT order
-EMAIL_PATTERNS = [
-    "{first}",
-    "{f}",
-    "{first}.{last}",
-    "{f}{last}",
-    "{f}.{last}",
-    "{last}.{first}",
-    "{last}{f}",
-    "{first}{last}",
-    "{last}{first}",
-    "{f}{l}",
-    "{first}_{last}",
-    "{last}_{first}",
-    "{first}-{last}",
-    "{last}-{first}",
-    "{last}.{f}",
-    "{f2}{last}",
-    "{f2}.{last}",
-    "{last}{f2}",
-    "{last}.{f2}",
-    "{f3}{last}",
-    "{f3}.{last}",
-    "{last}{f3}",
-    "{last}.{f3}",
-    "{first}{l}",
-    "{first}.{l}",
-    "{l}{first}",
-    "{l}.{first}",
-    "{first}{l2}",
-    "{first}.{l2}",
-    "{l2}{first}",
-    "{l2}.{first}",
-    "{first}{l3}",
-    "{first}.{l3}",
-    "{l3}{first}",
-    "{l3}.{first}",
-    "{first}{l4}",
-    "{first}.{l4}",
-    "{l4}{first}",
-    "{l4}.{first}",
-    "{first}{l5}",
-    "{first}.{l5}",
-    "{l5}{first}",
-    "{l5}.{first}",
-    "{first}{l6}",
-    "{first}.{l6}",
-    "{l6}{first}",
-    "{l6}.{first}",
-    "{f}.{l}",
-    "{f}{l2}",
-    "{f}.{l2}",
-]
+def generate_email_variations(
+    first_name: str,
+    last_name: str,
+    domain: str,
+    count: int = 50,
+) -> List[Dict[str, str]]:
+    """Generate unique email variations from a persona name."""
+    first = first_name.lower()
+    last = last_name.lower()
+    emails = set()
+
+    # Pattern 1: first name variations
+    emails.add(f"{first}@{domain}")
+    emails.add(f"{first[0]}@{domain}")
+
+    # Pattern 2: first.last variations
+    emails.add(f"{first}.{last}@{domain}")
+    emails.add(f"{first}{last}@{domain}")
+    emails.add(f"{first[0]}{last}@{domain}")
+    emails.add(f"{first[0]}.{last}@{domain}")
+
+    # Pattern 3: last.first variations
+    emails.add(f"{last}.{first}@{domain}")
+    emails.add(f"{last}{first}@{domain}")
+    emails.add(f"{last}{first[0]}@{domain}")
+    emails.add(f"{last}.{first[0]}@{domain}")
+
+    # Pattern 4: initials
+    emails.add(f"{first[0]}{last[0]}@{domain}")
+    emails.add(f"{first[0]}.{last[0]}@{domain}")
+
+    # Pattern 5: underscore variations
+    emails.add(f"{first}_{last}@{domain}")
+    emails.add(f"{last}_{first}@{domain}")
+
+    # Pattern 6: hyphen variations
+    emails.add(f"{first}-{last}@{domain}")
+    emails.add(f"{last}-{first}@{domain}")
+
+    # Pattern 7: progressive first name + last
+    for i in range(2, len(first) + 1):
+        emails.add(f"{first[:i]}{last}@{domain}")
+        emails.add(f"{first[:i]}.{last}@{domain}")
+        emails.add(f"{last}{first[:i]}@{domain}")
+        emails.add(f"{last}.{first[:i]}@{domain}")
+
+    # Pattern 8: first + progressive last name
+    for i in range(1, len(last) + 1):
+        emails.add(f"{first}{last[:i]}@{domain}")
+        emails.add(f"{first}.{last[:i]}@{domain}")
+        emails.add(f"{last[:i]}{first}@{domain}")
+        emails.add(f"{last[:i]}.{first}@{domain}")
+
+    # Pattern 9: progressive both
+    for i in range(1, min(len(first), 4) + 1):
+        for j in range(1, min(len(last), 4) + 1):
+            emails.add(f"{first[:i]}.{last[:j]}@{domain}")
+            emails.add(f"{last[:j]}.{first[:i]}@{domain}")
+
+    email_list = sorted(list(emails))[:count]
+    display_name = f"{first_name} {last_name}".strip()
+    return [
+        {"email": email, "display_name": display_name}
+        for email in email_list
+    ]
 
 
 def generate_password(length: int = 12) -> str:
@@ -110,52 +121,17 @@ def parse_display_name(display_name: str) -> tuple:
         display_name: Full name like "Jack Zuvelek"
     
     Returns:
-        Tuple of (first_name, last_name) in lowercase
+        Tuple of (first_name, last_name) in original casing
     """
     parts = display_name.strip().split()
     
     if len(parts) < 2:
         raise ValueError(f"Display name must have first and last name: '{display_name}'")
     
-    first = parts[0].lower()
-    last = parts[-1].lower()  # Use last part as surname (handles middle names)
+    first = parts[0]
+    last = parts[-1]  # Use last part as surname (handles middle names)
     
     return first, last
-
-
-def generate_local_part(pattern: str, first: str, last: str) -> str:
-    """
-    Generate the local part of an email (before @) from a pattern.
-    
-    Args:
-        pattern: Email pattern like "{first}.{last}"
-        first: First name in lowercase
-        last: Last name in lowercase
-    
-    Returns:
-        Local part of email address
-    """
-    # Create all the substitution values
-    substitutions = {
-        "first": first,
-        "last": last,
-        "f": first[0] if len(first) >= 1 else "",
-        "l": last[0] if len(last) >= 1 else "",
-        "f2": first[:2] if len(first) >= 2 else first,
-        "f3": first[:3] if len(first) >= 3 else first,
-        "l2": last[:2] if len(last) >= 2 else last,
-        "l3": last[:3] if len(last) >= 3 else last,
-        "l4": last[:4] if len(last) >= 4 else last,
-        "l5": last[:5] if len(last) >= 5 else last,
-        "l6": last[:6] if len(last) >= 6 else last,
-    }
-    
-    # Replace all placeholders
-    result = pattern
-    for key, value in substitutions.items():
-        result = result.replace("{" + key + "}", value)
-    
-    return result
 
 
 def generate_emails_for_domain(
@@ -175,38 +151,31 @@ def generate_emails_for_domain(
         List of dicts with keys: email, display_name, password, local_part
     """
     first, last = parse_display_name(display_name)
-    
+
+    variations = generate_email_variations(first, last, domain, count)
     emails = []
-    used_local_parts = set()
-    
-    # Use patterns up to count
-    patterns_to_use = EMAIL_PATTERNS[:count]
-    
-    for pattern in patterns_to_use:
-        local_part = generate_local_part(pattern, first, last)
-        
-        # Skip if we somehow get a duplicate (shouldn't happen with these patterns)
-        if local_part in used_local_parts:
-            continue
-        
-        used_local_parts.add(local_part)
-        
-        email = f"{local_part}@{domain}"
+
+    for variation in variations:
+        email = variation["email"]
+        local_part = email.split("@")[0]
         password = generate_password()
-        
-        # Ensure password doesn't contain parts of email
-        while (local_part in password.lower() or 
-               first in password.lower() or 
-               last in password.lower()):
+
+        while (
+            local_part in password.lower()
+            or first.lower() in password.lower()
+            or last.lower() in password.lower()
+        ):
             password = generate_password()
-        
-        emails.append({
-            "email": email,
-            "display_name": display_name,  # Keep original casing
-            "password": password,
-            "local_part": local_part
-        })
-    
+
+        emails.append(
+            {
+                "email": email,
+                "display_name": variation["display_name"],
+                "password": password,
+                "local_part": local_part,
+            }
+        )
+
     return emails
 
 

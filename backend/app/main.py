@@ -8,7 +8,14 @@ from sqlalchemy import text, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from fastapi import Depends
 
-from app.api.routes import domains_router, mailboxes_router, tenants_router, wizard_router, stats_router
+from app.api.routes import (
+    domains_router,
+    mailboxes_router,
+    tenants_router,
+    wizard_router,
+    stats_router,
+    webhooks_router,
+)
 from app.db.session import get_db_session
 from app.core.config import get_settings
 from app.db.session import engine
@@ -100,6 +107,7 @@ app.include_router(mailboxes_router)
 app.include_router(tenants_router)
 app.include_router(wizard_router)
 app.include_router(stats_router)
+app.include_router(webhooks_router)
 
 
 @app.get("/", tags=["root"])

@@ -61,7 +61,7 @@ class UserOpsSelenium:
         username: str = "me1",
         display_name: str = "me1",
         password: str = "#Sendemails1",
-        onmicrosoft_domain: str = None
+        custom_domain: str = None
     ) -> Dict:
         """Create a licensed user via M365 Admin Portal.
         
@@ -255,7 +255,7 @@ class UserOpsSelenium:
             except:
                 pass
             
-            upn = f"{username}@{onmicrosoft_domain}" if onmicrosoft_domain else username
+            upn = f"{username}@{custom_domain}" if custom_domain else username
             email = upn  # For consistency with previous API
             logger.info(f"[{self.domain}] ✓ Created licensed user: {upn}")
             

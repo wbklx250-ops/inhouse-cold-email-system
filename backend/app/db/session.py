@@ -3,8 +3,7 @@ Database session configuration for Neon Serverless PostgreSQL.
 
 Neon is a serverless PostgreSQL provider with specific connection requirements:
 - SSL is required (handled via ssl context in connect_args)
-- NullPool is used to disable local connection pooling - Neon's built-in PgBouncer handles pooling
-- This prevents stale/dropped connection issues common with serverless databases
+- Async engine uses explicit pooling settings for higher concurrency
 - Retry logic handles transient connection drops in serverless environments
 """
 import ssl
@@ -78,12 +77,14 @@ def prepare_database_url(url: str) -> tuple[str, dict]:
 # Prepare the database URL and connect_args
 database_url, connect_args = prepare_database_url(settings.database_url)
 
-# Create async engine with NullPool for Neon serverless
-# NullPool disables local connection pooling - Neon's built-in pooler (PgBouncer) handles this
-# This prevents stale connection issues common with serverless databases
+# Create async engine with connection pooling settings
 engine = create_async_engine(
     database_url,
-    poolclass=NullPool,  # Don't pool connections locally - Neon handles this
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=60,
+    pool_recycle=1800,
+    pool_pre_ping=True,
     echo=settings.debug,
     connect_args=connect_args,
 )

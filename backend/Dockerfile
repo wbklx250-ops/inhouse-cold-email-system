@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     apt-transport-https \
     software-properties-common \
     gnupg \
+    chromium \
+    chromium-driver \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PowerShell Core (for Microsoft 365 scripts)

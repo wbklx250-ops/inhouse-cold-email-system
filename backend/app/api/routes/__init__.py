@@ -3,6 +3,7 @@ from app.api.routes.mailboxes import router as mailboxes_router
 from app.api.routes.tenants import router as tenants_router
 from app.api.routes.wizard import router as wizard_router
 from app.api.routes.stats import router as stats_router
+from app.api.routes.webhooks import router as webhooks_router
 
 __all__ = [
     "domains_router",
@@ -10,4 +11,5 @@ __all__ = [
     "tenants_router",
     "wizard_router",
     "stats_router",
+    "webhooks_router",
 ]

@@ -20,7 +20,10 @@ param(
     [string]$Password,  # Password to set for the mailbox
     
     [Parameter(Mandatory=$true)]
-    [string]$LicensedUserEmail  # Email of licensed user to grant delegation
+    [string]$LicensedUserEmail,  # Email of licensed user to grant delegation
+
+    [Parameter(Mandatory=$false)]
+    [bool]$SkipDelegation = $false
 )
 
 # Set error action preference
@@ -136,39 +139,41 @@ try {
         $configStatus.errors += "Graph API connection failed: $($_.Exception.Message)"
     }
     
-    # Grant Full Access permission
-    try {
-        Add-MailboxPermission -Identity $Email -User $LicensedUserEmail -AccessRights FullAccess -InheritanceType All -AutoMapping $true -ErrorAction Stop
-        $configStatus.full_access_granted = $true
-    } catch {
-        if ($_.Exception.Message -like "*already has*" -or $_.Exception.Message -like "*already exists*") {
-            $configStatus.full_access_granted = $true  # Already granted
-        } else {
-            $configStatus.errors += "Failed to grant FullAccess: $($_.Exception.Message)"
+    if (-not $SkipDelegation) {
+        # Grant Full Access permission
+        try {
+            Add-MailboxPermission -Identity $Email -User $LicensedUserEmail -AccessRights FullAccess -InheritanceType All -AutoMapping $true -ErrorAction Stop
+            $configStatus.full_access_granted = $true
+        } catch {
+            if ($_.Exception.Message -like "*already has*" -or $_.Exception.Message -like "*already exists*") {
+                $configStatus.full_access_granted = $true  # Already granted
+            } else {
+                $configStatus.errors += "Failed to grant FullAccess: $($_.Exception.Message)"
+            }
         }
-    }
-    
-    # Grant Send As permission
-    try {
-        Add-RecipientPermission -Identity $Email -Trustee $LicensedUserEmail -AccessRights SendAs -Confirm:$false -ErrorAction Stop
-        $configStatus.send_as_granted = $true
-    } catch {
-        if ($_.Exception.Message -like "*already has*" -or $_.Exception.Message -like "*already exists*") {
-            $configStatus.send_as_granted = $true  # Already granted
-        } else {
-            $configStatus.errors += "Failed to grant SendAs: $($_.Exception.Message)"
+        
+        # Grant Send As permission
+        try {
+            Add-RecipientPermission -Identity $Email -Trustee $LicensedUserEmail -AccessRights SendAs -Confirm:$false -ErrorAction Stop
+            $configStatus.send_as_granted = $true
+        } catch {
+            if ($_.Exception.Message -like "*already has*" -or $_.Exception.Message -like "*already exists*") {
+                $configStatus.send_as_granted = $true  # Already granted
+            } else {
+                $configStatus.errors += "Failed to grant SendAs: $($_.Exception.Message)"
+            }
         }
-    }
-    
-    # Grant Send On Behalf permission
-    try {
-        Set-Mailbox -Identity $Email -GrantSendOnBehalfTo @{Add=$LicensedUserEmail} -ErrorAction Stop
-        $configStatus.send_on_behalf_granted = $true
-    } catch {
-        if ($_.Exception.Message -like "*already*") {
-            $configStatus.send_on_behalf_granted = $true  # Already granted
-        } else {
-            $configStatus.errors += "Failed to grant SendOnBehalf: $($_.Exception.Message)"
+        
+        # Grant Send On Behalf permission
+        try {
+            Set-Mailbox -Identity $Email -GrantSendOnBehalfTo @{Add=$LicensedUserEmail} -ErrorAction Stop
+            $configStatus.send_on_behalf_granted = $true
+        } catch {
+            if ($_.Exception.Message -like "*already*") {
+                $configStatus.send_on_behalf_granted = $true  # Already granted
+            } else {
+                $configStatus.errors += "Failed to grant SendOnBehalf: $($_.Exception.Message)"
+            }
         }
     }
     
@@ -176,10 +181,7 @@ try {
     Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
     
     # Determine overall success
-    $allSuccess = $configStatus.mailbox_found -and 
-                  $configStatus.full_access_granted -and 
-                  $configStatus.send_as_granted -and 
-                  $configStatus.send_on_behalf_granted
+    $allSuccess = $configStatus.mailbox_found
     
     $result = @{
         mailbox_found = $configStatus.mailbox_found

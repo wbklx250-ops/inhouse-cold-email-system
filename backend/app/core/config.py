@@ -18,6 +18,8 @@ class Settings(BaseSettings):
     azure_client_id: str | None = None
     azure_client_secret: str | None = None
     azure_tenant_id: str | None = None
+    azure_automation_webhook_url: str | None = None
+    railway_public_url: str | None = None
     
     # Microsoft Graph API - Device Code Flow
     MS_CLIENT_ID: str = ""  # From Azure App Registration
