@@ -99,14 +99,14 @@ def _save_totp_immediately_sync(
 ) -> bool:
     """
     Save TOTP (and new password if present) immediately from a sync thread.
-    Uses an async session via asyncio.run to persist before MFA enrollment finishes.
+    Uses a synchronous session to avoid event-loop issues in Selenium threads.
     """
-    async def _save():
-        from app.db.session import async_session_factory
+    try:
+        from app.db.session import SyncSessionLocal
         from app.models.tenant import Tenant
 
-        async with async_session_factory() as session:
-            tenant = await session.get(Tenant, UUID(tenant_id))
+        with SyncSessionLocal() as session:
+            tenant = session.get(Tenant, UUID(tenant_id))
             if not tenant:
                 logger.error(f"[W{worker_id}] ❌ Tenant not found for immediate TOTP save")
                 return False
@@ -116,15 +116,9 @@ def _save_totp_immediately_sync(
                 tenant.admin_password = new_password
                 tenant.password_changed = True
 
-            await session.commit()
-            logger.info(f"[W{worker_id}] ✅ SAVED {tenant.name} to DB")
+            session.commit()
+            logger.info(f"[W{worker_id}] ✅ SAVED {tenant.name} to DB (sync)")
             return True
-
-    try:
-        return asyncio.run(_save())
-    except RuntimeError as e:
-        logger.error(f"[W{worker_id}] ❌ Immediate TOTP save failed (event loop): {e}")
-        return False
     except Exception as e:
         logger.error(f"[W{worker_id}] ❌ Immediate TOTP save failed: {e}")
         return False

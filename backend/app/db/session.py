@@ -16,7 +16,9 @@ from functools import wraps
 from typing import TypeVar, Callable, Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
+from sqlalchemy import create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.exc import DBAPIError, OperationalError
 
 from app.core.config import get_settings
@@ -173,6 +175,25 @@ async def execute_with_retry(
 
 # Alias for clarity - this IS an async engine, use this in background tasks
 async_engine = engine
+
+# Sync engine/session for thread-safe operations (e.g., Selenium workers)
+sync_engine = create_engine(
+    database_url.replace("postgresql+asyncpg", "postgresql+psycopg2"),
+    echo=settings.debug,
+    pool_pre_ping=True,
+    pool_size=3,
+    max_overflow=2,
+    pool_timeout=60,
+    pool_recycle=180,
+    pool_reset_on_return="rollback",
+    connect_args=connect_args,
+)
+
+SyncSessionLocal = sessionmaker(
+    bind=sync_engine,
+    class_=Session,
+    expire_on_commit=False,
+)
 
 SessionLocal = async_sessionmaker(
     bind=engine,
