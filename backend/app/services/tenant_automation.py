@@ -124,34 +124,6 @@ def _save_totp_immediately_sync(
         return False
 
 
-# === CRITICAL: Save password immediately (sync helper for thread workers) ===
-def _save_password_immediately_sync(
-    tenant_id: str,
-    new_password: str,
-    worker_id: int = 0,
-) -> bool:
-    """Save new password immediately after password change."""
-    try:
-        from app.db.session import SyncSessionLocal
-        from app.models.tenant import Tenant
-
-        with SyncSessionLocal() as session:
-            tenant = session.get(Tenant, UUID(tenant_id))
-            if not tenant:
-                logger.error(f"[W{worker_id}] ❌ Tenant not found for password save")
-                return False
-
-            tenant.admin_password = new_password
-            tenant.password_changed = True
-
-            session.commit()
-            logger.info(f"[W{worker_id}] ✅ SAVED password to DB (sync)")
-            return True
-    except Exception as e:
-        logger.error(f"[W{worker_id}] ❌ Password save failed: {e}")
-        return False
-
-
 # === CRITICAL: Save TOTP immediately helper ===
 async def _save_totp_immediately(db, tenant_id: str, totp_secret: str, worker_id: int = 0) -> bool:
     """
@@ -1784,11 +1756,6 @@ class BrowserWorker:
                 else:
                     logger.info(f"[W{self.worker_id}] ✓ [PASSWORD CHANGE] Password change appears successful!")
                     result.new_password = new_pwd
-                    _save_password_immediately_sync(
-                        tenant_id=tenant_id,
-                        new_password=new_pwd,
-                        worker_id=self.worker_id,
-                    )
             else:
                 logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] No password change required (keywords not found)")
                 result.new_password = initial_pwd
