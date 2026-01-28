@@ -420,6 +420,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     result = {"success": False, "verified": False, "dns_configured": False, "error": None}
     
     # ===== SETUP BROWSER =====
+    logger.info(f"[{domain}] Creating browser with headless={headless}")
     worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
     driver = worker._create_driver()
     driver.implicitly_wait(15)  # Increased from 10
