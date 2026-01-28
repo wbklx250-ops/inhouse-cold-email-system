@@ -204,26 +204,6 @@ class BrowserWorker:
             return ""
     
     def _create_driver(self):
-        # === STEP 4/5 ENVIRONMENT DEBUG ===
-        import subprocess
-        logger.info(f"[W{self.worker_id}] ===== CHROME DRIVER CREATION DEBUG =====")
-        logger.info(f"[W{self.worker_id}] CWD: {os.getcwd()}")
-        logger.info(f"[W{self.worker_id}] DISPLAY: {os.environ.get('DISPLAY', 'not set')}")
-        logger.info(f"[W{self.worker_id}] CHROME_BIN: {os.environ.get('CHROME_BIN', 'not set')}")
-        logger.info(f"[W{self.worker_id}] CHROME_PATH: {os.environ.get('CHROME_PATH', 'not set')}")
-        logger.info(f"[W{self.worker_id}] CHROMIUM_PATH: {os.environ.get('CHROMIUM_PATH', 'not set')}")
-        
-        # Check /dev/shm
-        try:
-            result = subprocess.run(['df', '-h', '/dev/shm'], capture_output=True, text=True)
-            logger.info(f"[W{self.worker_id}] /dev/shm:\n{result.stdout}")
-            if result.stderr:
-                logger.info(f"[W{self.worker_id}] /dev/shm stderr: {result.stderr}")
-        except Exception as e:
-            logger.info(f"[W{self.worker_id}] /dev/shm check failed: {e}")
-        
-        logger.info(f"[W{self.worker_id}] =========================================")
-        
         opts = Options()
         if self.headless:
             opts.add_argument("--headless=new")
