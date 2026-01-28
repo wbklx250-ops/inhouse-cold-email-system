@@ -423,8 +423,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     logger.info(f"[{domain}] Creating browser with headless={headless}")
     worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
     driver = worker._create_driver()
-    driver.implicitly_wait(15)  # Increased from 10
-    driver.set_page_load_timeout(60)  # Add page load timeout
+    driver.implicitly_wait(30)  # Increased from 15 for Railway headless
+    driver.set_page_load_timeout(90)  # Increased from 60 for Railway headless
     logger.info(f"[{domain}] Browser initialized successfully")
     
     # ===== STEP 1: LOGIN =====
@@ -446,14 +446,24 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     logger.info(f"[{domain}] Step 2: Navigate to domains page")
     driver.get("https://admin.microsoft.com/#/Domains")
     wait_for_page_load(driver, timeout=30)
-    time.sleep(8)  # Increased from 5 for page to fully render
+    time.sleep(10)  # Increased from 8 for Railway headless - page fully render
     
-    # Verify we're on domains page
+    # Explicit wait for domain page elements before URL check
+    try:
+        WebDriverWait(driver, 15).until(
+            lambda d: "domains" in d.current_url.lower() or 
+                      "domain" in d.find_element(By.TAG_NAME, "body").text.lower()
+        )
+        logger.info(f"[{domain}] Domain page elements detected")
+    except Exception as e:
+        logger.warning(f"[{domain}] Explicit wait for domain page timed out: {e}")
+    
+    # Verify we're on domains page with increased wait between attempts
     for check_attempt in range(10):
         if "domains" in driver.current_url.lower():
             logger.info(f"[{domain}] Successfully reached domains page")
             break
-        time.sleep(1)
+        time.sleep(3)  # Increased from 1s to 3s for Railway headless
     else:
         raise Exception("Could not reach domains page after 10 attempts")
     
