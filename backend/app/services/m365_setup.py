@@ -151,135 +151,152 @@ async def run_step5_for_batch(
     batch_id: UUID, on_progress=None
 ) -> Dict[str, Any]:
     """
-    PARALLEL batch processing with proper async/sync separation.
+    TRUE BATCH PROCESSING - Process domains in chunks of 3.
     
-    Architecture:
-    1. ASYNC: Gather all tenant data from database (main event loop)
-    2. SYNC IN THREADS: Run Selenium automation (thread pool, no async)
-    3. ASYNC: Update database with results (main event loop)
+    Memory-efficient architecture:
+    - Only gather data for the current chunk (3 domains)
+    - Process that chunk completely (Selenium + DB updates)
+    - Then move to next chunk
     
-    This prevents asyncio event loop conflicts between threads.
+    This prevents memory issues when processing 50+ domains by NOT
+    pre-scheduling all domains upfront.
     """
     from app.models.batch import SetupBatch
     
-    # ============ PARALLEL MODE INDICATOR ============
+    # ============ TRUE BATCH MODE INDICATOR ============
     logger.info("=" * 60)
-    logger.info(f"=== PARALLEL MODE ACTIVE (ASYNC-SAFE) ===")
-    logger.info(f"=== Processing up to {MAX_PARALLEL_BROWSERS} domains simultaneously ===")
+    logger.info(f"=== TRUE BATCH MODE (MEMORY EFFICIENT) ===")
+    logger.info(f"=== Processing in chunks of 3, max {MAX_PARALLEL_BROWSERS} parallel browsers ===")
     logger.info("=" * 60)
     
+    CHUNK_SIZE = 3
+    STAGGER_INTERVAL = 15  # Seconds between browser launches within a chunk
+    
     # ============================================================
-    # PHASE 1: GATHER TENANT DATA (Async, main event loop)
+    # INITIAL: Get list of tenant IDs to process (lightweight query)
     # ============================================================
     
-    logger.info("Phase 1: Gathering tenant data from database...")
+    logger.info("Getting list of tenants to process...")
     
     async with get_fresh_db_session() as db:
         result = await db.execute(
-            select(Tenant).where(
+            select(Tenant.id, Tenant.custom_domain, Tenant.name).where(
                 Tenant.batch_id == batch_id,
                 Tenant.domain_id.isnot(None),
                 Tenant.first_login_completed == True,
                 Tenant.dkim_enabled != True
             )
         )
-        tenants = list(result.scalars().all())
+        tenant_refs = list(result.all())  # List of (id, custom_domain, name) tuples
     
-    summary = {"batch_id": str(batch_id), "total": len(tenants),
+    total_tenants = len(tenant_refs)
+    summary = {"batch_id": str(batch_id), "total": total_tenants,
                "successful": 0, "failed": 0, "results": []}
     
-    if not tenants:
+    if not tenant_refs:
         logger.info("No tenants to process")
         return summary
     
-    # Prepare data for threads (extract all needed info, no SQLAlchemy objects)
-    tenants_data = []
-    tenant_lookup = {}  # Map domain -> tenant for DB updates later
+    logger.info(f"Found {total_tenants} tenants to process in chunks of {CHUNK_SIZE}")
     
-    STAGGER_INTERVAL = 15  # Seconds between browser launches
-    
-    for idx, tenant in enumerate(tenants):
-        domain_name = tenant.custom_domain or tenant.name
-        
-        # Get domain info
-        async with get_fresh_db_session() as db:
-            domain = await db.get(Domain, tenant.domain_id)
-        if not domain:
-            logger.warning(f"[{domain_name}] Domain record not found, skipping")
-            continue
-        
-        # Validate credentials
-        if not tenant.admin_email or not tenant.admin_password or not tenant.totp_secret:
-            logger.warning(f"[{domain_name}] Missing credentials, skipping")
-            summary["results"].append({
-                "tenant_id": str(tenant.id),
-                "domain_name": domain_name,
-                "success": False,
-                "error": "Missing credentials (admin_email, admin_password, or totp_secret)"
-            })
-            summary["failed"] += 1
-            continue
-        
-        # Check if already verified (skip Selenium, just do DKIM)
-        already_verified = tenant.domain_verified_in_m365
-        
-        tenant_data = {
-            "tenant_id": str(tenant.id),
-            "domain_id": str(domain.id),
-            "domain": domain_name,
-            "zone_id": domain.cloudflare_zone_id,
-            "admin_email": tenant.admin_email,
-            "admin_password": tenant.admin_password,
-            "totp_secret": tenant.totp_secret,
-            "delay": idx * STAGGER_INTERVAL,
-            "already_verified": already_verified,
-        }
-        
-        tenants_data.append(tenant_data)
-        tenant_lookup[domain_name] = {
-            "tenant_id": tenant.id,
-            "domain_id": domain.id
-        }
-        
-        logger.info(f"Scheduled domain {idx+1}/{len(tenants)}: {domain_name} (starts in {idx * STAGGER_INTERVAL}s)")
-    
-    if not tenants_data:
-        logger.info("No valid tenants to process after validation")
-        return summary
-    
-    logger.info(f"Phase 1 complete: {len(tenants_data)} tenants ready for processing")
-    
-    # ============================================================
-    # PHASE 2: RUN SELENIUM IN THREADS (Sync, thread pool) - CHUNKED
-    # ============================================================
-
-    logger.info(f"Phase 2: Starting parallel Selenium automation with {MAX_PARALLEL_BROWSERS} workers...")
-
-    # Results from threads (domain -> result dict)
-    thread_results = {}
-
+    total_chunks = (total_tenants + CHUNK_SIZE - 1) // CHUNK_SIZE
     loop = asyncio.get_event_loop()
-    chunk_size = 3
-    total_chunks = (len(tenants_data) + chunk_size - 1) // chunk_size
-
-    for chunk_start in range(0, len(tenants_data), chunk_size):
-        chunk = tenants_data[chunk_start:chunk_start + chunk_size]
-        chunk_num = (chunk_start // chunk_size) + 1
-
-        logger.info(
-            "Processing chunk %s/%s (%s domains)",
-            chunk_num,
-            total_chunks,
-            len(chunk),
-        )
-
+    
+    # ============================================================
+    # PROCESS IN TRUE CHUNKS - Gather, Process, Update per chunk
+    # ============================================================
+    
+    for chunk_start in range(0, total_tenants, CHUNK_SIZE):
+        chunk_refs = tenant_refs[chunk_start:chunk_start + CHUNK_SIZE]
+        chunk_num = (chunk_start // CHUNK_SIZE) + 1
+        
+        logger.info("=" * 40)
+        logger.info(f"CHUNK {chunk_num}/{total_chunks}: Processing {len(chunk_refs)} domains")
+        logger.info("=" * 40)
+        
+        # ========== PHASE 1: Gather data for THIS CHUNK ONLY ==========
+        
+        chunk_data = []
+        chunk_lookup = {}  # Map domain -> tenant for DB updates
+        
+        for idx, (tenant_id, custom_domain, tenant_name) in enumerate(chunk_refs):
+            domain_name = custom_domain or tenant_name
+            
+            # Get full tenant and domain info
+            async with get_fresh_db_session() as db:
+                tenant = await db.get(Tenant, tenant_id)
+                if not tenant:
+                    logger.warning(f"[{domain_name}] Tenant not found, skipping")
+                    summary["failed"] += 1
+                    summary["results"].append({
+                        "tenant_id": str(tenant_id),
+                        "domain_name": domain_name,
+                        "success": False,
+                        "error": "Tenant not found"
+                    })
+                    continue
+                
+                domain = await db.get(Domain, tenant.domain_id)
+                if not domain:
+                    logger.warning(f"[{domain_name}] Domain record not found, skipping")
+                    summary["failed"] += 1
+                    summary["results"].append({
+                        "tenant_id": str(tenant_id),
+                        "domain_name": domain_name,
+                        "success": False,
+                        "error": "Domain record not found"
+                    })
+                    continue
+                
+                # Validate credentials
+                if not tenant.admin_email or not tenant.admin_password or not tenant.totp_secret:
+                    logger.warning(f"[{domain_name}] Missing credentials, skipping")
+                    summary["failed"] += 1
+                    summary["results"].append({
+                        "tenant_id": str(tenant_id),
+                        "domain_name": domain_name,
+                        "success": False,
+                        "error": "Missing credentials (admin_email, admin_password, or totp_secret)"
+                    })
+                    continue
+                
+                # Build tenant data for Selenium (within-chunk delay)
+                tenant_data = {
+                    "tenant_id": str(tenant.id),
+                    "domain_id": str(domain.id),
+                    "domain": domain_name,
+                    "zone_id": domain.cloudflare_zone_id,
+                    "admin_email": tenant.admin_email,
+                    "admin_password": tenant.admin_password,
+                    "totp_secret": tenant.totp_secret,
+                    "delay": idx * STAGGER_INTERVAL,  # Within-chunk delay: 0, 15, 30
+                    "already_verified": tenant.domain_verified_in_m365,
+                }
+                
+                chunk_data.append(tenant_data)
+                chunk_lookup[domain_name] = {
+                    "tenant_id": tenant.id,
+                    "domain_id": domain.id
+                }
+                
+                logger.info(f"  [{chunk_num}.{idx+1}] {domain_name} (delay: {idx * STAGGER_INTERVAL}s)")
+        
+        if not chunk_data:
+            logger.info(f"Chunk {chunk_num}: No valid tenants after validation, moving to next chunk")
+            continue
+        
+        # ========== PHASE 2: Run Selenium for THIS CHUNK ==========
+        
+        logger.info(f"Chunk {chunk_num}: Starting Selenium for {len(chunk_data)} domains...")
+        
+        chunk_results = {}  # domain -> result dict
+        
         with ThreadPoolExecutor(max_workers=MAX_PARALLEL_BROWSERS) as executor:
             future_to_domain = {}
-
-            for tenant_data in chunk:
+            
+            for tenant_data in chunk_data:
                 domain_name = tenant_data["domain"]
-
-                # Use run_in_executor for proper asyncio integration
+                
                 future = loop.run_in_executor(
                     executor,
                     _sync_setup_domain,
@@ -289,170 +306,150 @@ async def run_step5_for_batch(
                     "domain": domain_name,
                     "tenant_data": tenant_data
                 }
-
-            # Wait for this chunk to complete before continuing
-            logger.info(
-                "Waiting for %s Selenium tasks to complete in chunk %s/%s...",
-                len(future_to_domain),
-                chunk_num,
-                total_chunks,
-            )
-
+            
+            # Wait for all tasks in this chunk to complete
             for future in asyncio.as_completed(list(future_to_domain.keys())):
                 task_info = future_to_domain[future]
                 domain_name = task_info["domain"]
-
+                
                 try:
                     result = await future
-                    thread_results[domain_name] = result
-
+                    chunk_results[domain_name] = result
+                    
                     if result.get("success"):
-                        logger.info(f"[{domain_name}] Selenium automation SUCCESS")
+                        logger.info(f"[{domain_name}] SUCCESS")
                     else:
-                        logger.warning(
-                            f"[{domain_name}] Selenium automation FAILED: {result.get('error')}"
-                        )
-
+                        logger.warning(f"[{domain_name}] FAILED: {result.get('error')}")
+                
                 except Exception as e:
-                    logger.exception(f"[{domain_name}] Thread execution error: {e}")
-                    thread_results[domain_name] = {
+                    logger.exception(f"[{domain_name}] Thread error: {e}")
+                    chunk_results[domain_name] = {
                         "success": False,
                         "verified": False,
                         "dns_configured": False,
                         "error": str(e)
                     }
-
-        logger.info("Chunk %s/%s complete", chunk_num, total_chunks)
-
-        if chunk_start + chunk_size < len(tenants_data):
-            await asyncio.sleep(2)
-
-    logger.info("Phase 2 complete: All Selenium tasks finished")
-    
-    # ============================================================
-    # PHASE 3: UPDATE DATABASE (Async, main event loop)
-    # ============================================================
-    
-    logger.info("Phase 3: Updating database with results...")
-    
-    for domain_name, selenium_result in thread_results.items():
-        lookup = tenant_lookup.get(domain_name)
-        if not lookup:
-            continue
         
-        tenant_id = lookup["tenant_id"]
-        domain_id = lookup["domain_id"]
+        # ========== PHASE 3: Update database for THIS CHUNK ==========
         
-        # Create Step5Result for summary
-        step_result = Step5Result(
-            tenant_id=str(tenant_id),
-            domain_name=domain_name
-        )
+        logger.info(f"Chunk {chunk_num}: Updating database...")
         
-        try:
-            async with get_fresh_db_session() as db:
-                # Re-fetch tenant and domain for updates (fresh from DB)
-                tenant = await db.get(Tenant, tenant_id)
-                domain = await db.get(Domain, domain_id)
-
-                if not tenant or not domain:
-                    step_result.error = "Tenant or domain not found in database"
-                    step_result.error_step = "db_update"
+        for domain_name, selenium_result in chunk_results.items():
+            lookup = chunk_lookup.get(domain_name)
+            if not lookup:
+                continue
+            
+            tenant_id = lookup["tenant_id"]
+            domain_id = lookup["domain_id"]
+            
+            step_result = Step5Result(
+                tenant_id=str(tenant_id),
+                domain_name=domain_name
+            )
+            
+            try:
+                async with get_fresh_db_session() as db:
+                    tenant = await db.get(Tenant, tenant_id)
+                    domain = await db.get(Domain, domain_id)
+                    
+                    if not tenant or not domain:
+                        step_result.error = "Tenant or domain not found"
+                        step_result.error_step = "db_update"
+                        summary["results"].append(step_result.to_dict())
+                        summary["failed"] += 1
+                        continue
+                    
+                    if selenium_result.get("success") and selenium_result.get("dns_configured"):
+                        # Full success
+                        step_result.success = True
+                        step_result.domain_added = True
+                        step_result.domain_verified = True
+                        step_result.txt_added_to_cloudflare = True
+                        step_result.mail_dns_added = True
+                        step_result.dkim_cnames_added = True
+                        step_result.dkim_enabled = True
+                        
+                        tenant.domain_added_to_m365 = True
+                        tenant.domain_verified_in_m365 = True
+                        tenant.domain_verified_at = datetime.utcnow()
+                        tenant.mx_record_added = True
+                        tenant.spf_record_added = True
+                        tenant.autodiscover_added = True
+                        tenant.dkim_cnames_added = True
+                        tenant.dkim_enabled = True
+                        tenant.dkim_enabled_at = datetime.utcnow()
+                        tenant.status = TenantStatus.DKIM_ENABLED
+                        tenant.setup_error = None
+                        tenant.setup_step = 6
+                        
+                        domain.status = DomainStatus.ACTIVE
+                        domain.m365_verified_at = datetime.utcnow()
+                        domain.mx_configured = True
+                        domain.spf_configured = True
+                        domain.dns_records_created = True
+                        domain.dkim_cnames_added = True
+                        domain.dkim_enabled = True
+                        
+                        await db.commit()
+                        summary["successful"] += 1
+                        logger.info(f"[{domain_name}] DB: FULL SUCCESS")
+                        
+                    elif selenium_result.get("verified"):
+                        # Partial success
+                        step_result.domain_added = True
+                        step_result.domain_verified = True
+                        step_result.error = "Domain verified but DNS setup incomplete"
+                        step_result.error_step = "dns_setup"
+                        
+                        tenant.domain_added_to_m365 = True
+                        tenant.domain_verified_in_m365 = True
+                        tenant.domain_verified_at = datetime.utcnow()
+                        tenant.status = TenantStatus.DOMAIN_VERIFIED
+                        tenant.setup_error = "DNS setup incomplete"
+                        
+                        domain.status = DomainStatus.M365_VERIFIED
+                        domain.m365_verified_at = datetime.utcnow()
+                        
+                        await db.commit()
+                        summary["failed"] += 1
+                        logger.warning(f"[{domain_name}] DB: PARTIAL")
+                        
+                    else:
+                        # Complete failure
+                        error_msg = selenium_result.get("error", "Unknown error")
+                        step_result.error = error_msg
+                        step_result.error_step = "selenium_automation"
+                        
+                        tenant.setup_error = error_msg
+                        await db.commit()
+                        
+                        summary["failed"] += 1
+                        logger.error(f"[{domain_name}] DB: FAILED - {error_msg}")
+                    
                     summary["results"].append(step_result.to_dict())
-                    summary["failed"] += 1
-                    continue
-
-                # Process Selenium result
-                if selenium_result.get("success") and selenium_result.get("dns_configured"):
-                    # Full success - domain verified AND DNS configured
-                    step_result.success = True
-                    step_result.domain_added = True
-                    step_result.domain_verified = True
-                    step_result.txt_added_to_cloudflare = True
-                    step_result.mail_dns_added = True
-                    step_result.dkim_cnames_added = True
-                    step_result.dkim_enabled = True
-
-                    # Update tenant
-                    tenant.domain_added_to_m365 = True
-                    tenant.domain_verified_in_m365 = True
-                    tenant.domain_verified_at = datetime.utcnow()
-                    tenant.mx_record_added = True
-                    tenant.spf_record_added = True
-                    tenant.autodiscover_added = True
-                    tenant.dkim_cnames_added = True
-                    tenant.dkim_enabled = True
-                    tenant.dkim_enabled_at = datetime.utcnow()
-                    tenant.status = TenantStatus.DKIM_ENABLED
-                    tenant.setup_error = None
-                    tenant.setup_step = 6  # Mark step 5 as complete
-
-                    # Update domain
-                    domain.status = DomainStatus.ACTIVE
-                    domain.m365_verified_at = datetime.utcnow()
-                    domain.mx_configured = True
-                    domain.spf_configured = True
-                    domain.dns_records_created = True
-                    domain.dkim_cnames_added = True
-                    domain.dkim_enabled = True
-
-                    await db.commit()
-
-                    summary["successful"] += 1
-                    logger.info(f"[{domain_name}] Database updated: FULL SUCCESS")
-
-                elif selenium_result.get("verified"):
-                    # Partial success - domain verified but DNS may not be complete
-                    step_result.domain_added = True
-                    step_result.domain_verified = True
-
-                    tenant.domain_added_to_m365 = True
-                    tenant.domain_verified_in_m365 = True
-                    tenant.domain_verified_at = datetime.utcnow()
-                    tenant.status = TenantStatus.DOMAIN_VERIFIED
-                    tenant.setup_error = "Domain verified but DNS setup incomplete"
-
-                    domain.status = DomainStatus.M365_VERIFIED
-                    domain.m365_verified_at = datetime.utcnow()
-
-                    await db.commit()
-
-                    # Mark as failed since not fully complete
-                    step_result.error = "Domain verified but DNS setup incomplete"
-                    step_result.error_step = "dns_setup"
-                    summary["failed"] += 1
-                    logger.warning(f"[{domain_name}] Database updated: PARTIAL (verified only)")
-
-                else:
-                    # Complete failure
-                    error_msg = selenium_result.get("error", "Unknown error")
-                    step_result.error = error_msg
-                    step_result.error_step = "selenium_automation"
-
-                    tenant.setup_error = error_msg
-                    await db.commit()
-
-                    summary["failed"] += 1
-                    logger.error(f"[{domain_name}] Database updated: FAILED - {error_msg}")
-
+                    
+                    if on_progress:
+                        on_progress(str(tenant_id), "complete", "success" if step_result.success else "failed")
+                        
+            except Exception as e:
+                logger.exception(f"[{domain_name}] DB update error: {e}")
+                step_result.error = f"Database error: {str(e)}"
+                step_result.error_step = "db_update"
                 summary["results"].append(step_result.to_dict())
-
-                # Progress callback
-                if on_progress:
-                    on_progress(str(tenant_id), "complete", "success" if step_result.success else "failed")
-
-        except Exception as e:
-            logger.exception(f"[{domain_name}] Database update error: {e}")
-            step_result.error = f"Database update error: {str(e)}"
-            step_result.error_step = "db_update"
-            summary["results"].append(step_result.to_dict())
-            summary["failed"] += 1
+                summary["failed"] += 1
+        
+        logger.info(f"Chunk {chunk_num}/{total_chunks} complete")
+        
+        # Brief pause between chunks
+        if chunk_start + CHUNK_SIZE < total_tenants:
+            logger.info("Pausing 2s before next chunk...")
+            await asyncio.sleep(2)
     
     # ============================================================
-    # PHASE 4: UPDATE BATCH STATUS
+    # FINAL: Update batch status
     # ============================================================
     
-    logger.info("Phase 4: Updating batch status...")
+    logger.info("Updating batch status...")
     
     async with get_fresh_db_session() as db:
         batch = await db.get(SetupBatch, batch_id)
