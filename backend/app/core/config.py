@@ -37,7 +37,7 @@ class Settings(BaseSettings):
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)
     # True = headless mode (faster, no GUI, for production)
-    step5_headless: bool = True
+    step5_headless: bool = False
 
     allowed_origins: str = ""
     

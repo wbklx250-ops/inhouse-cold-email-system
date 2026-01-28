@@ -238,7 +238,8 @@ def setup_domain_with_retry(
     admin_email: str,
     admin_password: str,
     totp_secret: str,
-    max_retries: int = 2
+    max_retries: int = 2,
+    headless: bool = True,
 ) -> dict:
     """
     Setup domain with automatic retry on failure.
@@ -273,7 +274,8 @@ def setup_domain_with_retry(
                 zone_id=zone_id,
                 admin_email=admin_email,
                 admin_password=admin_password,
-                totp_secret=totp_secret
+                totp_secret=totp_secret,
+                headless=headless,
             )
             
             if result.get("success"):
@@ -298,6 +300,85 @@ def setup_domain_with_retry(
     }
 
 
+def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: str, domain: str) -> None:
+    """Log into M365 admin portal with robust MFA handling.
+
+    Raises:
+        Exception: if required login steps are not reachable.
+    """
+    logger.info(f"[{domain}] Logging into M365 Admin Portal")
+    driver.get("https://admin.microsoft.com")
+    wait_for_page_load(driver, timeout=30)
+    time.sleep(3)
+
+    # Email
+    email_field = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.NAME, "loginfmt"))
+    )
+    email_field.clear()
+    email_field.send_keys(admin_email + Keys.RETURN)
+    time.sleep(3)
+
+    # Password
+    password_field = WebDriverWait(driver, 20).until(
+        EC.presence_of_element_located((By.NAME, "passwd"))
+    )
+    password_field.clear()
+    password_field.send_keys(admin_password + Keys.RETURN)
+    time.sleep(3)
+
+    # Detect MFA prompt by page text OR input field
+    page_text = driver.page_source.lower()
+    mfa_indicators = [
+        "verify your identity",
+        "verification code",
+        "use the authenticator",
+        "enter code",
+        "sign in with a code",
+    ]
+    mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
+
+    code_input = None
+    if mfa_detected:
+        logger.info(f"[{domain}] MFA detected, waiting for TOTP input...")
+        code_input = WebDriverWait(driver, 20).until(
+            EC.presence_of_element_located((By.NAME, "otc"))
+        )
+    else:
+        # Still check if the code input shows up even without text indicators
+        try:
+            code_input = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.NAME, "otc"))
+            )
+            logger.info(f"[{domain}] MFA input found without explicit indicators")
+        except Exception:
+            code_input = None
+
+    if code_input:
+        code = pyotp.TOTP(totp_secret).now()
+        code_input.clear()
+        code_input.send_keys(code)
+        # Click verify/continue
+        try:
+            verify_btn = driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
+            safe_click(driver, verify_btn, "MFA Verify")
+        except Exception:
+            code_input.send_keys(Keys.RETURN)
+        time.sleep(3)
+    else:
+        logger.info(f"[{domain}] No MFA code input detected")
+
+    # Stay signed in prompt
+    try:
+        stay_signed_in = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable((By.ID, "idBtn_Back"))
+        )
+        stay_signed_in.click()
+        time.sleep(2)
+    except Exception:
+        logger.debug(f"[{domain}] No stay signed in prompt")
+
+
 def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_password, totp_secret, cloudflare_service=None, headless=False):
     """Complete M365 domain setup following EXACT wizard flow.
     
@@ -315,7 +396,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1920,1080")
-    opts.add_argument("--headless=new")
+    if headless:
+        opts.add_argument("--headless=new")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-extensions")
     opts.add_argument("--disable-infobars")
@@ -331,43 +413,13 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     # ===== STEP 1: LOGIN =====
     logger.info(f"[{domain}] Step 1: Login")
     update_status_file(domain, "login", "in_progress", "Logging into M365 Admin Portal")
-    driver.get("https://admin.microsoft.com")
-    wait_for_page_load(driver, timeout=30)
-    time.sleep(5)  # Extra wait after page load
-    
-    # Enter email
-    email_field = WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.NAME, "loginfmt"))
+    _login_with_mfa(
+        driver=driver,
+        admin_email=admin_email,
+        admin_password=admin_password,
+        totp_secret=totp_secret,
+        domain=domain,
     )
-    email_field.send_keys(admin_email + Keys.RETURN)
-    time.sleep(5)  # Increased from 3
-    
-    # Enter password
-    password_field = WebDriverWait(driver, 15).until(
-        EC.presence_of_element_located((By.NAME, "passwd"))
-    )
-    password_field.send_keys(admin_password + Keys.RETURN)
-    time.sleep(5)  # Increased from 3
-    
-    # Handle TOTP if required
-    try:
-        totp_field = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.NAME, "otc"))
-        )
-        totp_field.send_keys(pyotp.TOTP(totp_secret).now() + Keys.RETURN)
-        time.sleep(5)  # Increased from 3
-    except:
-        logger.debug(f"[{domain}] No TOTP field found (may not be required)")
-    
-    # Handle "Stay signed in?" prompt
-    try:
-        stay_signed_in = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.ID, "idBtn_Back"))
-        )
-        stay_signed_in.click()
-        time.sleep(3)
-    except:
-        logger.debug(f"[{domain}] No 'Stay signed in' prompt found")
     
     screenshot(driver, "01_login", domain)
     update_status_file(domain, "login", "complete", "Successfully logged in")

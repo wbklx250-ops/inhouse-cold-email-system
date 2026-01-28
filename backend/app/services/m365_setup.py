@@ -126,7 +126,8 @@ def _sync_setup_domain(tenant_data: dict) -> dict:
             zone_id=tenant_data["zone_id"],
             admin_email=tenant_data["admin_email"],
             admin_password=tenant_data["admin_password"],
-            totp_secret=tenant_data["totp_secret"]
+            totp_secret=tenant_data["totp_secret"],
+            headless=STEP5_HEADLESS,
         )
         
         logger.info(f"[{domain}] Selenium automation completed: success={result.get('success')}")
