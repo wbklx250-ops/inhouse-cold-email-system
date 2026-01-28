@@ -113,10 +113,29 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             logger.error("Tenant %s not found", tenant_id)
             return {"success": False, "error": "Tenant not found"}
 
+        logger.info("[%s] Checking current state...", tenant.custom_domain)
+        logger.info("  - mailboxes_created: %s", tenant.step6_mailboxes_created)
+        logger.info("  - delegations_done: %s", tenant.step6_delegations_done)
+        logger.info("  - passwords_set: %s", tenant.step6_passwords_set)
+        logger.info("  - complete: %s", tenant.step6_complete)
+
         if tenant.step6_complete:
-            logger.info("[%s] Already complete, skipping", tenant.custom_domain)
+            logger.info("[%s] SKIPPING - already complete", tenant.custom_domain)
             update_progress(str(tenant.id), "complete", "complete", "Step 6 already complete")
             return {"success": True, "skipped": True}
+
+        needs_powershell = not (tenant.step6_mailboxes_created and tenant.step6_delegations_done)
+        needs_graph_api = not tenant.step6_passwords_set
+
+        if needs_powershell:
+            logger.info("[%s] RUNNING PowerShell...", tenant.custom_domain)
+        else:
+            logger.info("[%s] SKIPPING PowerShell - already done", tenant.custom_domain)
+
+        if needs_graph_api:
+            logger.info("[%s] RUNNING Graph API...", tenant.custom_domain)
+        else:
+            logger.info("[%s] SKIPPING Graph API - already done", tenant.custom_domain)
 
         update_progress(str(tenant.id), "starting", "in_progress", "Initializing...")
 
@@ -266,7 +285,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             # ========================================
             # PHASE 1: PowerShell - Create, fix names, delegate
             # ========================================
-            if tenant.step6_mailboxes_created and tenant.step6_delegations_done and all_created and all_delegated:
+            if not needs_powershell and all_created and all_delegated:
                 logger.info(
                     "[%s] Mailboxes already created & delegated, skipping PowerShell",
                     tenant.custom_domain,
@@ -353,7 +372,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             # ========================================
             # PHASE 2: Graph API - Set passwords, enable accounts
             # ========================================
-            if tenant.step6_passwords_set and all_passwords_set:
+            if not needs_graph_api and all_passwords_set:
                 logger.info("[%s] Passwords already set, skipping Graph API", tenant.custom_domain)
                 update_progress(
                     str(tenant.id),

@@ -2249,11 +2249,17 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
   const [isStarting, setIsStarting] = useState(false);
   const [isAutomationRunning, setIsAutomationRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const summary = step6Status?.summary || {};
-  const totalTenants = summary?.total_tenants ?? 0;
-  const completedTenants = summary?.step6_complete ?? 0;
-  const readyForStep6 = summary?.ready_for_step6 ?? 0;
-  const step6Errors = summary?.step6_errors ?? 0;
+  const summary = step6Status?.summary ?? {
+    total_tenants: 0,
+    step5_complete: 0,
+    step6_complete: 0,
+    step6_errors: 0,
+    ready_for_step6: 0,
+  };
+  const totalTenants = summary.total_tenants;
+  const completedTenants = summary.step6_complete;
+  const readyForStep6 = summary.ready_for_step6;
+  const step6Errors = summary.step6_errors;
 
   // Fetch step6 status
   const fetchStep6Status = useCallback(async () => {
@@ -2269,7 +2275,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
       }
       
       // Check if automation is running
-      const hasActiveProgress = data.tenants.some((t: TenantStep6Status) => t.live_progress.active);
+      const hasActiveProgress = data.tenants?.some((t: TenantStep6Status) => t.live_progress.active) ?? false;
       setIsAutomationRunning(hasActiveProgress);
       
       setError(null);
@@ -2403,7 +2409,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
             <div className="text-sm text-gray-500">Total Tenants</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
-            <div className="text-3xl font-bold text-blue-600">{summary?.step5_complete ?? 0}</div>
+            <div className="text-3xl font-bold text-blue-600">{summary.step5_complete}</div>
             <div className="text-sm text-gray-500">Step 5 Complete</div>
           </div>
           <div className="bg-white rounded-lg shadow p-4 text-center">
@@ -2509,7 +2515,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
-              {step6Status?.tenants.map((tenant) => (
+              {step6Status?.tenants?.map((tenant) => (
                 <tr
                   key={tenant.tenant_id}
                   className={`${
