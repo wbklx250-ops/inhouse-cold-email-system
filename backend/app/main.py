@@ -1,6 +1,24 @@
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any
+
+# Create logs directory
+os.makedirs("logs", exist_ok=True)
+
+# Setup file logging
+log_filename = f"logs/step6_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    handlers=[
+        logging.FileHandler(log_filename),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -23,6 +41,7 @@ from app.services.powershell.setup import ensure_powershell_modules, check_power
 from app.services.background_jobs import start_background_scheduler, stop_background_scheduler
 
 logger = logging.getLogger(__name__)
+logger.info("Logging to %s", log_filename)
 settings = get_settings()
 
 

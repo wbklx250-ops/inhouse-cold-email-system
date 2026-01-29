@@ -46,6 +46,9 @@ RUN wget -q https://packages.microsoft.com/config/debian/11/packages-microsoft-p
 RUN pwsh -Command "Set-PSRepository PSGallery -InstallationPolicy Trusted" \
     && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -Scope AllUsers -Force"
 
+# Install Microsoft Graph Users module for PowerShell
+RUN pwsh -Command "Install-Module -Name Microsoft.Graph.Users -Scope AllUsers -Force"
+
 # Copy requirements and install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

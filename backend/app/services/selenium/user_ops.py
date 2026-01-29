@@ -5,6 +5,7 @@ No Graph API needed - uses M365 Admin Portal directly.
 
 import time
 import logging
+import re
 from typing import Optional, List, Dict
 from selenium import webdriver
 from selenium.webdriver.common.by import By
@@ -448,3 +449,445 @@ class UserOpsSelenium:
                 failed.append(user['current_upn'])
         
         return {"updated": updated, "failed": failed}
+
+    def set_passwords_and_enable_via_admin_ui(
+        self,
+        password: str = "#Sendemails1",
+        exclude_users: Optional[List[str]] = None,
+        expected_count: int = 50,
+    ) -> Dict:
+        """Set passwords and enable accounts using M365 Admin Center UI.
+
+        Uses bulk actions in the users list to reset passwords and unblock sign-in.
+        """
+        exclude_users = exclude_users or []
+        results = {"passwords_set": 0, "accounts_enabled": 0, "errors": []}
+        admin_url = "https://admin.microsoft.com/Adminportal/Home#/users"
+        batch_size = 40
+        email_regex = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+        def extract_email(text: str) -> Optional[str]:
+            match = email_regex.search(text or "")
+            return match.group(0).lower() if match else None
+
+        def load_users_list() -> bool:
+            logger.info(f"[{self.domain}] Opening M365 Admin Center Users page...")
+            self.driver.get(admin_url)
+            time.sleep(5)
+            try:
+                WebDriverWait(self.driver, 30).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "[data-automationid='DetailsList']"))
+                )
+            except Exception as exc:
+                results["errors"].append(f"Users list not loaded: {exc}")
+                return False
+            time.sleep(2)
+            return True
+
+        def collect_target_emails() -> List[str]:
+            rows = self.driver.find_elements(By.CSS_SELECTOR, "[data-automationid='DetailsRow']")
+            emails: List[str] = []
+            for row in rows:
+                row_text = row.text or ""
+                row_text_lower = row_text.lower()
+                email = extract_email(row_text)
+                if not email:
+                    continue
+                if ".onmicrosoft.com" in row_text_lower:
+                    continue
+                if any(excl.lower() in row_text_lower for excl in exclude_users):
+                    continue
+                emails.append(email)
+            return emails
+
+        def select_emails(emails_to_select: List[str]) -> int:
+            emails_set = {email.lower() for email in emails_to_select}
+            checkboxes = self.driver.find_elements(By.CSS_SELECTOR, "[data-automationid='DetailsRowCheck']")
+            selected = 0
+            for cb in checkboxes:
+                try:
+                    row = cb.find_element(By.XPATH, "./ancestor::div[@data-automationid='DetailsRow']")
+                    row_text = row.text or ""
+                    email = extract_email(row_text)
+                    if not email or email.lower() not in emails_set:
+                        continue
+                    cb.click()
+                    selected += 1
+                    time.sleep(0.2)
+                except Exception:
+                    continue
+            time.sleep(2)
+            return selected
+
+        def reset_password_for_selected() -> bool:
+            logger.info(f"[{self.domain}] Resetting passwords to {password}...")
+            try:
+                try:
+                    reset_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Reset password')]")
+                    reset_btn.click()
+                except Exception:
+                    more_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-automationid='splitbuttonprimary']")
+                    more_btn.click()
+                    time.sleep(1)
+                    reset_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Reset password')]")
+                    reset_btn.click()
+
+                time.sleep(3)
+
+                try:
+                    WebDriverWait(self.driver, 10).until(
+                        EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
+                    )
+                except Exception:
+                    pass
+
+                self._screenshot("reset_password_dialog")
+
+                try:
+                    manual_toggle = self.driver.find_element(
+                        By.XPATH,
+                        "//*[contains(., 'Let me create') or contains(., 'Manually') or contains(., 'manual')]",
+                    )
+                    manual_toggle.click()
+                    time.sleep(1)
+                except Exception:
+                    pass
+
+                try:
+                    auto_gen = self.driver.find_element(
+                        By.XPATH,
+                        "//input[@type='checkbox' and contains(@aria-label, 'Auto')]",
+                    )
+                    if auto_gen.is_selected():
+                        auto_gen.click()
+                        time.sleep(1)
+                except Exception:
+                    pass
+
+                try:
+                    change_pwd = self.driver.find_element(
+                        By.XPATH,
+                        "//input[@type='checkbox' and contains(@aria-label, 'change')]",
+                    )
+                    if change_pwd.is_selected():
+                        change_pwd.click()
+                        time.sleep(1)
+                except Exception:
+                    pass
+
+                try:
+                    self.driver.execute_script(
+                        """
+                        const dialog = document.querySelector('[role="dialog"]') || document.body;
+                        dialog.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                            if (cb.checked) cb.click();
+                        });
+                        dialog.querySelectorAll('[role="checkbox"]').forEach(cb => {
+                            const checked = (cb.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                            if (checked) cb.click();
+                        });
+                        """
+                    )
+                except Exception:
+                    pass
+
+                pwd_input = None
+                pwd_selectors = [
+                    "input[type='password']",
+                    "input[aria-label*='Password']",
+                    "input[aria-label*='password']",
+                    "input[placeholder*='Password']",
+                    "input[placeholder*='password']",
+                ]
+                for selector in pwd_selectors:
+                    try:
+                        pwd_input = WebDriverWait(self.driver, 5).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                        )
+                        if pwd_input:
+                            break
+                    except Exception:
+                        continue
+
+                if not pwd_input:
+                    try:
+                        self.driver.execute_script(
+                            """
+                            const dialog = document.querySelector('[role="dialog"]') || document.body;
+                            dialog.querySelectorAll('[role="checkbox"]').forEach(cb => {
+                                const checked = (cb.getAttribute('aria-checked') || '').toLowerCase() === 'true';
+                                if (checked) cb.click();
+                            });
+                            """
+                        )
+                        time.sleep(1)
+                    except Exception:
+                        pass
+                    for selector in pwd_selectors:
+                        try:
+                            pwd_input = WebDriverWait(self.driver, 3).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                            )
+                            if pwd_input:
+                                break
+                        except Exception:
+                            continue
+
+                if not pwd_input:
+                    self._screenshot("reset_password_no_input")
+                    raise Exception("Password input not found in reset dialog")
+                pwd_input.clear()
+                pwd_input.send_keys(password)
+                time.sleep(1)
+
+                try:
+                    change_pwd = self.driver.find_element(
+                        By.XPATH,
+                        "//input[@type='checkbox' and contains(@aria-label, 'change')]",
+                    )
+                    if change_pwd.is_selected():
+                        change_pwd.click()
+                        time.sleep(1)
+                except Exception:
+                    pass
+
+                confirm_clicked = False
+                confirm_selectors = [
+                    "//button[contains(., 'Reset password')]",
+                    "//button[contains(., 'Reset') and not(contains(., 'password'))]",
+                    "//button[contains(., 'Confirm')]",
+                    "//button[contains(@class, 'ms-Button') and contains(., 'Reset')]",
+                    "button.ms-Button--primary",
+                    "button.ms-Button--primary[title*='Reset']",
+                ]
+                for selector in confirm_selectors:
+                    try:
+                        if selector.startswith("//"):
+                            confirm_btn = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.XPATH, selector))
+                            )
+                        else:
+                            confirm_btn = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                            )
+                        confirm_btn.click()
+                        confirm_clicked = True
+                        break
+                    except Exception:
+                        continue
+
+                if not confirm_clicked:
+                    try:
+                        self.driver.execute_script(
+                            """
+                            const dialog = document.querySelector('[role="dialog"], .ms-Dialog, .ms-Panel');
+                            if (!dialog) return;
+                            const btn = [...dialog.querySelectorAll('button')]
+                                .find(b => (b.textContent || '').toLowerCase().includes('reset'));
+                            if (btn) btn.click();
+                            """
+                        )
+                        confirm_clicked = True
+                    except Exception:
+                        confirm_clicked = False
+
+                if not confirm_clicked:
+                    raise Exception("Could not click Reset/Confirm button in password dialog")
+                time.sleep(5)
+
+                try:
+                    close_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Close')]")
+                    close_btn.click()
+                except Exception:
+                    pass
+
+                logger.info(f"[{self.domain}] Passwords reset for selected batch.")
+                return True
+            except Exception as exc:
+                results["errors"].append(f"Reset password failed: {exc}")
+                return False
+
+        def enable_signin_for_selected() -> bool:
+            logger.info(f"[{self.domain}] Enabling sign-in for selected accounts...")
+            try:
+                more_action_selectors = [
+                    "button[aria-label*='View more actions on selected']",
+                    "button.ms-CommandBar-overflowButton",
+                    "button[aria-label*='More actions']",
+                    "button[aria-label*='More']",
+                    "button[data-automationid='MoreActionsButton']",
+                    "button[data-automationid='OverflowButton']",
+                    "button[title*='More actions']",
+                    "button[title*='More']",
+                    "[data-automationid='splitbuttonprimary']",
+                ]
+
+                more_clicked = False
+                for selector in more_action_selectors:
+                    try:
+                        more_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                        )
+                        more_btn.click()
+                        more_clicked = True
+                        break
+                    except Exception:
+                        continue
+
+                if not more_clicked:
+                    raise Exception("Could not find More actions (3 dots) button")
+
+                time.sleep(2)
+                self._screenshot("enable_signin_more_actions")
+
+                edit_clicked = False
+                edit_selectors = [
+                    "//button[contains(., 'Edit sign-in status')]",
+                    "//button[contains(., 'Edit sign in status')]",
+                    "//span[contains(., 'Edit sign-in status')]",
+                    "//span[contains(., 'Edit sign in status')]",
+                ]
+                for selector in edit_selectors:
+                    try:
+                        edit_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
+                        edit_btn.click()
+                        edit_clicked = True
+                        break
+                    except Exception:
+                        continue
+
+                if not edit_clicked:
+                    raise Exception("Could not find 'Edit sign-in status' option")
+
+                time.sleep(3)
+                self._screenshot("enable_signin_panel")
+
+                allow_clicked = False
+                allow_selectors = [
+                    "input.ms-ChoiceField-input[id$='-true']",
+                    "label.ms-ChoiceField-field[for$='-true']",
+                    "//span[contains(@class, 'ms-ChoiceFieldLabel') and contains(., 'Allow users to sign in')]",
+                    "//label[contains(@class, 'ms-ChoiceField-field') and contains(., 'Allow users to sign in')]",
+                ]
+                for selector in allow_selectors:
+                    try:
+                        if selector.startswith("//"):
+                            allow_radio = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.XPATH, selector))
+                            )
+                        else:
+                            allow_radio = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                            )
+                        allow_radio.click()
+                        allow_clicked = True
+                        break
+                    except Exception:
+                        continue
+
+                if not allow_clicked:
+                    try:
+                        self.driver.execute_script(
+                            """
+                            const panel = document.querySelector('[role="dialog"], [role="region"], body');
+                            const allow = [...panel.querySelectorAll('[role="radio"]')]
+                                .find(r => (r.textContent || '').toLowerCase().includes('allow'));
+                            if (allow) allow.click();
+                            """
+                        )
+                        allow_clicked = True
+                    except Exception:
+                        allow_clicked = False
+
+                if not allow_clicked:
+                    raise Exception("Could not select 'Allow users to sign in' option")
+
+                save_clicked = False
+                save_selectors = [
+                    "button.ms-Button--primary",
+                    "button.ms-Button--primary[title*='Save']",
+                    "//button[contains(@class, 'ms-Button') and contains(., 'Save')]",
+                    "//button[contains(., 'Confirm')]",
+                ]
+                for selector in save_selectors:
+                    try:
+                        if selector.startswith("//"):
+                            save_btn = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.XPATH, selector))
+                            )
+                        else:
+                            save_btn = WebDriverWait(self.driver, 10).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                            )
+                        save_btn.click()
+                        save_clicked = True
+                        break
+                    except Exception:
+                        continue
+
+                if not save_clicked:
+                    raise Exception("Could not click Save on sign-in status panel")
+
+                try:
+                    WebDriverWait(self.driver, 40).until(
+                        EC.invisibility_of_element_located((By.XPATH, "//button[contains(., 'Save')]"))
+                    )
+                except Exception:
+                    time.sleep(10)
+
+                logger.info(f"[{self.domain}] Accounts enabled for selected batch.")
+                return True
+            except Exception as exc:
+                results["errors"].append(f"Enable sign-in failed: {exc}")
+                return False
+
+        if not load_users_list():
+            return results
+
+        target_emails = collect_target_emails()
+        if not target_emails:
+            results["errors"].append("No eligible users found to update")
+            return results
+
+        total_passwords_set = 0
+        failed_password_batches = 0
+        for i in range(0, len(target_emails), batch_size):
+            batch = target_emails[i : i + batch_size]
+            if not load_users_list():
+                results["errors"].append("Failed to reload users list for password batch")
+                failed_password_batches += 1
+                continue
+            selected = select_emails(batch)
+            if selected == 0:
+                continue
+            if not reset_password_for_selected():
+                failed_password_batches += 1
+                continue
+            total_passwords_set += selected
+
+        results["passwords_set"] = min(total_passwords_set, expected_count)
+        if failed_password_batches:
+            results["errors"].append(f"Password reset failed for {failed_password_batches} batch(es)")
+
+        total_accounts_enabled = 0
+        failed_enable_batches = 0
+        for i in range(0, len(target_emails), batch_size):
+            batch = target_emails[i : i + batch_size]
+            if not load_users_list():
+                results["errors"].append("Failed to reload users list for enable batch")
+                failed_enable_batches += 1
+                continue
+            selected = select_emails(batch)
+            if selected == 0:
+                continue
+            if not enable_signin_for_selected():
+                failed_enable_batches += 1
+                continue
+            total_accounts_enabled += selected
+
+        results["accounts_enabled"] = min(total_accounts_enabled, expected_count)
+        if failed_enable_batches:
+            results["errors"].append(f"Enable sign-in failed for {failed_enable_batches} batch(es)")
+        return results

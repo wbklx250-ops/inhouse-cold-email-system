@@ -357,27 +357,40 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
 
     # Detect MFA prompt by page text OR input field
     page_text = driver.page_source.lower()
-    mfa_indicators = [
-        "verify your identity",
-        "verification code",
-        "use the authenticator",
-        "enter code",
-        "sign in with a code",
-    ]
-    mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
+    if "allow access" in page_text or "enter code to allow access" in page_text:
+        mfa_detected = False
+    else:
+        mfa_indicators = [
+            "verify your identity",
+            "verification code",
+            "use the authenticator",
+            "sign in with a code",
+            "authenticator",
+        ]
+        mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
 
     code_input = None
     if mfa_detected:
         logger.info(f"[{domain}] MFA detected, waiting for TOTP input...")
-        code_input = WebDriverWait(driver, 20).until(
-            EC.presence_of_element_located((By.NAME, "otc"))
-        )
+        for selector in [(By.ID, "idTxtBx_SAOTCC_OTC"), (By.NAME, "otc")]:
+            try:
+                code_input = WebDriverWait(driver, 20).until(
+                    EC.presence_of_element_located(selector)
+                )
+                break
+            except Exception:
+                continue
     else:
         # Still check if the code input shows up even without text indicators
         try:
-            code_input = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.NAME, "otc"))
-            )
+            for selector in [(By.ID, "idTxtBx_SAOTCC_OTC"), (By.NAME, "otc")]:
+                try:
+                    code_input = WebDriverWait(driver, 10).until(
+                        EC.presence_of_element_located(selector)
+                    )
+                    break
+                except Exception:
+                    continue
             logger.info(f"[{domain}] MFA input found without explicit indicators")
         except Exception:
             code_input = None

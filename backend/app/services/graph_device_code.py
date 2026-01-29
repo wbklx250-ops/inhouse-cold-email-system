@@ -2,6 +2,9 @@
 Graph API authentication using device code flow with Selenium MFA handling.
 """
 
+import nest_asyncio
+nest_asyncio.apply()
+
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -111,63 +114,69 @@ class GraphDeviceCodeAuth:
             next_btn.click()
             await asyncio.sleep(3)
 
-            # SCREEN 1: "Pick an account"
-            page_source = self.driver.page_source.lower()
-            if "pick an account" in page_source or "choose an account" in page_source:
-                logger.info("Account picker detected, clicking existing account...")
-                try:
-                    account_tile = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "div.table"))
-                    )
-                    account_tile.click()
-                    await asyncio.sleep(3)
-                except Exception:
+            # Wait for page transition
+            await asyncio.sleep(3)
+
+            # Loop to handle multiple screens
+            for screen_attempt in range(5):
+                page_source = self.driver.page_source.lower()
+
+                # SCREEN: "Pick an account"
+                if "pick an account" in page_source or "choose an account" in page_source:
+                    logger.info("Pick an account screen - clicking existing account...")
                     try:
-                        first_account = self.driver.find_element(By.CSS_SELECTOR, "[data-test-id]")
-                        first_account.click()
+                        account = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable(
+                                (By.CSS_SELECTOR, "div.table[data-test-id], .tile-container, div[role='button']")
+                            )
+                        )
+                        account.click()
                         await asyncio.sleep(3)
-                    except Exception:
-                        pass
+                        continue
+                    except Exception as e:
+                        logger.warning("Could not click account: %s", e)
 
-            # SCREEN 2: "Are you trying to sign in to..."
-            await asyncio.sleep(2)
-            page_source = self.driver.page_source.lower()
-            if "are you trying to sign in" in page_source:
-                logger.info("Sign in confirmation detected, clicking Continue...")
-                try:
-                    continue_btn = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "idSIButton9"))
-                    )
-                    continue_btn.click()
-                    await asyncio.sleep(3)
-                except Exception as e:
-                    logger.warning("Continue button: %s", e)
-
-            # SCREEN 3: "Permissions requested" - Consent
-            await asyncio.sleep(2)
-            page_source = self.driver.page_source.lower()
-
-            if "permissions requested" in page_source or "this app would like to" in page_source:
-                logger.info("Permissions consent screen detected, clicking Accept...")
-                try:
-                    # Check the "Consent on behalf of your organization" checkbox (optional but good)
+                # SCREEN: "Are you trying to sign in to..." / Continue confirmation
+                if "are you trying to sign in" in page_source or "only continue if" in page_source:
+                    logger.info("Confirmation screen - clicking Continue...")
                     try:
-                        consent_checkbox = self.driver.find_element(By.ID, "consentCheckbox")
-                        if not consent_checkbox.is_selected():
-                            consent_checkbox.click()
-                            await asyncio.sleep(0.5)
-                    except Exception:
-                        pass
+                        continue_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.ID, "idSIButton9"))
+                        )
+                        continue_btn.click()
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception as e:
+                        logger.warning("Could not click Continue: %s", e)
 
-                    # Click Accept button
-                    accept_btn = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "idSIButton9"))
-                    )
-                    accept_btn.click()
-                    await asyncio.sleep(3)
-                    logger.info("Clicked Accept on permissions consent")
-                except Exception as e:
-                    logger.warning("Consent screen handling: %s", e)
+                # SCREEN: "Permissions requested" / Consent
+                if "permissions requested" in page_source or "this app would like to" in page_source:
+                    logger.info("Permissions consent screen - clicking Accept...")
+                    try:
+                        # Check the "Consent on behalf of your organization" checkbox (optional but good)
+                        try:
+                            consent_checkbox = self.driver.find_element(By.ID, "consentCheckbox")
+                            if not consent_checkbox.is_selected():
+                                consent_checkbox.click()
+                                await asyncio.sleep(0.5)
+                        except Exception:
+                            pass
+
+                        accept_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.ID, "idSIButton9"))
+                        )
+                        accept_btn.click()
+                        await asyncio.sleep(3)
+                        continue
+                    except Exception as e:
+                        logger.warning("Could not click Accept: %s", e)
+
+                # SCREEN: Success / "You may close this window"
+                if "you have signed in" in page_source or "you may now close" in page_source:
+                    logger.info("Device code authentication successful!")
+                    return True
+
+                await asyncio.sleep(2)
 
             # SCREEN 4: Password entry (if session expired)
             page_source = self.driver.page_source.lower()
@@ -230,7 +239,16 @@ class GraphDeviceCodeAuth:
         await asyncio.sleep(2)
         page_source = self.driver.page_source.lower()
 
-        if "authenticator" in page_source or "verification code" in page_source or "enter code" in page_source:
+        # Avoid false positives on device code entry page
+        if "allow access" in page_source or "enter code to allow access" in page_source:
+            return
+
+        if (
+            "authenticator" in page_source
+            or "verification code" in page_source
+            or "verify your identity" in page_source
+            or ("verification" in page_source and "code" in page_source)
+        ):
             if self.totp_secret:
                 import pyotp
 
@@ -239,27 +257,28 @@ class GraphDeviceCodeAuth:
 
                 logger.info("Entering TOTP code for MFA")
 
-                try:
-                    totp_input = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((By.ID, "idTxtBx_SAOTCC_OTC"))
-                    )
+                totp_input = None
+                for selector in [(By.ID, "idTxtBx_SAOTCC_OTC"), (By.NAME, "otc")]:
+                    try:
+                        totp_input = WebDriverWait(self.driver, 10).until(
+                            EC.presence_of_element_located(selector)
+                        )
+                        break
+                    except Exception:
+                        continue
+
+                if totp_input:
                     totp_input.clear()
                     totp_input.send_keys(code)
 
-                    verify_btn = self.driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
-                    verify_btn.click()
-                    await asyncio.sleep(3)
-                except Exception:
                     try:
-                        totp_input = self.driver.find_element(By.NAME, "otc")
-                        totp_input.clear()
-                        totp_input.send_keys(code)
-
-                        verify_btn = self.driver.find_element(By.ID, "idSIButton9")
+                        verify_btn = self.driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
                         verify_btn.click()
-                        await asyncio.sleep(3)
-                    except Exception as e:
-                        logger.warning("TOTP input failed: %s", e)
+                    except Exception:
+                        totp_input.send_keys("\n")
+                    await asyncio.sleep(3)
+                else:
+                    logger.warning("TOTP input failed: could not locate input")
 
 
 async def set_passwords_via_graph(

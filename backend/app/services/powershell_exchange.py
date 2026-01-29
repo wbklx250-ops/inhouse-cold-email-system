@@ -3,10 +3,8 @@ PowerShell Exchange Service - Uses device code auth with Selenium MFA handling.
 """
 
 import os
-
-if os.environ.get("ENABLE_NEST_ASYNCIO") == "1":
-    import nest_asyncio
-    nest_asyncio.apply()
+import nest_asyncio
+nest_asyncio.apply()
 
 import asyncio
 import subprocess
@@ -17,6 +15,7 @@ from typing import List, Dict, Any, Optional
 
 from selenium import webdriver
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
@@ -150,6 +149,9 @@ Write-Output "CONNECTED_SUCCESS"
         logger.info("Completing device login with code: %s", device_code)
 
         try:
+            preferred_text = (self.admin_email or "").lower()
+            account_picker_seen = False
+
             # Navigate to device login page
             self.driver.get("https://microsoft.com/devicelogin")
             await asyncio.sleep(2)
@@ -169,22 +171,344 @@ Write-Output "CONNECTED_SUCCESS"
             # SCREEN 1: "Pick an account"
             page_source = self.driver.page_source.lower()
             if "pick an account" in page_source or "choose an account" in page_source:
-                logger.info("Account picker detected, clicking existing account...")
-                try:
-                    account_tile = WebDriverWait(self.driver, 5).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "div.table"))
-                    )
-                    account_tile.click()
-                    await asyncio.sleep(3)
-                except Exception:
+                account_picker_seen = True
+                logger.info("Account picker detected, selecting account...")
+                account_clicked = False
+                clicked_preferred = False
+
+                def _safe_click(element) -> bool:
+                    if not element:
+                        return False
                     try:
-                        first_account = self.driver.find_element(By.CSS_SELECTOR, "[data-test-id]")
-                        first_account.click()
+                        if element.is_displayed() and element.is_enabled():
+                            element.click()
+                            return True
+                    except Exception:
+                        return False
+                    return False
+
+                def _js_click(element) -> bool:
+                    """Click using JavaScript as fallback."""
+                    if not element:
+                        return False
+                    try:
+                        self.driver.execute_script("arguments[0].click();", element)
+                        return True
+                    except Exception:
+                        return False
+
+                try:
+                    # Wait a moment for account tiles to fully load
+                    await asyncio.sleep(1)
+
+                    tile_wait_selectors = [
+                        "#tilesHolder",
+                        "#tilesHolder div[role='button']",
+                        "div.tile",
+                        "div.table",
+                    ]
+
+                    for selector in tile_wait_selectors:
+                        try:
+                            WebDriverWait(self.driver, 6).until(
+                                EC.presence_of_element_located((By.CSS_SELECTOR, selector))
+                            )
+                            break
+                        except Exception:
+                            continue
+                    
+                    # More comprehensive selectors for Microsoft account tiles
+                    account_selectors = [
+                        "#tilesHolder .tile",
+                        "#tilesHolder .tile-container",
+                        "#tilesHolder .table",
+                        "#tilesHolder div.table[role='button']",
+                        "#tilesHolder div.table",
+                        "#tilesHolder div[role='button']",
+                        "#tilesHolder div[role='listitem']",
+                        "#tilesHolder div[role='option']",
+                        "div.table[role='button']",
+                        "div.table",
+                        "div.tile",
+                        "div.tile-container",
+                        "div[data-test-id]",
+                        "div[role='option']",
+                        "div[role='listitem']",
+                        "div[role='button']",
+                        "button[data-test-id]",
+                        "div.row",
+                        "div.identity-credential",
+                        "small.table-text",
+                    ]
+
+                    elements = []
+                    for selector in account_selectors:
+                        try:
+                            found = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                            elements.extend(found)
+                        except Exception:
+                            continue
+
+                    logger.info(f"Found {len(elements)} potential account elements")
+
+                    # Try to find and click preferred account first
+                    if preferred_text:
+                        for element in elements:
+                            try:
+                                text = (element.text or "").lower()
+                                if preferred_text in text:
+                                    logger.info(f"Found matching account element with text: {text[:50]}")
+                                    account_clicked = _safe_click(element)
+                                    if not account_clicked:
+                                        account_clicked = _js_click(element)
+                                    if account_clicked:
+                                        logger.info("✓ Clicked preferred account")
+                                        clicked_preferred = True
+                                        break
+                            except Exception:
+                                continue
+
+                    def _click_use_another_account() -> bool:
+                        selectors = [
+                            "#otherTile",
+                            "#tilesHolder div[role='button']",
+                            "div.table",
+                            "div[role='button']",
+                            "button",
+                            "a",
+                        ]
+                        for selector in selectors:
+                            try:
+                                for element in self.driver.find_elements(By.CSS_SELECTOR, selector):
+                                    text = (element.text or "").lower()
+                                    if "use another account" in text:
+                                        logger.info("Clicking 'Use another account'...")
+                                        if _safe_click(element) or _js_click(element):
+                                            return True
+                            except Exception:
+                                continue
+
+                        try:
+                            xpath = "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'use another account')]"
+                            for element in self.driver.find_elements(By.XPATH, xpath):
+                                if _safe_click(element) or _js_click(element):
+                                    return True
+                        except Exception:
+                            pass
+                        return False
+
+                    # If preferred account wasn't found, force "Use another account"
+                    if preferred_text and not account_clicked:
+                        account_clicked = _click_use_another_account()
+                        if account_clicked:
+                            logger.info("✓ Selected 'Use another account' for fresh login")
+
+                    # If no preferred account specified, try any account that isn't "use another"
+                    if not account_clicked and not preferred_text:
+                        for element in elements:
+                            try:
+                                text = (element.text or "").lower()
+                                if "use another account" in text or "back" in text or not text.strip():
+                                    continue
+                                if "@" in text or "signed in" in text:
+                                    logger.info(f"Trying to click account: {text[:50]}")
+                                    account_clicked = _safe_click(element)
+                                    if not account_clicked:
+                                        account_clicked = _js_click(element)
+                                    if account_clicked:
+                                        logger.info("✓ Clicked account tile")
+                                        break
+                            except Exception:
+                                continue
+
+                    # If still not clicked, try the first visible tile in tilesHolder
+                    if not account_clicked and not preferred_text:
+                        try:
+                            tiles_holder = self.driver.find_element(By.ID, "tilesHolder")
+                            tiles = tiles_holder.find_elements(By.CSS_SELECTOR, "div[role='button'], div[role='listitem'], div.table, div.tile")
+                            for tile in tiles:
+                                text = (tile.text or "").lower()
+                                if "use another account" in text or "back" in text or not text.strip():
+                                    continue
+                                if tile.is_displayed():
+                                    logger.info("Trying first visible tile in tilesHolder")
+                                    account_clicked = _safe_click(tile)
+                                    if not account_clicked:
+                                        account_clicked = _js_click(tile)
+                                    if account_clicked:
+                                        logger.info("✓ Clicked tile via tilesHolder")
+                                        break
+                        except Exception:
+                            pass
+
+                    # If still not clicked, try to locate the account tile from text nodes
+                    if not account_clicked and not preferred_text:
+                        def _find_clickable_parent(node):
+                            current = node
+                            for _ in range(6):
+                                if not current:
+                                    break
+                                try:
+                                    role = (current.get_attribute("role") or "").lower()
+                                    classes = (current.get_attribute("class") or "").lower()
+                                    data_test = (current.get_attribute("data-test-id") or "").lower()
+                                    if role in {"button", "option", "listitem"}:
+                                        return current
+                                    if "table" in classes or "tile" in classes or "identity" in classes:
+                                        return current
+                                    if data_test:
+                                        return current
+                                except Exception:
+                                    pass
+                                try:
+                                    current = current.find_element(By.XPATH, "..")
+                                except Exception:
+                                    break
+                            return None
+
+                        preferred_xpath = None
+                        if preferred_text:
+                            preferred_xpath = (
+                                "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), "
+                                f"'{preferred_text}')][not(contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'use another'))]"
+                            )
+
+                        xpath_candidates = [
+                            preferred_xpath,
+                            "//*[contains(., '@')]",
+                            "//*[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'signed in')]",
+                        ]
+
+                        for xpath in [x for x in xpath_candidates if x]:
+                            try:
+                                found_nodes = self.driver.find_elements(By.XPATH, xpath)
+                                for node in found_nodes:
+                                    try:
+                                        text = (node.text or "").lower()
+                                        if "use another account" in text or not text.strip():
+                                            continue
+                                        candidate = _find_clickable_parent(node)
+                                        if candidate:
+                                            logger.info("Trying clickable parent for account text: %s", text[:50])
+                                            account_clicked = _safe_click(candidate)
+                                            if not account_clicked:
+                                                account_clicked = _js_click(candidate)
+                                            if account_clicked:
+                                                logger.info("✓ Clicked account tile via text match")
+                                                break
+                                    except Exception:
+                                        continue
+                                if account_clicked:
+                                    break
+                            except Exception:
+                                continue
+
+                    # Try finding by XPath containing email or "Signed in"
+                    if not account_clicked:
+                        xpaths_to_try = [
+                            "//div[contains(@class, 'table') and contains(., 'Signed in')]",
+                            "//div[contains(@class, 'table') and contains(., '@')]",
+                            "//div[@role='button' and contains(., 'Signed in')]",
+                            "//div[@data-test-id and contains(., '@')]",
+                            "//div[contains(@class, 'tile') and contains(., 'Signed in')]",
+                            "//div[contains(@class, 'tile') and contains(., '@')]",
+                        ]
+                        if preferred_text:
+                            xpaths_to_try.insert(0, f"//div[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), '{preferred_text}')]")
+                        
+                        for xpath in xpaths_to_try:
+                            try:
+                                found_elements = self.driver.find_elements(By.XPATH, xpath)
+                                for element in found_elements:
+                                    text = (element.text or "").lower()
+                                    if "use another account" in text:
+                                        continue
+                                    logger.info(f"Trying XPath element: {text[:50]}")
+                                    account_clicked = _safe_click(element)
+                                    if not account_clicked:
+                                        account_clicked = _js_click(element)
+                                    if account_clicked:
+                                        logger.info("✓ Clicked via XPath")
+                                        break
+                                if account_clicked:
+                                    break
+                            except Exception:
+                                continue
+
+                    if account_clicked:
                         await asyncio.sleep(3)
+                except Exception as exc:
+                    logger.warning("Account picker click attempt failed: %s", exc)
+
+                if not account_clicked:
+                    try:
+                        body = self.driver.find_element(By.TAG_NAME, "body")
+                        body.click()
+                        await asyncio.sleep(0.3)
+                        for _ in range(6):
+                            body.send_keys(Keys.TAB)
+                            await asyncio.sleep(0.2)
+                            active = self.driver.switch_to.active_element
+                            active_text = (active.text or "").lower() if active else ""
+                            active_role = (active.get_attribute("role") or "").lower() if active else ""
+                            if "use another account" in active_text:
+                                continue
+                            if active_role in {"button", "option", "listitem"} or "@" in active_text or "signed in" in active_text:
+                                active.send_keys(Keys.ENTER)
+                                account_clicked = True
+                                logger.info("✓ Clicked account tile via keyboard fallback")
+                                await asyncio.sleep(2)
+                                break
                     except Exception:
                         pass
 
-            # SCREEN 2: "Are you trying to sign in to Microsoft Exchange..."
+                if not account_clicked:
+                    try:
+                        os.makedirs("logs", exist_ok=True)
+                        screenshot_path = os.path.join(
+                            "logs", f"account_picker_missing_{int(time.time())}.png"
+                        )
+                        self.driver.save_screenshot(screenshot_path)
+                        logger.warning(
+                            "Account picker not clicked. URL=%s Title=%s Screenshot=%s",
+                            self.driver.current_url,
+                            self.driver.title,
+                            screenshot_path,
+                        )
+                    except Exception:
+                        logger.warning("Account picker not clicked and screenshot failed")
+
+            # SCREEN 2: Email entry (after choosing "Use another account")
+            if account_picker_seen and preferred_text and not clicked_preferred:
+                try:
+                    await asyncio.sleep(1)
+                    email_input = None
+                    email_selectors = [
+                        (By.ID, "i0116"),
+                        (By.NAME, "loginfmt"),
+                        (By.CSS_SELECTOR, "input[type='email']"),
+                    ]
+                    for selector in email_selectors:
+                        try:
+                            email_input = WebDriverWait(self.driver, 6).until(
+                                EC.presence_of_element_located(selector)
+                            )
+                            if email_input and email_input.is_displayed():
+                                break
+                        except Exception:
+                            continue
+
+                    if email_input:
+                        logger.info("Entering admin email for fresh login")
+                        email_input.clear()
+                        email_input.send_keys(self.admin_email)
+                        next_btn = self.driver.find_element(By.ID, "idSIButton9")
+                        next_btn.click()
+                        await asyncio.sleep(3)
+                except Exception as exc:
+                    logger.warning("Email entry step skipped: %s", exc)
+
+            # SCREEN 3: "Are you trying to sign in to Microsoft Exchange..."
             await asyncio.sleep(2)
             page_source = self.driver.page_source.lower()
             if "are you trying to sign in" in page_source or "microsoft exchange" in page_source:
@@ -198,7 +522,7 @@ Write-Output "CONNECTED_SUCCESS"
                 except Exception as e:
                     logger.warning("Continue button: %s", e)
 
-            # SCREEN 3: Password entry (if session expired)
+            # SCREEN 4: Password entry (if session expired)
             page_source = self.driver.page_source.lower()
             if "enter password" in page_source or "passwd" in self.driver.page_source:
                 logger.info("Password entry detected...")
@@ -214,10 +538,10 @@ Write-Output "CONNECTED_SUCCESS"
                 except Exception:
                     pass
 
-            # SCREEN 4: MFA/TOTP
+            # SCREEN 5: MFA/TOTP
             await self._handle_mfa()
 
-            # SCREEN 5: "Stay signed in?"
+            # SCREEN 6: "Stay signed in?"
             await asyncio.sleep(2)
             try:
                 page_source = self.driver.page_source.lower()
@@ -251,11 +575,22 @@ Write-Output "CONNECTED_SUCCESS"
         await asyncio.sleep(2)
         page_source = self.driver.page_source.lower()
 
-        # Check if TOTP input is present
+        # Avoid false positives on various screens
+        if "allow access" in page_source or "enter code to allow access" in page_source:
+            return
+        if "pick an account" in page_source or "choose an account" in page_source:
+            logger.debug("Skipping MFA - still on account picker")
+            return
+        if "are you trying to sign in" in page_source:
+            logger.debug("Skipping MFA - on consent screen")
+            return
+
+        # Check if TOTP input is present (more specific check)
         if (
-            "authenticator" in page_source
+            ("authenticator" in page_source and "code" in page_source)
             or "verification code" in page_source
-            or "enter code" in page_source
+            or "verify your identity" in page_source
+            or "enter the code" in page_source
         ):
             if self.totp_secret:
                 import pyotp
@@ -266,28 +601,80 @@ Write-Output "CONNECTED_SUCCESS"
                 logger.info("Entering TOTP code for MFA")
 
                 # Find and fill TOTP input
-                try:
-                    totp_input = WebDriverWait(self.driver, 10).until(
-                        EC.presence_of_element_located((By.NAME, "otc"))
-                    )
+                totp_input = None
+                selectors = [
+                    (By.ID, "idTxtBx_SAOTCC_OTC"),
+                    (By.ID, "idTxtBx_TOTP_OTC"),
+                    (By.NAME, "otc"),
+                    (By.NAME, "ProofConfirmation"),
+                    (By.CSS_SELECTOR, "input[type='tel']"),
+                    (By.CSS_SELECTOR, "input[inputmode='numeric']"),
+                    (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+                    (By.CSS_SELECTOR, "input[aria-label*='code']"),
+                    (By.XPATH, "//input[contains(@aria-label, 'code') or contains(@placeholder, 'code')]")
+                ]
+
+                def _find_totp_input() -> Optional[webdriver.remote.webelement.WebElement]:
+                    for selector in selectors:
+                        try:
+                            element = WebDriverWait(self.driver, 6).until(
+                                EC.presence_of_element_located(selector)
+                            )
+                            if element and element.is_displayed():
+                                return element
+                        except Exception:
+                            continue
+                    return None
+
+                totp_input = _find_totp_input()
+
+                if not totp_input:
+                    try:
+                        self.driver.switch_to.default_content()
+                        frames = self.driver.find_elements(By.TAG_NAME, "iframe")
+                        for frame in frames:
+                            try:
+                                self.driver.switch_to.frame(frame)
+                                totp_input = _find_totp_input()
+                                if totp_input:
+                                    break
+                            except Exception:
+                                continue
+                            finally:
+                                self.driver.switch_to.default_content()
+                    except Exception:
+                        self.driver.switch_to.default_content()
+
+                if totp_input:
                     totp_input.clear()
                     totp_input.send_keys(code)
 
-                    verify_btn = self.driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
-                    verify_btn.click()
-                    await asyncio.sleep(3)
-                except Exception:
-                    # Try alternative input
                     try:
-                        totp_input = self.driver.find_element(By.ID, "idTxtBx_SAOTCC_OTC")
-                        totp_input.clear()
-                        totp_input.send_keys(code)
-
                         verify_btn = self.driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
                         verify_btn.click()
-                        await asyncio.sleep(3)
-                    except Exception as exc:
-                        logger.warning("Could not find TOTP input: %s", exc)
+                    except Exception:
+                        try:
+                            verify_btn = self.driver.find_element(By.ID, "idSIButton9")
+                            verify_btn.click()
+                        except Exception:
+                            totp_input.send_keys("\n")
+                    await asyncio.sleep(3)
+                else:
+                    try:
+                        self.driver.switch_to.default_content()
+                        os.makedirs("logs", exist_ok=True)
+                        screenshot_path = os.path.join("logs", f"mfa_totp_missing_{int(time.time())}.png")
+                        self.driver.save_screenshot(screenshot_path)
+                        logger.warning(
+                            "Could not find TOTP input field. URL=%s Title=%s Screenshot=%s",
+                            self.driver.current_url,
+                            self.driver.title,
+                            screenshot_path,
+                        )
+                    except Exception:
+                        logger.warning("Could not find TOTP input field after waiting")
+                    finally:
+                        self.driver.switch_to.default_content()
 
         # Handle "Stay signed in?" prompt
         try:
@@ -333,6 +720,53 @@ Write-Output "CONNECTED_SUCCESS"
 
         return "\n".join(output_lines)
 
+    async def _run_command_interactive(self, script: str, timeout: int = 600) -> str:
+        """Run a PowerShell script that requires interactive device code auth."""
+
+        if not self.ps_process:
+            raise Exception("PowerShell process not running")
+
+        self.ps_process.stdin.write(script)
+        self.ps_process.stdin.flush()
+
+        output_lines = []
+        device_code = None
+        start = time.time()
+
+        while time.time() - start < timeout:
+            line = self.ps_process.stdout.readline()
+            if not line:
+                await asyncio.sleep(0.1)
+                continue
+
+            line = line.strip()
+            output_lines.append(line)
+            logger.debug("PS Interactive Output: %s", line)
+
+            if not device_code:
+                code_match = re.search(r"enter the code\s+([A-Z0-9]{8,})", line, re.IGNORECASE)
+                if code_match:
+                    device_code = code_match.group(1)
+                    logger.info("Got device code: %s", device_code)
+                    success = await self._complete_device_login(device_code)
+                    logger.info("Device login completed: %s", success)
+                    if not success:
+                        break
+
+                code_match2 = re.search(r"code[:\s]+([A-Z0-9]{8,})", line, re.IGNORECASE)
+                if not device_code and code_match2:
+                    device_code = code_match2.group(1)
+                    logger.info("Got device code (alt): %s", device_code)
+                    success = await self._complete_device_login(device_code)
+                    logger.info("Device login completed: %s", success)
+                    if not success:
+                        break
+
+            if "MG_COMPLETE" in line:
+                break
+
+        return "\n".join(output_lines)
+
     async def create_shared_mailboxes(
         self,
         mailboxes: List[Dict[str, str]],
@@ -354,6 +788,7 @@ Write-Output "CONNECTED_SUCCESS"
             "failed": [],
             "delegated": [],
             "upns_fixed": [],
+            "passwords_set": [],
         }
 
         base_display_name = mailboxes[0].get("display_name", "User") if mailboxes else "User"
@@ -455,11 +890,153 @@ try {{
 
             await asyncio.sleep(0.2)
 
+        # STEP 5: Connect to Microsoft Graph (same session)
+        logger.info("Connecting to Microsoft Graph for password setting...")
+
+        domain_label = "unknown"
+        if delegate_to and "@" in delegate_to:
+            domain_label = delegate_to.split("@")[-1]
+
+        logger.info(f"[{domain_label}] Running Connect-MgGraph...")
+
+        disconnect_cmd = "Disconnect-MgGraph -ErrorAction SilentlyContinue"
+        await self._run_command(disconnect_cmd)
+        await asyncio.sleep(1)
+
+        # Use direct stdin/stdout for Graph connect since it's interactive
+        graph_connect_cmd = '''
+$InformationPreference = "Continue"
+Connect-MgGraph -Scopes "User.ReadWrite.All" -UseDeviceCode -NoWelcome -ForceRefresh -InformationAction Continue 6>&1 2>&1
+Write-Output "MG_CONNECT_DONE"
+'''
+        self.ps_process.stdin.write(graph_connect_cmd)
+        self.ps_process.stdin.flush()
+
+        # Read output looking for device code
+        graph_device_code = None
+        timeout = 120
+        start = time.time()
+        collected_output = []
+
+        while time.time() - start < timeout:
+            line = self.ps_process.stdout.readline()
+            if not line:
+                await asyncio.sleep(0.1)
+                continue
+
+            line = line.strip()
+            collected_output.append(line)
+            logger.debug("Graph PS Output: %s", line)
+
+            # Look for device code in the output
+            code_match = re.search(r"enter the code\s+([A-Z0-9]{8,})", line, re.IGNORECASE)
+            if code_match:
+                graph_device_code = code_match.group(1)
+                logger.info("Found Graph device code: %s", graph_device_code)
+                break
+
+            # Alternative pattern
+            code_match2 = re.search(r"code[:\s]+([A-Z0-9]{8,})", line, re.IGNORECASE)
+            if code_match2:
+                graph_device_code = code_match2.group(1)
+                logger.info("Found Graph device code (alt): %s", graph_device_code)
+                break
+
+            if "MG_CONNECT_DONE" in line:
+                logger.info("Graph connect completed without device code prompt - may already be authenticated")
+                break
+
+        full_output = "\n".join(collected_output)
         logger.info(
-            "PowerShell complete: %s created, %s delegated, %s UPNs fixed",
+            "[%s] Connect-MgGraph output: %s",
+            domain_label,
+            full_output[:1000] if full_output else "EMPTY",
+        )
+
+        if not graph_device_code:
+            lowered_output = (full_output or "").lower()
+            if "enter the code" in lowered_output or "devicelogin" in lowered_output:
+                match = re.search(r"code\s+([A-Z0-9]{9})", full_output, re.IGNORECASE)
+                if match:
+                    graph_device_code = match.group(1)
+                    logger.info("[%s] Found Graph device code: %s", domain_label, graph_device_code)
+                else:
+                    logger.error(
+                        "[%s] Could not extract device code from: %s",
+                        domain_label,
+                        full_output[:500] if full_output else "EMPTY",
+                    )
+            elif "welcome" in lowered_output:
+                logger.warning(
+                    "[%s] Graph connected without device code prompt - cached token may be stale",
+                    domain_label,
+                )
+            else:
+                logger.error(
+                    "[%s] Unexpected Graph connect output: %s",
+                    domain_label,
+                    full_output[:500] if full_output else "EMPTY",
+                )
+
+        if graph_device_code:
+            logger.info("Starting Selenium device login for Graph...")
+            success = await self._complete_device_login(graph_device_code)
+            logger.info("[%s] Device login completed: %s", domain_label, success)
+
+            # Wait for Graph connection to complete
+            logger.info("Waiting for Graph connection to complete...")
+            timeout = 60
+            start = time.time()
+            while time.time() - start < timeout:
+                line = self.ps_process.stdout.readline()
+                if not line:
+                    await asyncio.sleep(0.2)
+                    continue
+                line = line.strip()
+                logger.debug("Graph PS Output (post-auth): %s", line)
+                if "MG_CONNECT_DONE" in line or "Welcome" in line:
+                    logger.info("✓ Graph connection confirmed")
+                    break
+        else:
+            logger.warning("No device code prompt found in Graph connect output")
+
+        await asyncio.sleep(3)
+
+        # STEP 6: Set passwords and enable accounts
+        logger.info("Setting passwords and enabling accounts...")
+        for mb in mailboxes:
+            email = mb["email"]
+            password = mb["password"]
+
+            pwd_cmd = f'''
+try {{
+    Update-MgUser -UserId "{email}" -PasswordProfile @{{
+        Password = "{password}"
+        ForceChangePasswordNextSignIn = $false
+    }} -AccountEnabled $true -ErrorAction Stop
+    Write-Output "PWDSET:{email}"
+}} catch {{
+    Write-Output "PWDFAILED:{email}:$($_.Exception.Message)"
+}}
+'''
+            output = await self._run_command(pwd_cmd)
+
+            if output and f"PWDSET:{email}" in output:
+                results["passwords_set"].append(email)
+                logger.info("  [OK] Password set: %s", email)
+            else:
+                logger.error("  [FAIL] Password failed: %s", email)
+
+            await asyncio.sleep(0.3)
+
+        await self._run_command("Disconnect-MgGraph -ErrorAction SilentlyContinue")
+
+        logger.info(
+            "PowerShell complete: %s created, %s delegated, %s UPNs fixed, %s passwords set",
             len(results["created"]),
             len(results["delegated"]),
             len(results["upns_fixed"]),
+            len(results["passwords_set"]),
         )
         return results
 
@@ -486,6 +1063,10 @@ try {{
 
         escaped_admin_email = self._ps_escape(admin_email)
         escaped_admin_password = self._ps_escape(admin_password)
+
+        disconnect_cmd = "Disconnect-MgGraph -ErrorAction SilentlyContinue"
+        await self._run_command(disconnect_cmd)
+        await asyncio.sleep(1)
 
         connect_graph_cmd = f'''
 try {{
@@ -590,17 +1171,137 @@ $result | ConvertTo-Json -Compress
                 results.append(parsed)
                 if parsed.get("success"):
                     updated.append(parsed["email"])
+                    logger.info("  [OK] Password set: %s", parsed["email"])
                 else:
                     failed.append({"email": parsed.get("email", email), "error": "; ".join(parsed.get("errors", []))})
+                    logger.error(
+                        "  [FAIL] Password set: %s - %s",
+                        parsed.get("email", email),
+                        "; ".join(parsed.get("errors", [])),
+                    )
             else:
                 failed.append({"email": email, "error": output or "No output from PowerShell"})
+                logger.error(
+                    "  [FAIL] Password set: %s - %s",
+                    email,
+                    output or "No output from PowerShell",
+                )
 
             await asyncio.sleep(0.5)
 
         await self._run_command("Disconnect-MgGraph -ErrorAction SilentlyContinue")
 
+        logger.info(
+            "Graph PowerShell password summary: updated=%s failed=%s",
+            len(updated),
+            len(failed),
+        )
+        if failed:
+            preview = "; ".join(
+                f"{item.get('email')}: {item.get('error')}" for item in failed[:5]
+            )
+            logger.warning("Graph PowerShell password failures (first 5): %s", preview)
+
         return {
             "results": results,
+            "updated": updated,
+            "failed": failed,
+        }
+
+    async def set_passwords_via_graph_powershell(
+        self,
+        mailboxes: List[Dict[str, str]],
+    ) -> Dict[str, Any]:
+        """
+        Set passwords, enable accounts, and fix UPNs using Microsoft.Graph PowerShell
+        with device code authentication.
+
+        Args:
+            mailboxes: List of {"email": "...", "password": "..."}
+
+        Returns:
+            {"results": [...], "updated": [...], "failed": [...]}
+        """
+
+        if not self.connected:
+            raise Exception("Not connected to Exchange Online")
+
+        if not self.ps_process:
+            raise Exception("PowerShell process not running")
+
+        password_commands = []
+        for mb in mailboxes:
+            email = self._ps_escape(mb["email"])
+            password = self._ps_escape(mb.get("password", ""))
+            password_commands.append(
+                f'''
+try {{
+    Update-MgUser -UserId "{email}" -PasswordProfile @{{
+        Password = "{password}"
+        ForceChangePasswordNextSignIn = $false
+    }} -AccountEnabled $true -ErrorAction Stop
+    Write-Output "PWDSET:{email}"
+}} catch {{
+    Write-Output "PWDFAILED:{email}:$($_.Exception.Message)"
+}}
+Start-Sleep -Milliseconds 300
+'''
+            )
+
+        full_script = f'''
+Import-Module Microsoft.Graph.Users -ErrorAction Stop
+Write-Output "MG_MODULE_LOADED"
+
+Disconnect-MgGraph -ErrorAction SilentlyContinue
+
+Connect-MgGraph -Scopes "User.ReadWrite.All" -UseDeviceCode -NoWelcome
+
+$ctx = Get-MgContext
+if ($ctx) {{
+    Write-Output "MG_CONNECTED"
+    Write-Output "MG_USER:$($ctx.Account)"
+}} else {{
+    Write-Output "MG_CONNECT_FAILED"
+    exit 1
+}}
+
+{"".join(password_commands)}
+
+Disconnect-MgGraph
+Write-Output "MG_COMPLETE"
+'''
+
+        output = await self._run_command_interactive(full_script)
+
+        updated = []
+        failed = []
+
+        for line in output.splitlines():
+            if line.startswith("PWDSET:"):
+                email = line.replace("PWDSET:", "").strip()
+                updated.append(email)
+                logger.info("  [OK] Password set: %s", email)
+            elif line.startswith("PWDFAILED:"):
+                payload = line.replace("PWDFAILED:", "")
+                parts = payload.split(":", 1)
+                email = parts[0].strip()
+                error = parts[1].strip() if len(parts) > 1 else "Unknown"
+                failed.append({"email": email, "error": error})
+                logger.error("  [FAIL] Password: %s - %s", email, error)
+
+        logger.info(
+            "Graph PowerShell password summary: updated=%s failed=%s",
+            len(updated),
+            len(failed),
+        )
+        if failed:
+            preview = "; ".join(
+                f"{item.get('email')}: {item.get('error')}" for item in failed[:5]
+            )
+            logger.warning("Graph PowerShell password failures (first 5): %s", preview)
+
+        return {
+            "results": [],
             "updated": updated,
             "failed": failed,
         }
