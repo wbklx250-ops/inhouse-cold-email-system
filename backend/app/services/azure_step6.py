@@ -1,8 +1,9 @@
 """
-Step 6 Orchestrator (Selenium + PowerShell)
+Step 6 Orchestrator (Selenium -> PowerShell -> Selenium)
 
-Uses Selenium to create licensed user and PowerShell device code auth
-to create shared mailboxes, set passwords, and add delegation.
+Uses Selenium to create the licensed user, PowerShell device code auth
+to create shared mailboxes and delegation, then Selenium Admin UI to
+set passwords and enable accounts.
 """
 
 import asyncio
@@ -114,7 +115,7 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
 
 
 async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
-    """Run Step 6 for a single tenant using Selenium + PowerShell + Graph API."""
+    """Run Step 6 for a single tenant using Selenium + PowerShell + Selenium UI."""
     async with async_session_factory() as db:
         tenant = await db.get(Tenant, tenant_id)
         if not tenant:
@@ -360,6 +361,8 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                 connected = await connect_powershell_with_retry(ps_service)
                 if not connected:
                     raise Exception("Failed to connect to Exchange Online")
+                logger.info("[%s] PowerShell connected - stabilizing browser session before continuing...", tenant.custom_domain)
+                await asyncio.sleep(5)
 
             # ========================================
             # PHASE 1: PowerShell - Create, fix names, delegate

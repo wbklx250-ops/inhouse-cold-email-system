@@ -888,7 +888,7 @@ try {{
 
             await asyncio.sleep(0.2)
 
-        # STEP 4: Fix UPNs to match email addresses (critical for Graph API)
+        # STEP 4: Fix UPNs to match email addresses (critical for Admin UI operations)
         logger.info("Fixing UPNs to match email addresses...")
         await asyncio.sleep(3)
 
@@ -912,153 +912,11 @@ try {{
 
             await asyncio.sleep(0.2)
 
-        # STEP 5: Connect to Microsoft Graph (same session)
-        logger.info("Connecting to Microsoft Graph for password setting...")
-
-        domain_label = "unknown"
-        if delegate_to and "@" in delegate_to:
-            domain_label = delegate_to.split("@")[-1]
-
-        logger.info(f"[{domain_label}] Running Connect-MgGraph...")
-
-        disconnect_cmd = "Disconnect-MgGraph -ErrorAction SilentlyContinue"
-        await self._run_command(disconnect_cmd)
-        await asyncio.sleep(1)
-
-        # Use direct stdin/stdout for Graph connect since it's interactive
-        graph_connect_cmd = '''
-$InformationPreference = "Continue"
-Connect-MgGraph -Scopes "User.ReadWrite.All" -UseDeviceCode -NoWelcome -ForceRefresh -InformationAction Continue 6>&1 2>&1
-Write-Output "MG_CONNECT_DONE"
-'''
-        self.ps_process.stdin.write(graph_connect_cmd)
-        self.ps_process.stdin.flush()
-
-        # Read output looking for device code
-        graph_device_code = None
-        timeout = 120
-        start = time.time()
-        collected_output = []
-
-        while time.time() - start < timeout:
-            line = self.ps_process.stdout.readline()
-            if not line:
-                await asyncio.sleep(0.1)
-                continue
-
-            line = line.strip()
-            collected_output.append(line)
-            logger.debug("Graph PS Output: %s", line)
-
-            # Look for device code in the output
-            code_match = re.search(r"enter the code\s+([A-Z0-9]{8,})", line, re.IGNORECASE)
-            if code_match:
-                graph_device_code = code_match.group(1)
-                logger.info("Found Graph device code: %s", graph_device_code)
-                break
-
-            # Alternative pattern
-            code_match2 = re.search(r"code[:\s]+([A-Z0-9]{8,})", line, re.IGNORECASE)
-            if code_match2:
-                graph_device_code = code_match2.group(1)
-                logger.info("Found Graph device code (alt): %s", graph_device_code)
-                break
-
-            if "MG_CONNECT_DONE" in line:
-                logger.info("Graph connect completed without device code prompt - may already be authenticated")
-                break
-
-        full_output = "\n".join(collected_output)
         logger.info(
-            "[%s] Connect-MgGraph output: %s",
-            domain_label,
-            full_output[:1000] if full_output else "EMPTY",
-        )
-
-        if not graph_device_code:
-            lowered_output = (full_output or "").lower()
-            if "enter the code" in lowered_output or "devicelogin" in lowered_output:
-                match = re.search(r"code\s+([A-Z0-9]{9})", full_output, re.IGNORECASE)
-                if match:
-                    graph_device_code = match.group(1)
-                    logger.info("[%s] Found Graph device code: %s", domain_label, graph_device_code)
-                else:
-                    logger.error(
-                        "[%s] Could not extract device code from: %s",
-                        domain_label,
-                        full_output[:500] if full_output else "EMPTY",
-                    )
-            elif "welcome" in lowered_output:
-                logger.warning(
-                    "[%s] Graph connected without device code prompt - cached token may be stale",
-                    domain_label,
-                )
-            else:
-                logger.error(
-                    "[%s] Unexpected Graph connect output: %s",
-                    domain_label,
-                    full_output[:500] if full_output else "EMPTY",
-                )
-
-        if graph_device_code:
-            logger.info("Starting Selenium device login for Graph...")
-            success = await self._complete_device_login(graph_device_code)
-            logger.info("[%s] Device login completed: %s", domain_label, success)
-
-            # Wait for Graph connection to complete
-            logger.info("Waiting for Graph connection to complete...")
-            timeout = 60
-            start = time.time()
-            while time.time() - start < timeout:
-                line = self.ps_process.stdout.readline()
-                if not line:
-                    await asyncio.sleep(0.2)
-                    continue
-                line = line.strip()
-                logger.debug("Graph PS Output (post-auth): %s", line)
-                if "MG_CONNECT_DONE" in line or "Welcome" in line:
-                    logger.info("✓ Graph connection confirmed")
-                    break
-        else:
-            logger.warning("No device code prompt found in Graph connect output")
-
-        await asyncio.sleep(3)
-
-        # STEP 6: Set passwords and enable accounts
-        logger.info("Setting passwords and enabling accounts...")
-        for mb in mailboxes:
-            email = mb["email"]
-            password = mb["password"]
-
-            pwd_cmd = f'''
-try {{
-    Update-MgUser -UserId "{email}" -PasswordProfile @{{
-        Password = "{password}"
-        ForceChangePasswordNextSignIn = $false
-    }} -AccountEnabled $true -ErrorAction Stop
-    Write-Output "PWDSET:{email}"
-}} catch {{
-    Write-Output "PWDFAILED:{email}:$($_.Exception.Message)"
-}}
-'''
-            output = await self._run_command(pwd_cmd)
-
-            if output and f"PWDSET:{email}" in output:
-                results["passwords_set"].append(email)
-                logger.info("  [OK] Password set: %s", email)
-            else:
-                logger.error("  [FAIL] Password failed: %s", email)
-
-            await asyncio.sleep(0.3)
-
-        await self._run_command("Disconnect-MgGraph -ErrorAction SilentlyContinue")
-
-        logger.info(
-            "PowerShell complete: %s created, %s delegated, %s UPNs fixed, %s passwords set",
+            "PowerShell complete: %s created, %s delegated, %s UPNs fixed",
             len(results["created"]),
             len(results["delegated"]),
             len(results["upns_fixed"]),
-            len(results["passwords_set"]),
         )
         return results
 
