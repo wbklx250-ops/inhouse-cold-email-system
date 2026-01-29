@@ -1063,16 +1063,15 @@ async def start_automation(
         logger.info(f"=== Tenants with first_login_completed=True: {first_login_done} ===")
         logger.info(f"=== Tenants with totp_secret set: {has_totp} ===")
         
-        # STEP 4 FIX: Exclude tenants that already have TOTP saved to prevent re-enrollment
+        # STEP 4 FIX: Eligible tenants are those who haven't completed first login
         tenants = (await db.execute(
             select(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.first_login_completed == False,
-                Tenant.totp_secret.is_(None)  # Skip already-completed tenants
+                Tenant.first_login_completed == False
             )
         )).scalars().all()
         
-        logger.info(f"=== Eligible tenants (first_login=False AND no totp): {len(tenants)} ===")
+        logger.info(f"=== Eligible tenants (first_login=False): {len(tenants)} ===")
         
         if not tenants:
             logger.warning(f"=== NO ELIGIBLE TENANTS - returning early ===")
