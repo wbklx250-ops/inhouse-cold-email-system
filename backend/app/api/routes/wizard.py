@@ -2490,6 +2490,39 @@ async def retry_step6_for_tenant(
     }
 
 
+@router.post("/tenants/{tenant_id}/step6/force-complete")
+async def force_complete_step6_for_tenant(
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Force Step 6 to complete for a tenant when mailboxes are already usable."""
+    tenant_result = await db.execute(
+        select(Tenant).where(Tenant.id == tenant_id)
+    )
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+
+    mailbox_total = await db.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+    ) or 0
+    if mailbox_total == 0:
+        raise HTTPException(400, "No mailboxes found for this tenant")
+
+    tenant.step6_complete = True
+    tenant.step6_completed_at = datetime.utcnow()
+    tenant.step6_error = None
+    tenant.status = TenantStatus.READY
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": f"Marked Step 6 complete for {tenant.custom_domain}",
+        "mailboxes": mailbox_total,
+    }
+
+
 @router.post("/batches/{batch_id}/step6/generate-mailboxes", response_model=StepResult)
 async def batch_generate_mailboxes(
     batch_id: UUID,

@@ -2326,6 +2326,25 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
     }
   };
 
+  const handleForceComplete = async (tenantId: string) => {
+    if (!confirm("Force-complete Step 6 for this tenant?")) return;
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/tenants/${tenantId}/step6/force-complete`, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to force complete Step 6");
+      }
+
+      await fetchStep6Status();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to force complete Step 6");
+    }
+  };
+
   // Download CSV
   const handleDownloadCSV = async () => {
     try {
@@ -2512,6 +2531,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Mailboxes</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Progress</th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">Live Status</th>
+                <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">Actions</th>
               </tr>
             </thead>
             <tbody className="bg-white divide-y divide-gray-200">
@@ -2598,6 +2618,16 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
                       <span className="text-gray-400">Waiting for Step 5</span>
                     ) : (
                       <span className="text-gray-400">Ready</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-right text-sm">
+                    {!tenant.step6_complete && tenant.mailbox_count > 0 && (
+                      <button
+                        onClick={() => handleForceComplete(tenant.tenant_id)}
+                        className="px-2 py-1 text-xs bg-yellow-100 text-yellow-800 rounded hover:bg-yellow-200"
+                      >
+                        Force Complete
+                      </button>
                     )}
                   </td>
                 </tr>

@@ -5,17 +5,23 @@ Uses Selenium to create licensed user and PowerShell device code auth
 to create shared mailboxes, set passwords, and add delegation.
 """
 
-import nest_asyncio
-nest_asyncio.apply()
-
 import asyncio
+try:
+    current_loop = asyncio.get_running_loop()
+except RuntimeError:
+    current_loop = None
+
+if current_loop is None or type(current_loop).__module__ != "uvloop":
+    import nest_asyncio
+
+    nest_asyncio.apply()
 import logging
 import time
 from datetime import datetime
 from typing import Dict, Any, List
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 
 from app.db.session import SessionLocal, async_session_factory
 from app.models.batch import SetupBatch
@@ -586,19 +592,66 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                     raise
 
             # ========================================
-            if (
-                tenant.step6_mailboxes_created >= len(mailboxes) * 0.9
-                and tenant.step6_delegations_done >= len(mailboxes) * 0.9
-                and tenant.step6_passwords_set >= len(mailboxes) * 0.9
-            ):
-                async with SessionLocal() as fresh_db:
-                    tenant_to_update = await fresh_db.get(Tenant, tenant.id)
-                    if tenant_to_update:
-                        tenant_to_update.step6_complete = True
-                        tenant_to_update.status = "ready"
-                        tenant_to_update.step6_error = None
-                        await fresh_db.commit()
-                logger.info("[%s]  Step 6 COMPLETE for %s", str(tenant.id)[:8], tenant.custom_domain)
+            # Completion check (use DB mailbox state to avoid stale counts)
+            async with SessionLocal() as fresh_db:
+                total_mailboxes = await fresh_db.scalar(
+                    select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+                ) or 0
+                created_count = await fresh_db.scalar(
+                    select(func.count(Mailbox.id)).where(
+                        Mailbox.tenant_id == tenant.id,
+                        Mailbox.created_in_exchange == True,
+                    )
+                ) or 0
+                delegated_count = await fresh_db.scalar(
+                    select(func.count(Mailbox.id)).where(
+                        Mailbox.tenant_id == tenant.id,
+                        Mailbox.delegated == True,
+                    )
+                ) or 0
+                passwords_set_count = await fresh_db.scalar(
+                    select(func.count(Mailbox.id)).where(
+                        Mailbox.tenant_id == tenant.id,
+                        Mailbox.password_set == True,
+                    )
+                ) or 0
+
+                tenant_to_update = await fresh_db.get(Tenant, tenant.id)
+                if tenant_to_update:
+                    tenant_to_update.step6_mailboxes_created = max(
+                        tenant_to_update.step6_mailboxes_created,
+                        created_count,
+                    )
+                    tenant_to_update.step6_delegations_done = max(
+                        tenant_to_update.step6_delegations_done,
+                        delegated_count,
+                    )
+                    tenant_to_update.step6_passwords_set = max(
+                        tenant_to_update.step6_passwords_set,
+                        passwords_set_count,
+                    )
+
+                    completion_threshold = 0.9
+                    if total_mailboxes > 0:
+                        has_mailboxes = created_count >= total_mailboxes * completion_threshold
+                        has_access = (
+                            delegated_count >= total_mailboxes * completion_threshold
+                            or passwords_set_count >= total_mailboxes * completion_threshold
+                        )
+                        if has_mailboxes and has_access:
+                            tenant_to_update.step6_complete = True
+                            tenant_to_update.step6_completed_at = datetime.utcnow()
+                            tenant_to_update.status = TenantStatus.READY
+                            tenant_to_update.step6_error = None
+
+                    await fresh_db.commit()
+
+                if tenant_to_update and tenant_to_update.step6_complete:
+                    logger.info(
+                        "[%s] Step 6 COMPLETE for %s",
+                        str(tenant.id)[:8],
+                        tenant.custom_domain,
+                    )
 
             update_progress(str(tenant.id), "complete", "complete", "Step 6 complete!")
             return {"success": True}
