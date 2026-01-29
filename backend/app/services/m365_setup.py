@@ -344,7 +344,9 @@ async def run_step5_for_batch(
                         tenant.dkim_enabled_at = datetime.utcnow()
                         tenant.status = TenantStatus.DKIM_ENABLED
                         tenant.setup_error = None
-                        tenant.setup_step = 6  # Mark step 5 as complete
+                        tenant.setup_step = "6"  # Mark step 5 as complete
+                        tenant.step5_complete = True
+                        tenant.step5_completed_at = datetime.utcnow()
 
                         # Update domain
                         domain.status = DomainStatus.ACTIVE
@@ -358,7 +360,7 @@ async def run_step5_for_batch(
                         await db.commit()
 
                         summary["successful"] += 1
-                        logger.info(f"[{domain_name}]  Database updated - Step 5 complete")
+                        logger.info(f"[{domain_name}]  Database updated - step5_complete=True")
 
                     elif selenium_result.get("verified"):
                         # Partial success - domain verified but DNS may not be complete

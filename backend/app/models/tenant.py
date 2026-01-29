@@ -103,6 +103,10 @@ class Tenant(TimestampUUIDMixin, Base):
     step6_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     step6_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # === STEP 5 PROGRESS TRACKING ===
+    step5_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step5_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # === DOMAIN LINKING ===
     custom_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     domain_id: Mapped[UUID | None] = mapped_column(
