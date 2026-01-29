@@ -1027,103 +1027,126 @@ async def start_automation(
     db: AsyncSession = Depends(get_db)
 ):
     """Start parallel first-login automation."""
-    import logging
-    logger = logging.getLogger(__name__)
-
-    # STEP 4 FIX: Enforce max 2 concurrent workers to avoid browser rendering issues
-    STEP4_MAX_WORKERS = 2
-    if max_workers > STEP4_MAX_WORKERS:
-        logger.warning(
-            "Step 4 max_workers capped at %s (requested %s)",
-            STEP4_MAX_WORKERS,
-            max_workers,
-        )
-        max_workers = STEP4_MAX_WORKERS
+    logger.info(f"=== STEP 4 START CALLED for batch {batch_id} ===")
     
-    # Check if automation is already running for this batch
-    job_id = str(batch_id)
-    if job_id in step4_jobs and step4_jobs[job_id].get("status") == "running":
-        logger.warning(f"Step 4 automation already running for batch {batch_id}")
-        return {
-            "success": False,
-            "message": f"Automation already running for this batch (started at {step4_jobs[job_id].get('started_at')})",
-            "already_running": True
+    try:
+        # STEP 4 FIX: Enforce max 2 concurrent workers to avoid browser rendering issues
+        STEP4_MAX_WORKERS = 2
+        if max_workers > STEP4_MAX_WORKERS:
+            logger.warning(
+                "Step 4 max_workers capped at %s (requested %s)",
+                STEP4_MAX_WORKERS,
+                max_workers,
+            )
+            max_workers = STEP4_MAX_WORKERS
+        
+        # Check if automation is already running for this batch
+        job_id = str(batch_id)
+        if job_id in step4_jobs and step4_jobs[job_id].get("status") == "running":
+            logger.warning(f"=== STEP 4 ALREADY RUNNING for batch {batch_id} ===")
+            return {
+                "success": False,
+                "message": f"Automation already running for this batch (started at {step4_jobs[job_id].get('started_at')})",
+                "already_running": True
+            }
+        
+        # DEBUG: Log total tenants in batch before filtering
+        all_tenants_result = await db.execute(
+            select(Tenant).where(Tenant.batch_id == batch_id)
+        )
+        all_tenants = all_tenants_result.scalars().all()
+        logger.info(f"=== Total tenants in batch: {len(all_tenants)} ===")
+        
+        # Log breakdown of tenant states
+        first_login_done = sum(1 for t in all_tenants if t.first_login_completed)
+        has_totp = sum(1 for t in all_tenants if t.totp_secret)
+        logger.info(f"=== Tenants with first_login_completed=True: {first_login_done} ===")
+        logger.info(f"=== Tenants with totp_secret set: {has_totp} ===")
+        
+        # STEP 4 FIX: Exclude tenants that already have TOTP saved to prevent re-enrollment
+        tenants = (await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.first_login_completed == False,
+                Tenant.totp_secret.is_(None)  # Skip already-completed tenants
+            )
+        )).scalars().all()
+        
+        logger.info(f"=== Eligible tenants (first_login=False AND no totp): {len(tenants)} ===")
+        
+        if not tenants:
+            logger.warning(f"=== NO ELIGIBLE TENANTS - returning early ===")
+            return {"success": True, "message": "No tenants"}
+        
+        # CRITICAL LOGGING: Log the actual max_workers value being used
+        logger.info(f"=" * 60)
+        logger.info(f"STEP 4 AUTOMATION STARTING")
+        logger.info(f"Batch ID: {batch_id}")
+        logger.info(f"Max Workers (parallel browsers): {max_workers}")
+        logger.info(f"Total tenants to process: {len(tenants)}")
+        logger.info(f"=" * 60)
+        
+        tenant_data = [
+            {"tenant_id": str(t.id), "admin_email": t.admin_email, "initial_password": t.admin_password}
+            for t in tenants
+        ]
+        
+        # Initialize job tracking
+        step4_jobs[job_id] = {
+            "status": "running",
+            "total": len(tenants),
+            "max_workers": max_workers,
+            "started_at": datetime.utcnow().isoformat()
         }
-    
-    # STEP 4 FIX: Exclude tenants that already have TOTP saved to prevent re-enrollment
-    tenants = (await db.execute(
-        select(Tenant).where(
-            Tenant.batch_id == batch_id,
-            Tenant.first_login_completed == False,
-            Tenant.totp_secret.is_(None)  # Skip already-completed tenants
-        )
-    )).scalars().all()
-    
-    if not tenants:
-        return {"success": True, "message": "No tenants"}
-    
-    # CRITICAL LOGGING: Log the actual max_workers value being used
-    logger.info(f"=" * 60)
-    logger.info(f"STEP 4 AUTOMATION STARTING")
-    logger.info(f"Batch ID: {batch_id}")
-    logger.info(f"Max Workers (parallel browsers): {max_workers}")
-    logger.info(f"Total tenants: {len(tenants)}")
-    logger.info(f"=" * 60)
-    
-    tenant_data = [
-        {"tenant_id": str(t.id), "admin_email": t.admin_email, "initial_password": t.admin_password}
-        for t in tenants
-    ]
-    
-    # Initialize job tracking
-    step4_jobs[job_id] = {
-        "status": "running",
-        "total": len(tenants),
-        "max_workers": max_workers,
-        "started_at": datetime.utcnow().isoformat()
-    }
-    
-    async def run():
-        try:
-            results = await process_tenants_parallel(tenant_data, new_password, max_workers)
-            for r in results:
-                async with AsyncSession(async_engine, expire_on_commit=False) as session:
-                    t = await session.get(Tenant, UUID(r["tenant_id"]))
-                    if t:
-                        t.first_login_completed = r["success"]
-                        t.totp_secret = r["totp_secret"]
-                        t.security_defaults_disabled = r["security_defaults_disabled"]
-                        t.setup_error = r["error"]
-                        if r["success"]:
-                            # Only update admin_password AFTER successful password change
-                            # This preserves the original TXT password until change is confirmed
-                            if r["new_password"]:  # Only update if we have a new password
-                                t.admin_password = r["new_password"]
-                                t.password_changed = True  # CRITICAL: Mark password as changed!
-                            t.first_login_at = datetime.utcnow()
-                        await session.commit()
-                        logger.info(" SAVED %s to DB", t.name)
-            
-            # Mark job as completed
-            step4_jobs[job_id]["status"] = "completed"
-            step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            logger.info(f"Step 4 automation completed for batch {batch_id}")
-            
-        except Exception as e:
-            # Mark job as failed
-            step4_jobs[job_id]["status"] = "failed"
-            step4_jobs[job_id]["error"] = str(e)
-            step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            logger.error(f"Step 4 automation failed for batch {batch_id}: {str(e)}")
-    
-    background_tasks.add_task(run)
-    
-    return {
-        "success": True,
-        "tenants": len(tenants),
-        "workers": max_workers,
-        "estimated_minutes": round(len(tenants) / max_workers * 1.5)
-    }
+        
+        async def run():
+            try:
+                results = await process_tenants_parallel(tenant_data, new_password, max_workers)
+                for r in results:
+                    async with AsyncSession(async_engine, expire_on_commit=False) as session:
+                        t = await session.get(Tenant, UUID(r["tenant_id"]))
+                        if t:
+                            t.first_login_completed = r["success"]
+                            t.totp_secret = r["totp_secret"]
+                            t.security_defaults_disabled = r["security_defaults_disabled"]
+                            t.setup_error = r["error"]
+                            if r["success"]:
+                                # Only update admin_password AFTER successful password change
+                                # This preserves the original TXT password until change is confirmed
+                                if r["new_password"]:  # Only update if we have a new password
+                                    t.admin_password = r["new_password"]
+                                    t.password_changed = True  # CRITICAL: Mark password as changed!
+                                t.first_login_at = datetime.utcnow()
+                            await session.commit()
+                            logger.info(" SAVED %s to DB", t.name)
+                
+                # Mark job as completed
+                step4_jobs[job_id]["status"] = "completed"
+                step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                logger.info(f"Step 4 automation completed for batch {batch_id}")
+                
+            except Exception as e:
+                # Mark job as failed
+                step4_jobs[job_id]["status"] = "failed"
+                step4_jobs[job_id]["error"] = str(e)
+                step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                logger.error(f"Step 4 automation failed for batch {batch_id}: {str(e)}")
+        
+        background_tasks.add_task(run)
+        logger.info(f"=== STEP 4 BACKGROUND TASK ADDED ===")
+        
+        return {
+            "success": True,
+            "tenants": len(tenants),
+            "workers": max_workers,
+            "estimated_minutes": round(len(tenants) / max_workers * 1.5)
+        }
+        
+    except Exception as e:
+        logger.error(f"=== STEP 4 START FAILED: {e} ===")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise
 
 
 @router.get("/batches/{batch_id}/step4/progress")
