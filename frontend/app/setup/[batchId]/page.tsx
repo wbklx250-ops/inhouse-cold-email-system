@@ -967,12 +967,12 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [linkResult, setLinkResult] = useState<any>(null);
 
   // Automation state
-  const [newPassword, setNewPassword] = useState("");
-  const [maxWorkers, setMaxWorkers] = useState(10);
   const [automating, setAutomating] = useState(false);
   const [automationStarted, setAutomationStarted] = useState(false);
   const [progress, setProgress] = useState<AutomationProgress>({ completed: 0, failed: 0, total: 0 });
   const [estimatedMinutes, setEstimatedMinutes] = useState(0);
+  const hardcodedPassword = "#Sendemails1";
+  const hardcodedMaxWorkers = 2;
 
   // Step 4 detailed status
   const [step4Status, setStep4Status] = useState<Step4Status | null>(null);
@@ -1101,7 +1101,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   
   const handleStartAutomation = async () => {
     // Debouncing: prevent multiple rapid clicks
-    if (!newPassword || automationRequestInProgress.current) {
+    if (automationRequestInProgress.current) {
       return;
     }
     
@@ -1113,8 +1113,8 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
     
     try {
       const formData = new FormData();
-      formData.append("new_password", newPassword);
-      formData.append("max_workers", maxWorkers.toString());
+      formData.append("new_password", hardcodedPassword);
+      formData.append("max_workers", hardcodedMaxWorkers.toString());
       
       const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/start-automation`, {
         method: "POST",
@@ -1134,7 +1134,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
         }
         
         setProgress(prev => ({ ...prev, total: data.tenants }));
-        setEstimatedMinutes(data.estimated_minutes || Math.round(data.tenants / maxWorkers * 1.5));
+        setEstimatedMinutes(data.estimated_minutes || Math.round(data.tenants / hardcodedMaxWorkers * 1.5));
       } else {
         // Request failed - reset state
         const errorData = await res.json().catch(() => ({ message: "Failed to start" }));
@@ -1189,7 +1189,7 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
   
   // Estimated time remaining
   const remaining = progress.total - progress.completed - progress.failed;
-  const etaMinutes = remaining > 0 ? Math.round(remaining / maxWorkers * 1.5) : 0;
+  const etaMinutes = remaining > 0 ? Math.round(remaining / hardcodedMaxWorkers * 1.5) : 0;
 
   // Check if all complete
   const allComplete = step4Status && step4Status.tenants_total > 0 && 
@@ -1235,13 +1235,9 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
 
   // Retry a single tenant
   const handleRetryTenant = async (tenantId: string) => {
-    if (!newPassword) {
-      alert("Please enter a password first");
-      return;
-    }
     try {
       const formData = new FormData();
-      formData.append("new_password", newPassword);
+      formData.append("new_password", hardcodedPassword);
       
       const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/retry-tenant/${tenantId}`, {
         method: "POST",
@@ -1460,46 +1456,16 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
             Automates password change, MFA enrollment (TOTP), and Security Defaults disable.
           </p>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                New Password (for all tenants)
-              </label>
-              <input
-                type="text"
-                value={newPassword}
-                onChange={(e) => setNewPassword(e.target.value)}
-                placeholder="StrongP@ssword123!"
-                disabled={automating}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                Max Workers (parallel browsers)
-              </label>
-              <input
-                type="number"
-                value={maxWorkers}
-                onChange={(e) => setMaxWorkers(Math.max(1, Math.min(20, parseInt(e.target.value) || 10)))}
-                min={1}
-                max={20}
-                disabled={automating}
-                className="w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 disabled:bg-gray-100"
-              />
-            </div>
-          </div>
-
           {!automating && !automationStarted && (
             <div className="text-sm text-gray-500">
-              Estimated time: ~{Math.round((status?.tenants_total || 0) / maxWorkers * 1.5)} minutes 
-              ({status?.tenants_total} tenants × 1.5 min / {maxWorkers} workers)
+              Estimated time: ~{Math.round((status?.tenants_total || 0) / hardcodedMaxWorkers * 1.5)} minutes
+              ({status?.tenants_total} tenants × 1.5 min / {hardcodedMaxWorkers} workers)
             </div>
           )}
 
           <button
             onClick={handleStartAutomation}
-            disabled={!newPassword || automating || status?.tenants_linked === 0}
+            disabled={automating || status?.tenants_linked === 0}
             className="w-full py-3 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
           >
             {automating ? (
