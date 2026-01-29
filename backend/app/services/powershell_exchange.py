@@ -3,10 +3,17 @@ PowerShell Exchange Service - Uses device code auth with Selenium MFA handling.
 """
 
 import os
-import nest_asyncio
-nest_asyncio.apply()
-
 import asyncio
+
+try:
+    current_loop = asyncio.get_running_loop()
+except RuntimeError:
+    current_loop = None
+
+if current_loop is None or type(current_loop).__module__ != "uvloop":
+    import nest_asyncio
+
+    nest_asyncio.apply()
 import subprocess
 import re
 import logging
