@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     # True = headless mode (faster, no GUI, REQUIRED for production/Railway - no display available!)
     step5_headless: bool = True
 
+    # Headless stability delays (seconds)
+    # Increase in headless to avoid racing Microsoft login screens
+    headless_delay_seconds: float = 1.5
+    headless_page_settle_seconds: float = 2.0
+
     allowed_origins: str = ""
     
     @property

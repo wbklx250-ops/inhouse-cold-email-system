@@ -20,6 +20,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -44,6 +46,19 @@ class GraphDeviceCodeAuth:
         self.totp_secret = totp_secret
         self.access_token: Optional[str] = None
         self.executor = ThreadPoolExecutor(max_workers=1)
+        settings = get_settings()
+        self._headless_delay_seconds = settings.headless_delay_seconds
+        self._headless_page_settle_seconds = settings.headless_page_settle_seconds
+
+    async def _sleep_after_action(self, base_delay: float = 0.5, extra_delay: float = 0.0) -> None:
+        delay = base_delay
+        try:
+            if self.driver and getattr(self.driver, "capabilities", {}).get("browserName"):
+                delay = max(delay, self._headless_delay_seconds)
+        except Exception:
+            delay = max(delay, self._headless_delay_seconds)
+        delay += extra_delay
+        await asyncio.sleep(delay)
 
     async def get_token(self) -> str:
         """Get Graph API access token via device code flow."""
@@ -100,7 +115,7 @@ class GraphDeviceCodeAuth:
         try:
             # Navigate to device login page
             self.driver.get("https://microsoft.com/devicelogin")
-            await asyncio.sleep(2)
+            await self._sleep_after_action(base_delay=2, extra_delay=self._headless_page_settle_seconds)
 
             # Enter device code
             code_input = WebDriverWait(self.driver, 15).until(
@@ -112,10 +127,10 @@ class GraphDeviceCodeAuth:
             # Click Next
             next_btn = self.driver.find_element(By.ID, "idSIButton9")
             next_btn.click()
-            await asyncio.sleep(3)
+            await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
 
             # Wait for page transition
-            await asyncio.sleep(3)
+            await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
 
             # Loop to handle multiple screens
             for screen_attempt in range(5):
@@ -131,7 +146,7 @@ class GraphDeviceCodeAuth:
                             )
                         )
                         account.click()
-                        await asyncio.sleep(3)
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                         continue
                     except Exception as e:
                         logger.warning("Could not click account: %s", e)
@@ -144,7 +159,7 @@ class GraphDeviceCodeAuth:
                             EC.element_to_be_clickable((By.ID, "idSIButton9"))
                         )
                         continue_btn.click()
-                        await asyncio.sleep(3)
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                         continue
                     except Exception as e:
                         logger.warning("Could not click Continue: %s", e)
@@ -158,7 +173,7 @@ class GraphDeviceCodeAuth:
                             consent_checkbox = self.driver.find_element(By.ID, "consentCheckbox")
                             if not consent_checkbox.is_selected():
                                 consent_checkbox.click()
-                                await asyncio.sleep(0.5)
+                                await self._sleep_after_action(base_delay=0.5)
                         except Exception:
                             pass
 
@@ -166,7 +181,7 @@ class GraphDeviceCodeAuth:
                             EC.element_to_be_clickable((By.ID, "idSIButton9"))
                         )
                         accept_btn.click()
-                        await asyncio.sleep(3)
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                         continue
                     except Exception as e:
                         logger.warning("Could not click Accept: %s", e)
@@ -176,7 +191,7 @@ class GraphDeviceCodeAuth:
                     logger.info("Device code authentication successful!")
                     return True
 
-                await asyncio.sleep(2)
+                await self._sleep_after_action(base_delay=2)
 
             # SCREEN 4: Password entry (if session expired)
             page_source = self.driver.page_source.lower()
@@ -190,7 +205,7 @@ class GraphDeviceCodeAuth:
                     pwd_input.send_keys(self.admin_password)
                     submit_btn = self.driver.find_element(By.ID, "idSIButton9")
                     submit_btn.click()
-                    await asyncio.sleep(3)
+                    await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 except Exception:
                     pass
 
@@ -198,18 +213,18 @@ class GraphDeviceCodeAuth:
             await self._handle_mfa()
 
             # SCREEN 6: "Stay signed in?"
-            await asyncio.sleep(2)
+            await self._sleep_after_action(base_delay=2)
             try:
                 page_source = self.driver.page_source.lower()
                 if "stay signed in" in page_source:
                     yes_btn = self.driver.find_element(By.ID, "idSIButton9")
                     yes_btn.click()
-                    await asyncio.sleep(2)
+                    await self._sleep_after_action(base_delay=2)
             except Exception:
                 pass
 
             # Check for success
-            await asyncio.sleep(3)
+            await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
             page_source = self.driver.page_source.lower()
             if (
                 "you have signed in" in page_source
@@ -223,7 +238,7 @@ class GraphDeviceCodeAuth:
             try:
                 final_btn = self.driver.find_element(By.ID, "idSIButton9")
                 final_btn.click()
-                await asyncio.sleep(2)
+                await self._sleep_after_action(base_delay=2)
             except Exception:
                 pass
 
@@ -236,7 +251,7 @@ class GraphDeviceCodeAuth:
     async def _handle_mfa(self):
         """Handle MFA/TOTP if required."""
 
-        await asyncio.sleep(2)
+        await self._sleep_after_action(base_delay=2)
         page_source = self.driver.page_source.lower()
 
         # Avoid false positives on device code entry page
@@ -276,7 +291,7 @@ class GraphDeviceCodeAuth:
                         verify_btn.click()
                     except Exception:
                         totp_input.send_keys("\n")
-                    await asyncio.sleep(3)
+                    await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 else:
                     logger.warning("TOTP input failed: could not locate input")
 

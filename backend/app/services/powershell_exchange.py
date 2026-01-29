@@ -27,6 +27,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import time
 
+from app.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +45,19 @@ class PowerShellExchangeService:
         self.totp_secret = totp_secret
         self.ps_process = None
         self.connected = False
+        settings = get_settings()
+        self._headless_delay_seconds = settings.headless_delay_seconds
+        self._headless_page_settle_seconds = settings.headless_page_settle_seconds
+
+    async def _sleep_after_action(self, base_delay: float = 0.5, extra_delay: float = 0.0) -> None:
+        delay = base_delay
+        try:
+            if self.driver and getattr(self.driver, "capabilities", {}).get("browserName"):
+                delay = max(delay, self._headless_delay_seconds)
+        except Exception:
+            delay = max(delay, self._headless_delay_seconds)
+        delay += extra_delay
+        await asyncio.sleep(delay)
 
     @staticmethod
     def _ps_escape(value: str) -> str:
@@ -161,7 +176,7 @@ Write-Output "CONNECTED_SUCCESS"
 
             # Navigate to device login page
             self.driver.get("https://microsoft.com/devicelogin")
-            await asyncio.sleep(2)
+            await self._sleep_after_action(base_delay=2, extra_delay=self._headless_page_settle_seconds)
 
             # Enter device code
             code_input = WebDriverWait(self.driver, 15).until(
@@ -173,7 +188,7 @@ Write-Output "CONNECTED_SUCCESS"
             # Click Next
             next_btn = self.driver.find_element(By.ID, "idSIButton9")
             next_btn.click()
-            await asyncio.sleep(3)
+            await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
 
             # SCREEN 1: "Pick an account"
             page_source = self.driver.page_source.lower()
@@ -443,7 +458,7 @@ Write-Output "CONNECTED_SUCCESS"
                                 continue
 
                     if account_clicked:
-                        await asyncio.sleep(3)
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 except Exception as exc:
                     logger.warning("Account picker click attempt failed: %s", exc)
 
@@ -511,12 +526,12 @@ Write-Output "CONNECTED_SUCCESS"
                         email_input.send_keys(self.admin_email)
                         next_btn = self.driver.find_element(By.ID, "idSIButton9")
                         next_btn.click()
-                        await asyncio.sleep(3)
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 except Exception as exc:
                     logger.warning("Email entry step skipped: %s", exc)
 
             # SCREEN 3: "Are you trying to sign in to Microsoft Exchange..."
-            await asyncio.sleep(2)
+            await self._sleep_after_action(base_delay=2)
             page_source = self.driver.page_source.lower()
             if "are you trying to sign in" in page_source or "microsoft exchange" in page_source:
                 logger.info("Consent screen detected, clicking Continue...")
@@ -525,7 +540,7 @@ Write-Output "CONNECTED_SUCCESS"
                         EC.element_to_be_clickable((By.ID, "idSIButton9"))
                     )
                     continue_btn.click()
-                    await asyncio.sleep(3)
+                    await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 except Exception as e:
                     logger.warning("Continue button: %s", e)
 
@@ -541,7 +556,7 @@ Write-Output "CONNECTED_SUCCESS"
                     pwd_input.send_keys(self.admin_password)
                     submit_btn = self.driver.find_element(By.ID, "idSIButton9")
                     submit_btn.click()
-                    await asyncio.sleep(3)
+                    await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
                 except Exception:
                     pass
 
@@ -549,18 +564,18 @@ Write-Output "CONNECTED_SUCCESS"
             await self._handle_mfa()
 
             # SCREEN 6: "Stay signed in?"
-            await asyncio.sleep(2)
+            await self._sleep_after_action(base_delay=2)
             try:
                 page_source = self.driver.page_source.lower()
                 if "stay signed in" in page_source:
                     yes_btn = self.driver.find_element(By.ID, "idSIButton9")
                     yes_btn.click()
-                    await asyncio.sleep(2)
+                    await self._sleep_after_action(base_delay=2)
             except Exception:
                 pass
 
             # Check for success
-            await asyncio.sleep(3)
+            await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
             page_source = self.driver.page_source.lower()
             if (
                 "you have signed in" in page_source

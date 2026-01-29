@@ -30,6 +30,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException
 import pyotp
 
 from .browser import create_driver, take_screenshot, cleanup_driver
+from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,17 @@ class MicrosoftLoginAutomation:
         self.headless = headless
         self.driver: Optional[webdriver.Chrome] = None
         self.screenshots: list = []
+        settings = get_settings()
+        self._headless_delay_seconds = settings.headless_delay_seconds
+        self._headless_page_settle_seconds = settings.headless_page_settle_seconds
+
+    def _settle_after_action(self, base_delay: float = 0.5, extra_delay: float = 0.0) -> None:
+        """Allow the page to settle after an action; slower when headless."""
+        delay = base_delay
+        if self.headless:
+            delay = max(delay, self._headless_delay_seconds)
+            delay += extra_delay
+        time.sleep(delay)
     
     def _screenshot(self, name: str) -> str:
         """Take screenshot and track it."""
@@ -125,7 +137,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 5).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)  # Brief settle time
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         
@@ -203,9 +215,9 @@ class MicrosoftLoginAutomation:
             return False
         
         email_input.clear()
-        time.sleep(0.2)
+        self._settle_after_action(base_delay=0.2)
         email_input.send_keys(email)
-        time.sleep(0.3)
+        self._settle_after_action(base_delay=0.3)
         email_input.send_keys(Keys.RETURN)
         
         # Wait for page to transition
@@ -215,6 +227,7 @@ class MicrosoftLoginAutomation:
             )
         except:
             pass
+        self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         return True
     
     def handle_password(self, password: str) -> bool:
@@ -230,9 +243,9 @@ class MicrosoftLoginAutomation:
             return False
         
         pwd_input.clear()
-        time.sleep(0.2)
+        self._settle_after_action(base_delay=0.2)
         pwd_input.send_keys(password)
-        time.sleep(0.3)
+        self._settle_after_action(base_delay=0.3)
         pwd_input.send_keys(Keys.RETURN)
         
         # Wait for page to transition
@@ -242,6 +255,7 @@ class MicrosoftLoginAutomation:
             )
         except:
             pass
+        self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         return True
     
     def handle_password_change(self, current: str, new: str) -> bool:
@@ -257,7 +271,7 @@ class MicrosoftLoginAutomation:
         ], timeout=30)
         if curr_input:
             curr_input.clear()
-            time.sleep(0.2)
+            self._settle_after_action(base_delay=0.2)
             curr_input.send_keys(current)
         
         # New password
@@ -267,7 +281,7 @@ class MicrosoftLoginAutomation:
         ], timeout=30)
         if new_input:
             new_input.clear()
-            time.sleep(0.2)
+            self._settle_after_action(base_delay=0.2)
             new_input.send_keys(new)
         
         # Confirm password
@@ -277,9 +291,9 @@ class MicrosoftLoginAutomation:
         ], timeout=30)
         if confirm_input:
             confirm_input.clear()
-            time.sleep(0.2)
+            self._settle_after_action(base_delay=0.2)
             confirm_input.send_keys(new)
-            time.sleep(0.3)
+            self._settle_after_action(base_delay=0.3)
             confirm_input.send_keys(Keys.RETURN)
         else:
             self._click_if_exists([
@@ -294,6 +308,7 @@ class MicrosoftLoginAutomation:
             )
         except:
             pass
+        self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         return True
     
     def extract_totp_only(self) -> Optional[str]:
@@ -358,7 +373,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         self._screenshot("mfa_after_first_next")
@@ -401,7 +416,7 @@ class MicrosoftLoginAutomation:
                 WebDriverWait(self.driver, 30).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
             except:
                 pass
             self._screenshot("mfa_after_different_app_click")
@@ -416,7 +431,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         self._screenshot("mfa_after_second_next")
@@ -442,7 +457,7 @@ class MicrosoftLoginAutomation:
                     WebDriverWait(self.driver, 30).until(
                         lambda d: d.execute_script("return document.readyState") == "complete"
                     )
-                    time.sleep(0.5)
+                    self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
                 except:
                     pass
             else:
@@ -475,7 +490,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         self._screenshot("mfa_secret_page")
@@ -514,7 +529,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
 
@@ -534,10 +549,10 @@ class MicrosoftLoginAutomation:
 
         logger.info(f"[W{worker_id}] Found code input field")
         code_input.clear()
-        time.sleep(0.2)
+        self._settle_after_action(base_delay=0.2)
         code_input.send_keys(code)
         logger.info(f"[W{worker_id}]  Entered code: {code}")
-        time.sleep(0.3)
+        self._settle_after_action(base_delay=0.3)
 
         logger.info(f"[W{worker_id}] --- Clicking Verify/Next ---")
         verify_clicked = self._click_if_exists([
@@ -557,7 +572,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         logger.info(f"[W{worker_id}] After verify URL: {self.driver.current_url}")
@@ -578,7 +593,7 @@ class MicrosoftLoginAutomation:
                     WebDriverWait(self.driver, 30).until(
                         lambda d: d.execute_script("return document.readyState") == "complete"
                     )
-                    time.sleep(0.5)
+                    self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
                 except:
                     pass
 
@@ -620,9 +635,9 @@ class MicrosoftLoginAutomation:
         
         if code_input:
             code_input.clear()
-            time.sleep(0.2)
+            self._settle_after_action(base_delay=0.2)
             code_input.send_keys(code)
-            time.sleep(0.3)
+            self._settle_after_action(base_delay=0.3)
             
             self._click_if_exists([
                 (By.XPATH, "//button[contains(text(), 'Verify')]"),
@@ -634,7 +649,7 @@ class MicrosoftLoginAutomation:
                 WebDriverWait(self.driver, 30).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
             except:
                 pass
             return True
@@ -654,7 +669,7 @@ class MicrosoftLoginAutomation:
             WebDriverWait(self.driver, 30).until(
                 lambda d: d.execute_script("return document.readyState") == "complete"
             )
-            time.sleep(0.5)
+            self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
         except:
             pass
         return True
@@ -670,7 +685,7 @@ class MicrosoftLoginAutomation:
                 WebDriverWait(self.driver, 30).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
             except:
                 pass
             
@@ -705,7 +720,7 @@ class MicrosoftLoginAutomation:
                 WebDriverWait(self.driver, 30).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
             except:
                 pass
             self._screenshot("security_defaults_saved")
@@ -738,7 +753,7 @@ class MicrosoftLoginAutomation:
                 WebDriverWait(self.driver, 30).until(
                     lambda d: d.execute_script("return document.readyState") == "complete"
                 )
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
             except:
                 pass
             
@@ -782,12 +797,12 @@ class MicrosoftLoginAutomation:
                         WebDriverWait(self.driver, 5).until(
                             lambda d: d.execute_script("return document.readyState") == "complete"
                         )
-                        time.sleep(0.5)
+                        self._settle_after_action(base_delay=0.5, extra_delay=self._headless_page_settle_seconds)
                     except:
                         pass
                 
                 # Brief pause between state checks
-                time.sleep(0.5)
+                self._settle_after_action(base_delay=0.5)
             
             # Final check
             if self.detect_state() == LoginState.LOGGED_IN:
