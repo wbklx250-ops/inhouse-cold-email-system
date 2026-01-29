@@ -132,8 +132,8 @@ class GraphDeviceCodeAuth:
             # SCREEN 2: "Are you trying to sign in to..."
             await asyncio.sleep(2)
             page_source = self.driver.page_source.lower()
-            if "are you trying to sign in" in page_source or "permissions requested" in page_source:
-                logger.info("Consent screen detected, clicking Continue...")
+            if "are you trying to sign in" in page_source:
+                logger.info("Sign in confirmation detected, clicking Continue...")
                 try:
                     continue_btn = WebDriverWait(self.driver, 10).until(
                         EC.element_to_be_clickable((By.ID, "idSIButton9"))
@@ -143,7 +143,33 @@ class GraphDeviceCodeAuth:
                 except Exception as e:
                     logger.warning("Continue button: %s", e)
 
-            # SCREEN 3: Password entry (if session expired)
+            # SCREEN 3: "Permissions requested" - Consent
+            await asyncio.sleep(2)
+            page_source = self.driver.page_source.lower()
+
+            if "permissions requested" in page_source or "this app would like to" in page_source:
+                logger.info("Permissions consent screen detected, clicking Accept...")
+                try:
+                    # Check the "Consent on behalf of your organization" checkbox (optional but good)
+                    try:
+                        consent_checkbox = self.driver.find_element(By.ID, "consentCheckbox")
+                        if not consent_checkbox.is_selected():
+                            consent_checkbox.click()
+                            await asyncio.sleep(0.5)
+                    except Exception:
+                        pass
+
+                    # Click Accept button
+                    accept_btn = WebDriverWait(self.driver, 10).until(
+                        EC.element_to_be_clickable((By.ID, "idSIButton9"))
+                    )
+                    accept_btn.click()
+                    await asyncio.sleep(3)
+                    logger.info("Clicked Accept on permissions consent")
+                except Exception as e:
+                    logger.warning("Consent screen handling: %s", e)
+
+            # SCREEN 4: Password entry (if session expired)
             page_source = self.driver.page_source.lower()
             if "enter password" in page_source or "passwd" in self.driver.page_source:
                 logger.info("Password entry detected...")
@@ -159,10 +185,10 @@ class GraphDeviceCodeAuth:
                 except Exception:
                     pass
 
-            # SCREEN 4: MFA/TOTP
+            # SCREEN 5: MFA/TOTP
             await self._handle_mfa()
 
-            # SCREEN 5: "Stay signed in?"
+            # SCREEN 6: "Stay signed in?"
             await asyncio.sleep(2)
             try:
                 page_source = self.driver.page_source.lower()
@@ -244,6 +270,9 @@ async def set_passwords_via_graph(
 
     results = {"success": [], "failed": []}
 
+    logger.info("Waiting 90 seconds for Azure AD sync after UPN fix...")
+    await asyncio.sleep(90)
+
     headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
@@ -253,29 +282,41 @@ async def set_passwords_via_graph(
         for mb in mailboxes:
             email = mb["email"]
             password = mb["password"]
+            success = False
 
-            url = f"https://graph.microsoft.com/v1.0/users/{email}"
-            body = {
-                "passwordProfile": {
-                    "password": password,
-                    "forceChangePasswordNextSignIn": False,
-                },
-                "accountEnabled": True,
-            }
+            for attempt in range(3):
+                url = f"https://graph.microsoft.com/v1.0/users/{email}"
+                body = {
+                    "passwordProfile": {
+                        "password": password,
+                        "forceChangePasswordNextSignIn": False,
+                    },
+                    "accountEnabled": True,
+                }
 
-            try:
-                response = await client.patch(url, json=body, headers=headers)
+                try:
+                    response = await client.patch(url, json=body, headers=headers)
 
-                if response.status_code in [200, 204]:
-                    results["success"].append(email)
-                    logger.info("  ✓ Password set + enabled: %s", email)
-                else:
-                    results["failed"].append({"email": email, "error": response.text})
-                    logger.error("  ✗ Failed: %s - %s", email, response.status_code)
-            except Exception as e:
-                results["failed"].append({"email": email, "error": str(e)})
-                logger.error("  ✗ Failed: %s - %s", email, e)
+                    if response.status_code in [200, 204]:
+                        results["success"].append(email)
+                        logger.info("  ✓ Password set: %s", email)
+                        success = True
+                        break
+                    if response.status_code == 404 and attempt < 2:
+                        logger.warning("  Retry %s/3: %s not synced yet...", attempt + 1, email)
+                        await asyncio.sleep(30)
+                    else:
+                        results["failed"].append({"email": email, "error": response.text})
+                        logger.error("  ✗ Failed: %s - %s", email, response.status_code)
+                        break
+                except Exception as e:
+                    results["failed"].append({"email": email, "error": str(e)})
+                    logger.error("  ✗ Failed: %s - %s", email, e)
+                    break
 
-            await asyncio.sleep(0.2)  # Rate limiting
+            if not success and not any(entry.get("email") == email for entry in results["failed"]):
+                results["failed"].append({"email": email, "error": "failed"})
+
+            await asyncio.sleep(0.3)  # Rate limiting
 
     return results

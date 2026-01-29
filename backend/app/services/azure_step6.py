@@ -348,16 +348,28 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             .values(delegated=True)
                         )
 
+                    for email in ps_results.get("upns_fixed", []):
+                        await db.execute(
+                            update(Mailbox)
+                            .where(Mailbox.email == email)
+                            .values(upn_fixed=True)
+                        )
+
                     created_count = sum(
                         1 for mb in mailboxes if (mb.created_in_exchange or mb.email in ps_results["created"])
                     )
                     delegated_count = sum(
                         1 for mb in mailboxes if (mb.delegated or mb.email in ps_results["delegated"])
                     )
+                    upn_fixed_count = sum(
+                        1 for mb in mailboxes if (getattr(mb, "upn_fixed", False) or mb.email in ps_results.get("upns_fixed", []))
+                    )
                     tenant.step6_mailboxes_created = created_count
                     tenant.step6_display_names_fixed = created_count
                     tenant.step6_delegations_done = delegated_count
+                    tenant.step6_upns_fixed = upn_fixed_count
                     await db.commit()
+                    logger.info("[%s] PowerShell progress saved to database", tenant.custom_domain)
 
                     update_progress(
                         str(tenant.id),

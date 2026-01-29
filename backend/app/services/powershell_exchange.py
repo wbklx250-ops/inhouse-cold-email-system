@@ -2,8 +2,11 @@
 PowerShell Exchange Service - Uses device code auth with Selenium MFA handling.
 """
 
-import nest_asyncio
-nest_asyncio.apply()
+import os
+
+if os.environ.get("ENABLE_NEST_ASYNCIO") == "1":
+    import nest_asyncio
+    nest_asyncio.apply()
 
 import asyncio
 import subprocess
@@ -350,6 +353,7 @@ Write-Output "CONNECTED_SUCCESS"
             "created": [],
             "failed": [],
             "delegated": [],
+            "upns_fixed": [],
         }
 
         base_display_name = mailboxes[0].get("display_name", "User") if mailboxes else "User"
@@ -427,10 +431,35 @@ try {{
 
             await asyncio.sleep(0.2)
 
+        # STEP 4: Fix UPNs to match email addresses (critical for Graph API)
+        logger.info("Fixing UPNs to match email addresses...")
+        await asyncio.sleep(3)
+
+        for mb in mailboxes:
+            email = mb["email"]
+            upn_cmd = f'''
+try {{
+    Set-Mailbox -Identity "{email}" -MicrosoftOnlineServicesID "{email}" -ErrorAction Stop
+    Write-Output "UPNFIXED:{email}"
+}} catch {{
+    Write-Output "UPNFAILED:{email}:$($_.Exception.Message)"
+}}
+'''
+            output = await self._run_command(upn_cmd)
+
+            if output and f"UPNFIXED:{email}" in output:
+                results["upns_fixed"].append(email)
+                logger.info("  ✓ UPN fixed: %s", email)
+            else:
+                logger.warning("  ⚠ UPN fix issue: %s", email)
+
+            await asyncio.sleep(0.2)
+
         logger.info(
-            "PowerShell complete: %s created, %s delegated",
+            "PowerShell complete: %s created, %s delegated, %s UPNs fixed",
             len(results["created"]),
             len(results["delegated"]),
+            len(results["upns_fixed"]),
         )
         return results
 
