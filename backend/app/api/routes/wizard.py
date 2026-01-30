@@ -1775,7 +1775,13 @@ async def get_step5_batch_status(
     batch_id: UUID,
     db: AsyncSession = Depends(get_db)
 ):
-    """Get Step 5 status for all tenants in batch."""
+    """Get Step 5 status for all tenants in batch.
+    
+    Returns detailed status for each tenant including:
+    - domain_added, domain_verified, dns_configured, dkim_cnames_added, dkim_enabled
+    - step5_complete flag
+    - error messages
+    """
     result = await db.execute(
         select(Tenant).where(Tenant.batch_id == batch_id)
     )
@@ -1790,10 +1796,17 @@ async def get_step5_batch_status(
         "dkim_cnames_added": 0,
         "dkim_enabled": 0,
         "errored": 0,
+        "step5_complete_count": 0,  # NEW: Count step5_complete=True
         "tenants": []
     }
     
     for tenant in tenants:
+        # Log each tenant's raw DB values for debugging
+        logger.debug(
+            f"[{tenant.custom_domain}] DB values: dkim_enabled={tenant.dkim_enabled}, "
+            f"step5_complete={tenant.step5_complete}, domain_verified={tenant.domain_verified_in_m365}"
+        )
+        
         tenant_status = {
             "id": str(tenant.id),
             "name": tenant.name,
@@ -1804,15 +1817,21 @@ async def get_step5_batch_status(
             "dns_configured": tenant.mx_record_added and tenant.spf_record_added,
             "dkim_cnames_added": tenant.dkim_cnames_added,
             "dkim_enabled": tenant.dkim_enabled,
+            "step5_complete": tenant.step5_complete,  # NEW: Include step5_complete field
             "error": tenant.setup_error
         }
         summary["tenants"].append(tenant_status)
         
-        # Count statuses
-        if tenant.setup_error:
-            summary["errored"] += 1
-        elif tenant.dkim_enabled:
+        # Count step5_complete
+        if tenant.step5_complete:
+            summary["step5_complete_count"] += 1
+        
+        # Count statuses - prioritize dkim_enabled/step5_complete over errors
+        if tenant.dkim_enabled or tenant.step5_complete:
             summary["dkim_enabled"] += 1
+        elif tenant.setup_error and not tenant.dkim_cnames_added:
+            # Only count as error if not partially complete
+            summary["errored"] += 1
         elif tenant.dkim_cnames_added:
             summary["dkim_cnames_added"] += 1
         elif tenant.mx_record_added:
@@ -1827,7 +1846,158 @@ async def get_step5_batch_status(
     # Determine if ready to advance to Step 6
     summary["ready_for_step6"] = summary["dkim_enabled"] == summary["total"] and summary["total"] > 0
     
+    # Log summary for debugging
+    logger.info(
+        f"Step5 status for batch {batch_id}: "
+        f"dkim_enabled={summary['dkim_enabled']}/{summary['total']}, "
+        f"step5_complete_count={summary['step5_complete_count']}, "
+        f"errored={summary['errored']}"
+    )
+    
     return summary
+
+
+@router.post("/batches/{batch_id}/step5/mark-complete/{tenant_id}")
+async def mark_tenant_step5_complete(
+    batch_id: UUID,
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Manually mark a tenant's Step 5 as complete.
+    
+    Use this when:
+    - Selenium automation succeeded but DB update failed
+    - Manual setup was done outside the wizard
+    - Need to force-complete a stuck tenant
+    
+    This sets ALL Step 5 related fields to complete state.
+    """
+    tenant = await db.get(Tenant, tenant_id)
+    if not tenant:
+        raise HTTPException(status_code=404, detail="Tenant not found")
+    
+    if tenant.batch_id != batch_id:
+        raise HTTPException(status_code=400, detail="Tenant does not belong to this batch")
+    
+    domain = None
+    if tenant.domain_id:
+        domain = await db.get(Domain, tenant.domain_id)
+    
+    # Update all Step 5 fields
+    tenant.domain_added_to_m365 = True
+    tenant.domain_verified_in_m365 = True
+    tenant.domain_verified_at = tenant.domain_verified_at or datetime.utcnow()
+    tenant.mx_record_added = True
+    tenant.spf_record_added = True
+    tenant.autodiscover_added = True
+    tenant.dkim_cnames_added = True
+    tenant.dkim_enabled = True
+    tenant.dkim_enabled_at = tenant.dkim_enabled_at or datetime.utcnow()
+    tenant.status = TenantStatus.DKIM_ENABLED
+    tenant.setup_error = None
+    tenant.setup_step = "6"
+    tenant.step5_complete = True
+    tenant.step5_completed_at = tenant.step5_completed_at or datetime.utcnow()
+    
+    # Update domain if exists
+    if domain:
+        domain.status = DomainStatus.ACTIVE
+        domain.mx_configured = True
+        domain.spf_configured = True
+        domain.dns_records_created = True
+        domain.dkim_cnames_added = True
+        domain.dkim_enabled = True
+    
+    await db.commit()
+    
+    logger.info(f"Manually marked tenant {tenant.name} ({tenant.custom_domain}) Step 5 as complete")
+    
+    return {
+        "success": True,
+        "message": f"Marked {tenant.name} ({tenant.custom_domain}) as Step 5 complete",
+        "tenant_id": str(tenant_id),
+        "domain": tenant.custom_domain
+    }
+
+
+@router.post("/batches/{batch_id}/step5/mark-complete-bulk")
+async def mark_bulk_tenants_step5_complete(
+    batch_id: UUID,
+    domains: List[str] = None,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Bulk mark multiple tenants' Step 5 as complete.
+    
+    Args:
+        batch_id: Batch UUID
+        domains: List of domain names to mark complete (in request body as JSON)
+    
+    Example request body:
+        {"domains": ["domain1.com", "domain2.com"]}
+    """
+    if not domains:
+        raise HTTPException(status_code=400, detail="No domains provided")
+    
+    # Get tenants matching the domains in this batch
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.custom_domain.in_(domains)
+        )
+    )
+    tenants = result.scalars().all()
+    
+    if not tenants:
+        raise HTTPException(status_code=404, detail="No matching tenants found")
+    
+    updated_count = 0
+    updated_domains = []
+    
+    for tenant in tenants:
+        # Update all Step 5 fields
+        tenant.domain_added_to_m365 = True
+        tenant.domain_verified_in_m365 = True
+        tenant.domain_verified_at = tenant.domain_verified_at or datetime.utcnow()
+        tenant.mx_record_added = True
+        tenant.spf_record_added = True
+        tenant.autodiscover_added = True
+        tenant.dkim_cnames_added = True
+        tenant.dkim_enabled = True
+        tenant.dkim_enabled_at = tenant.dkim_enabled_at or datetime.utcnow()
+        tenant.status = TenantStatus.DKIM_ENABLED
+        tenant.setup_error = None
+        tenant.setup_step = "6"
+        tenant.step5_complete = True
+        tenant.step5_completed_at = tenant.step5_completed_at or datetime.utcnow()
+        
+        # Update domain if exists
+        if tenant.domain_id:
+            domain = await db.get(Domain, tenant.domain_id)
+            if domain:
+                domain.status = DomainStatus.ACTIVE
+                domain.mx_configured = True
+                domain.spf_configured = True
+                domain.dns_records_created = True
+                domain.dkim_cnames_added = True
+                domain.dkim_enabled = True
+        
+        updated_count += 1
+        updated_domains.append(tenant.custom_domain)
+    
+    await db.commit()
+    
+    logger.info(f"Bulk marked {updated_count} tenants Step 5 complete: {updated_domains}")
+    
+    return {
+        "success": True,
+        "message": f"Marked {updated_count} tenants as Step 5 complete",
+        "updated_count": updated_count,
+        "domains": updated_domains,
+        "requested": len(domains),
+        "not_found": len(domains) - updated_count
+    }
 
 
 @router.post("/batches/{batch_id}/step5/retry-dkim")

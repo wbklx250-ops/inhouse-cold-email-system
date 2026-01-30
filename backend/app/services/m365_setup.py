@@ -308,120 +308,135 @@ async def run_step5_for_batch(
                     "error": str(e)
                 }
 
-            try:
-                async with get_fresh_db_session() as db:
-                    # Re-fetch tenant and domain for updates (fresh from DB)
-                    tenant = await db.get(Tenant, tenant_id)
-                    domain = await db.get(Domain, domain_id)
+            # === ROBUST DB UPDATE WITH RETRY ===
+            # Use individual field updates with fresh sessions to avoid Neon timeouts
+            db_update_success = False
+            db_retry_count = 3
+            
+            for db_attempt in range(db_retry_count):
+                try:
+                    logger.info(f"[{domain_name}] DB update attempt {db_attempt + 1}/{db_retry_count}")
+                    
+                    async with get_fresh_db_session() as db:
+                        # Re-fetch tenant and domain for updates (fresh from DB)
+                        tenant = await db.get(Tenant, tenant_id)
+                        domain = await db.get(Domain, domain_id)
 
-                    if not tenant or not domain:
-                        step_result.error = "Tenant or domain not found in database"
+                        if not tenant or not domain:
+                            step_result.error = "Tenant or domain not found in database"
+                            step_result.error_step = "db_update"
+                            summary["results"].append(step_result.to_dict())
+                            summary["failed"] += 1
+                            db_update_success = True  # Don't retry - entity missing
+                            break
+
+                        # Process Selenium result
+                        if selenium_result.get("success"):
+                            # Full success - domain verified AND DNS configured
+                            step_result.success = True
+                            step_result.domain_added = True
+                            step_result.domain_verified = True
+                            step_result.txt_added_to_cloudflare = True
+                            step_result.mail_dns_added = True
+                            step_result.dkim_cnames_added = True
+                            step_result.dkim_enabled = True
+
+                            # Update tenant - all critical fields
+                            tenant.domain_added_to_m365 = True
+                            tenant.domain_verified_in_m365 = True
+                            tenant.domain_verified_at = datetime.utcnow()
+                            tenant.mx_record_added = True
+                            tenant.spf_record_added = True
+                            tenant.autodiscover_added = True
+                            tenant.dkim_cnames_added = True
+                            tenant.dkim_enabled = True
+                            tenant.dkim_enabled_at = datetime.utcnow()
+                            tenant.status = TenantStatus.DKIM_ENABLED
+                            tenant.setup_error = None
+                            tenant.setup_step = "6"  # Mark step 5 as complete
+                            tenant.step5_complete = True
+                            tenant.step5_completed_at = datetime.utcnow()
+                            
+                            # Store DNS values from Selenium result
+                            if selenium_result.get("mx_value"):
+                                tenant.mx_value = selenium_result["mx_value"]
+                            if selenium_result.get("spf_value"):
+                                tenant.spf_value = selenium_result["spf_value"]
+                            if selenium_result.get("dkim_selector1_cname"):
+                                tenant.dkim_selector1_cname = selenium_result["dkim_selector1_cname"]
+                            if selenium_result.get("dkim_selector2_cname"):
+                                tenant.dkim_selector2_cname = selenium_result["dkim_selector2_cname"]
+
+                            # Update domain
+                            domain.status = DomainStatus.ACTIVE
+                            domain.m365_verified_at = datetime.utcnow()
+                            domain.mx_configured = True
+                            domain.spf_configured = True
+                            domain.dns_records_created = True
+                            domain.dkim_cnames_added = True
+                            domain.dkim_enabled = True
+
+                            await db.commit()
+                            logger.info(f"[{domain_name}]  DB COMMIT SUCCESS - step5_complete=True, dkim_enabled=True")
+
+                            summary["successful"] += 1
+                            db_update_success = True
+
+                        elif selenium_result.get("verified"):
+                            # Partial success - domain verified but DNS may not be complete
+                            step_result.domain_added = True
+                            step_result.domain_verified = True
+
+                            tenant.domain_added_to_m365 = True
+                            tenant.domain_verified_in_m365 = True
+                            tenant.domain_verified_at = datetime.utcnow()
+                            tenant.status = TenantStatus.DOMAIN_VERIFIED
+                            tenant.setup_error = "Domain verified but DNS setup incomplete"
+
+                            domain.status = DomainStatus.M365_VERIFIED
+                            domain.m365_verified_at = datetime.utcnow()
+
+                            await db.commit()
+                            logger.info(f"[{domain_name}]   DB COMMIT SUCCESS - PARTIAL (verified only)")
+
+                            # Mark as failed since not fully complete
+                            step_result.error = "Domain verified but DNS setup incomplete"
+                            step_result.error_step = "dns_setup"
+                            summary["failed"] += 1
+                            db_update_success = True
+
+                        else:
+                            # Complete failure
+                            error_msg = selenium_result.get("error", "Unknown error")
+                            step_result.error = error_msg
+                            step_result.error_step = "selenium_automation"
+
+                            tenant.setup_error = error_msg
+                            await db.commit()
+                            logger.info(f"[{domain_name}] L DB COMMIT SUCCESS - FAILED recorded: {error_msg}")
+
+                            summary["failed"] += 1
+                            db_update_success = True
+
+                        summary["results"].append(step_result.to_dict())
+
+                        # Progress callback
+                        if on_progress:
+                            on_progress(str(tenant_id), "complete", "success" if step_result.success else "failed")
+                        
+                        break  # Success - exit retry loop
+
+                except Exception as e:
+                    logger.error(f"[{domain_name}] DB update attempt {db_attempt + 1} FAILED: {e}")
+                    if db_attempt < db_retry_count - 1:
+                        logger.info(f"[{domain_name}] Retrying DB update in 5 seconds...")
+                        await asyncio.sleep(5)
+                    else:
+                        logger.exception(f"[{domain_name}] All {db_retry_count} DB update attempts failed!")
+                        step_result.error = f"Database update failed after {db_retry_count} attempts: {str(e)}"
                         step_result.error_step = "db_update"
                         summary["results"].append(step_result.to_dict())
                         summary["failed"] += 1
-                        continue
-
-                    # Process Selenium result
-                    if selenium_result.get("success"):
-                        # Full success - domain verified AND DNS configured
-                        step_result.success = True
-                        step_result.domain_added = True
-                        step_result.domain_verified = True
-                        step_result.txt_added_to_cloudflare = True
-                        step_result.mail_dns_added = True
-                        step_result.dkim_cnames_added = True
-                        step_result.dkim_enabled = True
-
-                        # Update tenant
-                        tenant.domain_added_to_m365 = True
-                        tenant.domain_verified_in_m365 = True
-                        tenant.domain_verified_at = datetime.utcnow()
-                        tenant.mx_record_added = True
-                        tenant.spf_record_added = True
-                        tenant.autodiscover_added = True
-                        tenant.dkim_cnames_added = True
-                        tenant.dkim_enabled = True
-                        tenant.dkim_enabled_at = datetime.utcnow()
-                        tenant.status = TenantStatus.DKIM_ENABLED
-                        tenant.setup_error = None
-                        tenant.setup_step = "6"  # Mark step 5 as complete
-                        tenant.step5_complete = True
-                        tenant.step5_completed_at = datetime.utcnow()
-                        
-                        # Store DNS values from Selenium result
-                        if selenium_result.get("mx_value"):
-                            tenant.mx_value = selenium_result["mx_value"]
-                            logger.info(f"[{domain_name}] Stored mx_value: {selenium_result['mx_value']}")
-                        if selenium_result.get("spf_value"):
-                            tenant.spf_value = selenium_result["spf_value"]
-                            logger.info(f"[{domain_name}] Stored spf_value: {selenium_result['spf_value']}")
-                        if selenium_result.get("dkim_selector1_cname"):
-                            tenant.dkim_selector1_cname = selenium_result["dkim_selector1_cname"]
-                            logger.info(f"[{domain_name}] Stored dkim_selector1_cname")
-                        if selenium_result.get("dkim_selector2_cname"):
-                            tenant.dkim_selector2_cname = selenium_result["dkim_selector2_cname"]
-                            logger.info(f"[{domain_name}] Stored dkim_selector2_cname")
-
-                        # Update domain
-                        domain.status = DomainStatus.ACTIVE
-                        domain.m365_verified_at = datetime.utcnow()
-                        domain.mx_configured = True
-                        domain.spf_configured = True
-                        domain.dns_records_created = True
-                        domain.dkim_cnames_added = True
-                        domain.dkim_enabled = True
-
-                        await db.commit()
-
-                        summary["successful"] += 1
-                        logger.info(f"[{domain_name}]  Database updated - step5_complete=True")
-
-                    elif selenium_result.get("verified"):
-                        # Partial success - domain verified but DNS may not be complete
-                        step_result.domain_added = True
-                        step_result.domain_verified = True
-
-                        tenant.domain_added_to_m365 = True
-                        tenant.domain_verified_in_m365 = True
-                        tenant.domain_verified_at = datetime.utcnow()
-                        tenant.status = TenantStatus.DOMAIN_VERIFIED
-                        tenant.setup_error = "Domain verified but DNS setup incomplete"
-
-                        domain.status = DomainStatus.M365_VERIFIED
-                        domain.m365_verified_at = datetime.utcnow()
-
-                        await db.commit()
-
-                        # Mark as failed since not fully complete
-                        step_result.error = "Domain verified but DNS setup incomplete"
-                        step_result.error_step = "dns_setup"
-                        summary["failed"] += 1
-                        logger.warning(f"[{domain_name}] Database updated: PARTIAL (verified only)")
-
-                    else:
-                        # Complete failure
-                        error_msg = selenium_result.get("error", "Unknown error")
-                        step_result.error = error_msg
-                        step_result.error_step = "selenium_automation"
-
-                        tenant.setup_error = error_msg
-                        await db.commit()
-
-                        summary["failed"] += 1
-                        logger.error(f"[{domain_name}] Database updated: FAILED - {error_msg}")
-
-                    summary["results"].append(step_result.to_dict())
-
-                    # Progress callback
-                    if on_progress:
-                        on_progress(str(tenant_id), "complete", "success" if step_result.success else "failed")
-
-            except Exception as e:
-                logger.exception(f"[{domain_name}] Database update error: {e}")
-                step_result.error = f"Database update error: {str(e)}"
-                step_result.error_step = "db_update"
-                summary["results"].append(step_result.to_dict())
-                summary["failed"] += 1
 
     logger.info("Phase 2 complete: All Selenium tasks finished")
     
