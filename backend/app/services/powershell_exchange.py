@@ -531,18 +531,65 @@ Write-Output "CONNECTED_SUCCESS"
                     logger.warning("Email entry step skipped: %s", exc)
 
             # SCREEN 3: "Are you trying to sign in to Microsoft Exchange..."
-            await self._sleep_after_action(base_delay=2)
-            page_source = self.driver.page_source.lower()
-            if "are you trying to sign in" in page_source or "microsoft exchange" in page_source:
-                logger.info("Consent screen detected, clicking Continue...")
-                try:
-                    continue_btn = WebDriverWait(self.driver, 10).until(
-                        EC.element_to_be_clickable((By.ID, "idSIButton9"))
-                    )
-                    continue_btn.click()
-                    await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
-                except Exception as e:
-                    logger.warning("Continue button: %s", e)
+            # CRITICAL FIX: Wait for account picker to be gone before checking consent screen
+            # The Pick an Account page contains "Microsoft Exchange REST API Based Powershell"
+            # which was falsely triggering consent screen detection
+            max_consent_wait_attempts = 10
+            consent_screen_found = False
+            
+            for consent_attempt in range(max_consent_wait_attempts):
+                await self._sleep_after_action(base_delay=2, extra_delay=self._headless_page_settle_seconds)
+                page_source = self.driver.page_source.lower()
+                
+                # First check if we're still on account picker - if so, wait
+                if "pick an account" in page_source or "choose an account" in page_source:
+                    logger.warning("Still on account picker (attempt %s/%s), waiting...", 
+                                   consent_attempt + 1, max_consent_wait_attempts)
+                    
+                    # Try clicking account again if we're stuck
+                    if consent_attempt >= 2:
+                        logger.info("Retrying account selection...")
+                        try:
+                            # Try to find and click an account tile
+                            account_tiles = self.driver.find_elements(By.CSS_SELECTOR, 
+                                "#tilesHolder div[role='button'], div.table, div.tile")
+                            for tile in account_tiles:
+                                try:
+                                    text = (tile.text or "").lower()
+                                    if "use another account" in text or not text.strip():
+                                        continue
+                                    if "@" in text or "signed in" in text:
+                                        self.driver.execute_script("arguments[0].click();", tile)
+                                        logger.info("Retried clicking account tile: %s", text[:30])
+                                        break
+                                except Exception:
+                                    continue
+                        except Exception as e:
+                            logger.warning("Retry account click failed: %s", e)
+                    continue
+                
+                # Now check for actual consent screen (not account picker)
+                # Use more specific check - "are you trying to sign in" is unique to consent screen
+                if "are you trying to sign in" in page_source:
+                    consent_screen_found = True
+                    logger.info("Consent screen detected (attempt %s), clicking Continue...", consent_attempt + 1)
+                    try:
+                        continue_btn = WebDriverWait(self.driver, 10).until(
+                            EC.element_to_be_clickable((By.ID, "idSIButton9"))
+                        )
+                        continue_btn.click()
+                        await self._sleep_after_action(base_delay=3, extra_delay=self._headless_page_settle_seconds)
+                    except Exception as e:
+                        logger.warning("Continue button: %s", e)
+                    break
+                
+                # If we're past account picker but not on consent screen, we may have succeeded
+                if consent_attempt > 0:
+                    logger.info("Not on account picker or consent screen, proceeding...")
+                    break
+            
+            if not consent_screen_found:
+                logger.info("Consent screen not encountered, checking for password/MFA screens...")
 
             # SCREEN 4: Password entry (if session expired)
             page_source = self.driver.page_source.lower()

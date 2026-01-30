@@ -162,8 +162,65 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             update_progress(str(tenant.id), "complete", "complete", "Step 6 already complete")
             return {"success": True, "skipped": True}
 
-        needs_powershell = not (tenant.step6_mailboxes_created and tenant.step6_delegations_done)
-        needs_admin_ui = not tenant.step6_passwords_set
+        # RETRY FIX: Clear previous error on retry start
+        if tenant.step6_error:
+            logger.info("[%s] Clearing previous error for retry: %s", tenant.custom_domain, tenant.step6_error)
+            tenant.step6_error = None
+            await db.commit()
+
+        # CRITICAL FIX: Check ACTUAL mailbox state in DB, not just counter fields
+        # Counter fields can be stale from previous partial runs
+        mailbox_count_result = await db.execute(
+            select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+        )
+        total_mailbox_count = mailbox_count_result.scalar() or 0
+        
+        created_count_result = await db.execute(
+            select(func.count(Mailbox.id)).where(
+                Mailbox.tenant_id == tenant.id,
+                Mailbox.created_in_exchange == True,
+            )
+        )
+        actual_created_count = created_count_result.scalar() or 0
+        
+        delegated_count_result = await db.execute(
+            select(func.count(Mailbox.id)).where(
+                Mailbox.tenant_id == tenant.id,
+                Mailbox.delegated == True,
+            )
+        )
+        actual_delegated_count = delegated_count_result.scalar() or 0
+        
+        password_set_count_result = await db.execute(
+            select(func.count(Mailbox.id)).where(
+                Mailbox.tenant_id == tenant.id,
+                Mailbox.password_set == True,
+            )
+        )
+        actual_password_set_count = password_set_count_result.scalar() or 0
+        
+        # Determine what needs to run based on actual mailbox state
+        # PowerShell is needed if we don't have 90%+ created AND delegated
+        completion_threshold = 0.9
+        if total_mailbox_count > 0:
+            powershell_done = (
+                actual_created_count >= total_mailbox_count * completion_threshold and 
+                actual_delegated_count >= total_mailbox_count * completion_threshold
+            )
+            admin_ui_done = actual_password_set_count >= total_mailbox_count * completion_threshold
+        else:
+            # No mailboxes yet - need to create them
+            powershell_done = False
+            admin_ui_done = False
+        
+        needs_powershell = not powershell_done
+        needs_admin_ui = not admin_ui_done
+        
+        logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
+                    tenant.custom_domain, total_mailbox_count, actual_created_count, 
+                    actual_delegated_count, actual_password_set_count)
+        logger.info("[%s] needs_powershell=%s, needs_admin_ui=%s", 
+                    tenant.custom_domain, needs_powershell, needs_admin_ui)
 
         if needs_powershell:
             logger.info("[%s] RUNNING PowerShell...", tenant.custom_domain)
@@ -200,17 +257,65 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             if tenant.batch_id:
                 batch = await db.get(SetupBatch, tenant.batch_id)
 
-            # Step 1: Selenium login to Admin Portal
-            update_progress(str(tenant.id), "login", "in_progress", "Logging into M365 Admin Portal...")
-            driver = create_driver(headless=False)
-            _login_with_mfa(
-                driver=driver,
-                admin_email=tenant.admin_email,
-                admin_password=tenant.admin_password,
-                totp_secret=tenant.totp_secret,
-                domain=tenant.custom_domain,
-            )
-            update_progress(str(tenant.id), "login", "complete", "Logged in successfully")
+            # BROWSER RETRY LOGIC: Handle browser crashes with retry
+            MAX_BROWSER_RETRIES = 2
+            browser_retry_count = 0
+            login_successful = False
+            
+            while browser_retry_count < MAX_BROWSER_RETRIES and not login_successful:
+                try:
+                    browser_retry_count += 1
+                    # Step 1: Selenium login to Admin Portal
+                    update_progress(str(tenant.id), "login", "in_progress", 
+                        f"Logging into M365 Admin Portal... (attempt {browser_retry_count}/{MAX_BROWSER_RETRIES})")
+                    
+                    # Clean up any existing driver before creating new one
+                    if driver:
+                        try:
+                            cleanup_driver(driver)
+                        except Exception:
+                            pass
+                        driver = None
+                    
+                    driver = create_driver(headless=False)
+                    _login_with_mfa(
+                        driver=driver,
+                        admin_email=tenant.admin_email,
+                        admin_password=tenant.admin_password,
+                        totp_secret=tenant.totp_secret,
+                        domain=tenant.custom_domain,
+                    )
+                    login_successful = True
+                    update_progress(str(tenant.id), "login", "complete", "Logged in successfully")
+                    
+                except Exception as browser_error:
+                    error_str = str(browser_error)
+                    is_connection_error = (
+                        "HTTPConnectionPool" in error_str or 
+                        "NewConnectionError" in error_str or
+                        "target machine actively refused" in error_str or
+                        "session" in error_str.lower() and "delete" in error_str.lower()
+                    )
+                    
+                    if is_connection_error and browser_retry_count < MAX_BROWSER_RETRIES:
+                        logger.warning(
+                            "[%s] Browser connection error (attempt %s/%s): %s - retrying in 5 seconds...",
+                            tenant.custom_domain, browser_retry_count, MAX_BROWSER_RETRIES, error_str[:100]
+                        )
+                        # Clean up crashed driver
+                        if driver:
+                            try:
+                                cleanup_driver(driver)
+                            except Exception:
+                                pass
+                            driver = None
+                        await asyncio.sleep(5)
+                    else:
+                        # Not a connection error or out of retries
+                        raise
+            
+            if not login_successful:
+                raise Exception(f"Failed to login after {MAX_BROWSER_RETRIES} attempts")
 
             # Step 2 + 3: Selenium create licensed user + assign license
             update_progress(
@@ -500,10 +605,36 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             tenant.step6_upns_fixed,
                         )
 
-                        powershell_succeeded = (
-                            len(ps_results.get("created", [])) > 0
-                            or (tenant.step6_mailboxes_created and tenant.step6_delegations_done)
-                        )
+                        # FIXED: Check actual DB state instead of ps_results["created"] count
+                        # This ensures Phase 2 runs even if mailboxes were created in a previous run
+                        async with SessionLocal() as check_db:
+                            ps_created_count = await check_db.scalar(
+                                select(func.count(Mailbox.id)).where(
+                                    Mailbox.tenant_id == tenant.id,
+                                    Mailbox.created_in_exchange == True,
+                                )
+                            ) or 0
+                            ps_delegated_count = await check_db.scalar(
+                                select(func.count(Mailbox.id)).where(
+                                    Mailbox.tenant_id == tenant.id,
+                                    Mailbox.delegated == True,
+                                )
+                            ) or 0
+                            
+                            ps_threshold = len(mailboxes) * 0.9
+                            powershell_succeeded = (
+                                ps_created_count >= ps_threshold and 
+                                ps_delegated_count >= ps_threshold
+                            )
+                            logger.info(
+                                "[%s] PowerShell phase check: created=%s, delegated=%s, threshold=%s, succeeded=%s",
+                                tenant.custom_domain,
+                                ps_created_count,
+                                ps_delegated_count,
+                                ps_threshold,
+                                powershell_succeeded,
+                            )
+                        
                         logger.info(
                             "[%s] === PHASE 1: PowerShell DONE (success=%s) ===",
                             tenant.custom_domain,
@@ -569,11 +700,61 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             "Setting passwords via Admin UI",
                         )
 
-                        admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
-                            password="#Sendemails1",
-                            exclude_users=[f"me1@{tenant.custom_domain}"],
-                            expected_count=len(mailboxes),
-                        )
+                        # BROWSER RETRY LOGIC for Admin UI phase
+                        admin_ui_results = None
+                        admin_ui_retry_count = 0
+                        MAX_ADMIN_UI_RETRIES = 2
+                        
+                        while admin_ui_retry_count < MAX_ADMIN_UI_RETRIES and admin_ui_results is None:
+                            try:
+                                admin_ui_retry_count += 1
+                                if admin_ui_retry_count > 1:
+                                    update_progress(str(tenant.id), "set_passwords", "in_progress", 
+                                        f"Retrying Admin UI (attempt {admin_ui_retry_count}/{MAX_ADMIN_UI_RETRIES})")
+                                    
+                                    # Recreate browser if crashed
+                                    if driver:
+                                        try:
+                                            cleanup_driver(driver)
+                                        except Exception:
+                                            pass
+                                        driver = None
+                                    
+                                    driver = create_driver(headless=False)
+                                    _login_with_mfa(
+                                        driver=driver,
+                                        admin_email=tenant.admin_email,
+                                        admin_password=tenant.admin_password,
+                                        totp_secret=tenant.totp_secret,
+                                        domain=tenant.custom_domain,
+                                    )
+                                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
+                                
+                                admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
+                                    password="#Sendemails1",
+                                    exclude_users=[f"me1@{tenant.custom_domain}"],
+                                    expected_count=len(mailboxes),
+                                )
+                            except Exception as admin_ui_error:
+                                error_str = str(admin_ui_error)
+                                is_connection_error = (
+                                    "HTTPConnectionPool" in error_str or 
+                                    "NewConnectionError" in error_str or
+                                    "target machine actively refused" in error_str or
+                                    "session" in error_str.lower() and "delete" in error_str.lower()
+                                )
+                                
+                                if is_connection_error and admin_ui_retry_count < MAX_ADMIN_UI_RETRIES:
+                                    logger.warning(
+                                        "[%s] Admin UI browser error (attempt %s/%s): %s - retrying...",
+                                        tenant.custom_domain, admin_ui_retry_count, MAX_ADMIN_UI_RETRIES, error_str[:100]
+                                    )
+                                    await asyncio.sleep(5)
+                                else:
+                                    raise
+                        
+                        if admin_ui_results is None:
+                            raise Exception(f"Admin UI failed after {MAX_ADMIN_UI_RETRIES} attempts")
 
                         if admin_ui_results.get("errors"):
                             logger.warning(
@@ -597,20 +778,35 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                 tenant_to_update.step6_passwords_set = password_set_count
                                 tenant_to_update.step6_accounts_enabled = accounts_enabled_count
 
-                            await fresh_db.execute(
-                                update(Mailbox)
-                                .where(Mailbox.tenant_id == tenant.id)
-                                .values(
-                                    password_set=True,
-                                    account_enabled=True,
+                            # CRITICAL FIX: Only mark mailboxes as done if passwords were actually set
+                            # Previously this blindly marked ALL mailboxes as done even with 0 passwords
+                            if password_set_count > 0:
+                                logger.info(
+                                    "[%s] Marking %s mailboxes as password_set=True",
+                                    tenant.custom_domain,
+                                    password_set_count,
                                 )
-                            )
+                                await fresh_db.execute(
+                                    update(Mailbox)
+                                    .where(Mailbox.tenant_id == tenant.id)
+                                    .values(
+                                        password_set=True,
+                                        account_enabled=True,
+                                    )
+                                )
+                            else:
+                                logger.warning(
+                                    "[%s] NOT marking mailboxes - passwords_set=0, accounts_enabled=%s",
+                                    tenant.custom_domain,
+                                    accounts_enabled_count,
+                                )
 
                             await fresh_db.commit()
                         logger.info(
-                            "[%s] Admin UI progress saved: passwords_set=%s",
+                            "[%s] Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
                             tenant.custom_domain,
                             password_set_count,
+                            accounts_enabled_count,
                         )
                         logger.info(
                             "[%s] === PHASE 2: Admin UI DONE ===",
@@ -625,6 +821,9 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
 
             # ========================================
             # Completion check (use DB mailbox state to avoid stale counts)
+            step6_actually_complete = False
+            missing_items = []
+            
             async with SessionLocal() as fresh_db:
                 total_mailboxes = await fresh_db.scalar(
                     select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
@@ -651,30 +850,53 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                 tenant_to_update = await fresh_db.get(Tenant, tenant.id)
                 if tenant_to_update:
                     tenant_to_update.step6_mailboxes_created = max(
-                        tenant_to_update.step6_mailboxes_created,
+                        tenant_to_update.step6_mailboxes_created or 0,
                         created_count,
                     )
                     tenant_to_update.step6_delegations_done = max(
-                        tenant_to_update.step6_delegations_done,
+                        tenant_to_update.step6_delegations_done or 0,
                         delegated_count,
                     )
                     tenant_to_update.step6_passwords_set = max(
-                        tenant_to_update.step6_passwords_set,
+                        tenant_to_update.step6_passwords_set or 0,
                         passwords_set_count,
                     )
 
+                    # CRITICAL FIX: Require BOTH delegation AND passwords for completion
+                    # Previously used OR which allowed marking complete with just delegations
                     completion_threshold = 0.9
                     if total_mailboxes > 0:
                         has_mailboxes = created_count >= total_mailboxes * completion_threshold
-                        has_access = (
-                            delegated_count >= total_mailboxes * completion_threshold
-                            or passwords_set_count >= total_mailboxes * completion_threshold
+                        has_delegation = delegated_count >= total_mailboxes * completion_threshold
+                        has_passwords = passwords_set_count >= total_mailboxes * completion_threshold
+                        
+                        logger.info(
+                            "[%s] Completion check: mailboxes=%s/%s, delegated=%s/%s, passwords=%s/%s (threshold=%s)",
+                            tenant.custom_domain,
+                            created_count, total_mailboxes,
+                            delegated_count, total_mailboxes,
+                            passwords_set_count, total_mailboxes,
+                            completion_threshold,
                         )
-                        if has_mailboxes and has_access:
+                        
+                        # MUST have mailboxes AND delegation AND passwords
+                        if has_mailboxes and has_delegation and has_passwords:
                             tenant_to_update.step6_complete = True
                             tenant_to_update.step6_completed_at = datetime.utcnow()
                             tenant_to_update.status = TenantStatus.READY
                             tenant_to_update.step6_error = None
+                            step6_actually_complete = True
+                            logger.info("[%s] All criteria met - marking Step 6 COMPLETE", tenant.custom_domain)
+                        else:
+                            if not has_mailboxes:
+                                missing_items.append(f"mailboxes ({created_count}/{total_mailboxes})")
+                            if not has_delegation:
+                                missing_items.append(f"delegation ({delegated_count}/{total_mailboxes})")
+                            if not has_passwords:
+                                missing_items.append(f"passwords ({passwords_set_count}/{total_mailboxes})")
+                            error_msg = f"Incomplete - missing: {', '.join(missing_items)}"
+                            tenant_to_update.step6_error = error_msg
+                            logger.warning("[%s] NOT marking complete - missing: %s", tenant.custom_domain, ", ".join(missing_items))
 
                     await fresh_db.commit()
 
@@ -685,8 +907,14 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                         tenant.custom_domain,
                     )
 
-            update_progress(str(tenant.id), "complete", "complete", "Step 6 complete!")
-            return {"success": True}
+            # CRITICAL FIX: Only report success if step 6 actually completed
+            if step6_actually_complete:
+                update_progress(str(tenant.id), "complete", "complete", "Step 6 complete!")
+                return {"success": True}
+            else:
+                error_detail = f"Step 6 incomplete - missing: {', '.join(missing_items)}" if missing_items else "Step 6 incomplete"
+                update_progress(str(tenant.id), "incomplete", "failed", error_detail)
+                return {"success": False, "error": error_detail}
         except Exception as exc:
             message = str(exc)
             logger.error("[%s] Step 6 failed: %s", tenant.custom_domain, message)

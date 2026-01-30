@@ -1609,7 +1609,9 @@ async def get_step5_automation_status(batch_id: UUID, db: AsyncSession = Depends
     active_count = 0
     
     for tenant in tenants:
-        domain = tenant.custom_domain
+        # CRITICAL FIX: Use same domain lookup as m365_setup.py uses when writing progress
+        # m365_setup.py uses: domain_name = tenant.custom_domain or tenant.name
+        domain = tenant.custom_domain or tenant.name
         if domain:
             progress = live_progress.get(domain, {})
             is_active = bool(progress) and progress.get("status") == "in_progress"
@@ -1801,16 +1803,19 @@ async def get_step5_batch_status(
     }
     
     for tenant in tenants:
+        # CRITICAL FIX: Use same domain lookup as m365_setup.py for consistency
+        domain_name = tenant.custom_domain or tenant.name
+        
         # Log each tenant's raw DB values for debugging
         logger.debug(
-            f"[{tenant.custom_domain}] DB values: dkim_enabled={tenant.dkim_enabled}, "
+            f"[{domain_name}] DB values: dkim_enabled={tenant.dkim_enabled}, "
             f"step5_complete={tenant.step5_complete}, domain_verified={tenant.domain_verified_in_m365}"
         )
         
         tenant_status = {
             "id": str(tenant.id),
             "name": tenant.name,
-            "domain": tenant.custom_domain,
+            "domain": domain_name,  # Use resolved domain name
             "status": tenant.status.value,
             "domain_added": tenant.domain_added_to_m365,
             "domain_verified": tenant.domain_verified_in_m365,
