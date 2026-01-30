@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     # False = visible browsers (useful for debugging/testing)
     # True = headless mode (faster, no GUI, REQUIRED for production/Railway - no display available!)
     step5_headless: bool = True
+    
+    # Step 6 Browser Display Mode (Mailbox creation via Selenium + PowerShell)
+    # False = visible browsers (useful for debugging/testing)
+    # True = headless mode (REQUIRED for production/Railway - no display available!)
+    step6_headless: bool = True
 
     # Headless stability delays (seconds)
     # Increase in headless to avoid racing Microsoft login screens

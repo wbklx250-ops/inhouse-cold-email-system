@@ -24,6 +24,7 @@ from uuid import UUID
 
 from sqlalchemy import select, update, func
 
+from app.core.config import get_settings
 from app.db.session import SessionLocal, async_session_factory
 from app.models.batch import SetupBatch
 from app.models.mailbox import Mailbox, MailboxStatus
@@ -252,6 +253,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
 
         driver = None
         ps_service = None
+        settings = get_settings()
         try:
             batch = None
             if tenant.batch_id:
@@ -277,7 +279,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             pass
                         driver = None
                     
-                    driver = create_driver(headless=False)
+                    driver = create_driver(headless=settings.step6_headless)
                     _login_with_mfa(
                         driver=driver,
                         admin_email=tenant.admin_email,
@@ -720,7 +722,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                             pass
                                         driver = None
                                     
-                                    driver = create_driver(headless=False)
+                                    driver = create_driver(headless=settings.step6_headless)
                                     _login_with_mfa(
                                         driver=driver,
                                         admin_email=tenant.admin_email,
