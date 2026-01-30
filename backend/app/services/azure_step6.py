@@ -784,7 +784,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             # Previously this blindly marked ALL mailboxes as done even with 0 passwords
                             if password_set_count > 0:
                                 logger.info(
-                                    "[%s] Marking %s mailboxes as password_set=True",
+                                    "[%s] Marking %s mailboxes as password_set=True and updating password to #Sendemails1",
                                     tenant.custom_domain,
                                     password_set_count,
                                 )
@@ -794,6 +794,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                     .values(
                                         password_set=True,
                                         account_enabled=True,
+                                        password="#Sendemails1",  # Update to actual password that was set via bulk reset
                                     )
                                 )
                             else:
