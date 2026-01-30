@@ -347,6 +347,20 @@ async def run_step5_for_batch(
                         tenant.setup_step = "6"  # Mark step 5 as complete
                         tenant.step5_complete = True
                         tenant.step5_completed_at = datetime.utcnow()
+                        
+                        # Store DNS values from Selenium result
+                        if selenium_result.get("mx_value"):
+                            tenant.mx_value = selenium_result["mx_value"]
+                            logger.info(f"[{domain_name}] Stored mx_value: {selenium_result['mx_value']}")
+                        if selenium_result.get("spf_value"):
+                            tenant.spf_value = selenium_result["spf_value"]
+                            logger.info(f"[{domain_name}] Stored spf_value: {selenium_result['spf_value']}")
+                        if selenium_result.get("dkim_selector1_cname"):
+                            tenant.dkim_selector1_cname = selenium_result["dkim_selector1_cname"]
+                            logger.info(f"[{domain_name}] Stored dkim_selector1_cname")
+                        if selenium_result.get("dkim_selector2_cname"):
+                            tenant.dkim_selector2_cname = selenium_result["dkim_selector2_cname"]
+                            logger.info(f"[{domain_name}] Stored dkim_selector2_cname")
 
                         # Update domain
                         domain.status = DomainStatus.ACTIVE
@@ -512,6 +526,18 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
         tenant.dkim_enabled_at = datetime.utcnow()
         tenant.status = TenantStatus.DKIM_ENABLED
         tenant.setup_error = None
+        tenant.step5_complete = True
+        tenant.step5_completed_at = datetime.utcnow()
+        
+        # Store DNS values from Selenium result
+        if selenium_result.get("mx_value"):
+            tenant.mx_value = selenium_result["mx_value"]
+        if selenium_result.get("spf_value"):
+            tenant.spf_value = selenium_result["spf_value"]
+        if selenium_result.get("dkim_selector1_cname"):
+            tenant.dkim_selector1_cname = selenium_result["dkim_selector1_cname"]
+        if selenium_result.get("dkim_selector2_cname"):
+            tenant.dkim_selector2_cname = selenium_result["dkim_selector2_cname"]
         
         domain.status = DomainStatus.ACTIVE
         domain.m365_verified_at = datetime.utcnow()

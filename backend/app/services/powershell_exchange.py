@@ -1297,16 +1297,56 @@ try {{
         return results
 
     async def disconnect(self):
-        """Disconnect from Exchange Online and cleanup."""
+        """Disconnect from Exchange Online and cleanup PowerShell processes."""
+        import subprocess
+        import platform
 
         if self.ps_process:
             try:
-                self.ps_process.stdin.write("Disconnect-ExchangeOnline -Confirm:$false\nexit\n")
+                # Try graceful disconnect
+                self.ps_process.stdin.write("Disconnect-ExchangeOnline -Confirm:$false\n")
+                self.ps_process.stdin.write("Disconnect-MgGraph -ErrorAction SilentlyContinue\n")
+                self.ps_process.stdin.write("exit\n")
                 self.ps_process.stdin.flush()
                 self.ps_process.wait(timeout=10)
-            except Exception:
-                self.ps_process.kill()
+            except Exception as e:
+                logger.warning("Graceful PowerShell disconnect failed: %s", e)
+                try:
+                    self.ps_process.kill()
+                except Exception:
+                    pass
 
             self.ps_process = None
             self.connected = False
             logger.info("Disconnected from Exchange Online")
+
+        # Force kill orphaned PowerShell processes on Windows
+        if platform.system() == "Windows":
+            try:
+                # Kill any orphaned pwsh processes that might be stuck
+                # Only kill processes related to our Exchange module operations
+                result = subprocess.run(
+                    ["wmic", "process", "where", "name='pwsh.exe'", "get", "commandline,processid"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                for line in result.stdout.split('\n'):
+                    if 'ExchangeOnlineManagement' in line or 'Microsoft.Graph' in line:
+                        parts = line.strip().split()
+                        if parts:
+                            try:
+                                pid = parts[-1]
+                                subprocess.run(
+                                    ["taskkill", "/F", "/PID", pid],
+                                    capture_output=True,
+                                    timeout=5
+                                )
+                                logger.debug("Killed orphaned pwsh process: %s", pid)
+                            except Exception:
+                                pass
+            except Exception as e:
+                logger.debug("PowerShell cleanup: %s", e)
+        
+        # Small delay to ensure cleanup completes
+        await asyncio.sleep(2)

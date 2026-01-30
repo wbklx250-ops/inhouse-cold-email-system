@@ -60,11 +60,63 @@ def create_driver(headless: bool = True) -> webdriver.Chrome:
 
 
 def cleanup_driver(driver: webdriver.Chrome) -> None:
-    """Close the driver safely."""
+    """Close the driver safely and force kill any orphaned Chrome processes."""
+    import subprocess
+    import platform
+    import time
+
+    # First try graceful quit
     try:
         driver.quit()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Driver quit failed: %s", e)
+
+    # Give it a moment to clean up
+    time.sleep(2)
+
+    # Force kill orphaned Chrome processes on Windows
+    if platform.system() == "Windows":
+        try:
+            # Kill ChromeDriver processes
+            subprocess.run(
+                ["taskkill", "/F", "/IM", "chromedriver.exe"],
+                capture_output=True,
+                timeout=10
+            )
+        except Exception as e:
+            logger.debug("ChromeDriver kill: %s", e)
+        
+        # Kill zombie Chrome processes (only our automation ones with specific profile pattern)
+        try:
+            result = subprocess.run(
+                ["wmic", "process", "where", "name='chrome.exe'", "get", "commandline,processid"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            # Look for our temp profile pattern and kill those
+            for line in result.stdout.split('\n'):
+                if 'chrome_profile_' in line and 'user-data-dir' in line:
+                    # Extract PID and kill
+                    parts = line.strip().split()
+                    if parts:
+                        try:
+                            pid = parts[-1]
+                            subprocess.run(
+                                ["taskkill", "/F", "/PID", pid],
+                                capture_output=True,
+                                timeout=5
+                            )
+                        except Exception:
+                            pass
+        except Exception as e:
+            logger.debug("Chrome cleanup: %s", e)
+    else:
+        # Linux/Mac - use pkill
+        try:
+            subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True, timeout=5)
+        except Exception:
+            pass
 
 
 def take_screenshot(driver: webdriver.Chrome, name: str) -> str:

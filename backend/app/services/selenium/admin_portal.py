@@ -430,7 +430,17 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     
     logger.info(f"[{domain}] ========== STARTING DOMAIN SETUP ==========")
     driver = None
-    result = {"success": False, "verified": False, "dns_configured": False, "error": None}
+    result = {
+        "success": False, 
+        "verified": False, 
+        "dns_configured": False, 
+        "error": None,
+        # DNS values to store in database
+        "mx_value": None,
+        "spf_value": None,
+        "dkim_selector1_cname": None,
+        "dkim_selector2_cname": None,
+    }
     
     # ===== SETUP BROWSER =====
     logger.info(f"[{domain}] Creating browser with headless={headless}")
@@ -1027,11 +1037,15 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         mx_target = mx_match.group(1)
         logger.info(f"[{domain}] Adding MX: {mx_target}")
         add_mx(zone_id, mx_target, 0)
+        # Store in result for database update
+        result["mx_value"] = mx_target
     
     if spf_match:
         spf_value = spf_match.group(1).strip()
         logger.info(f"[{domain}] Adding SPF: {spf_value}")
         add_spf(zone_id, spf_value)
+        # Store in result for database update
+        result["spf_value"] = spf_value
     
     logger.info(f"[{domain}] Adding autodiscover CNAME")
     add_cname(zone_id, "autodiscover", "autodiscover.outlook.com")
@@ -1041,11 +1055,15 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         dkim1_target = sel1_match.group(1)
         logger.info(f"[{domain}] Adding DKIM: selector1._domainkey -> {dkim1_target}")
         add_cname(zone_id, "selector1._domainkey", dkim1_target)
+        # Store in result for database update
+        result["dkim_selector1_cname"] = dkim1_target
     
     if sel2_match:
         dkim2_target = sel2_match.group(1)
         logger.info(f"[{domain}] Adding DKIM: selector2._domainkey -> {dkim2_target}")
         add_cname(zone_id, "selector2._domainkey", dkim2_target)
+        # Store in result for database update
+        result["dkim_selector2_cname"] = dkim2_target
     
     result["dns_configured"] = True
     update_status_file(domain, "dns_setup", "complete", "DNS records added to Cloudflare")
@@ -1147,7 +1165,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     screenshot(driver, "15_final", domain)
     page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
     
-    if "complete" in page_text:
+    if "complete" in page_text or "domain setup is complete" in page_text:
         logger.info(f"[{domain}] Clicking Done button")
         try:
             btns = driver.find_elements(By.TAG_NAME, "button")
@@ -1158,8 +1176,17 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
                     break
         except:
             pass
-    
-    result["success"] = True
+        # Only set success=True if we actually reached completion page
+        result["success"] = True
+    else:
+        # Did NOT reach completion - check if DNS was at least configured
+        if result["dns_configured"] and result["verified"]:
+            logger.warning(f"[{domain}] DNS configured but wizard did not reach 'complete' page - marking as partial success")
+            result["success"] = True  # Still consider success if DNS is done
+        else:
+            logger.error(f"[{domain}] Did not reach completion page and DNS not fully configured")
+            if not result["error"]:
+                result["error"] = "Setup did not reach completion page"
     
     # ===== FINAL STATUS UPDATE =====
     if result["success"]:
