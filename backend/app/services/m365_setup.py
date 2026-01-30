@@ -377,7 +377,7 @@ async def run_step5_for_batch(
                             domain.dkim_enabled = True
 
                             await db.commit()
-                            logger.info(f"[{domain_name}]  DB COMMIT SUCCESS - step5_complete=True, dkim_enabled=True")
+                            logger.info(f"[{domain_name}] [OK] DB COMMIT SUCCESS - step5_complete=True, dkim_enabled=True")
 
                             summary["successful"] += 1
                             db_update_success = True
@@ -397,7 +397,7 @@ async def run_step5_for_batch(
                             domain.m365_verified_at = datetime.utcnow()
 
                             await db.commit()
-                            logger.info(f"[{domain_name}]   DB COMMIT SUCCESS - PARTIAL (verified only)")
+                            logger.info(f"[{domain_name}] [OK] DB COMMIT SUCCESS - PARTIAL (verified only)")
 
                             # Mark as failed since not fully complete
                             step_result.error = "Domain verified but DNS setup incomplete"
@@ -413,7 +413,7 @@ async def run_step5_for_batch(
 
                             tenant.setup_error = error_msg
                             await db.commit()
-                            logger.info(f"[{domain_name}] L DB COMMIT SUCCESS - FAILED recorded: {error_msg}")
+                            logger.info(f"[{domain_name}] [FAIL] DB COMMIT SUCCESS - FAILED recorded: {error_msg}")
 
                             summary["failed"] += 1
                             db_update_success = True
