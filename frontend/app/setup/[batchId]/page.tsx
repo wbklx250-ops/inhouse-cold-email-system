@@ -2214,6 +2214,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
   const [isLoading, setIsLoading] = useState(true);
   const [isStarting, setIsStarting] = useState(false);
   const [isAutomationRunning, setIsAutomationRunning] = useState(false);
+  const [isMarkingComplete, setIsMarkingComplete] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const summary = step6Status?.summary ?? {
     total_tenants: 0,
@@ -2308,6 +2309,33 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
       await fetchStep6Status();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to force complete Step 6");
+    }
+  };
+
+  // Mark batch as complete manually
+  const handleMarkBatchComplete = async () => {
+    if (!confirm("Mark this batch as complete? This will move the batch to COMPLETED status.")) return;
+    
+    setIsMarkingComplete(true);
+    setError(null);
+    
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/mark-complete`, {
+        method: "POST",
+      });
+      
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to mark batch complete");
+      }
+      
+      const data = await response.json();
+      alert(data.message || "Batch marked as complete!");
+      onComplete(); // Refresh status - will move to step 7
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to mark batch complete");
+    } finally {
+      setIsMarkingComplete(false);
     }
   };
 
@@ -2612,18 +2640,31 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
           ← Back to Step 5
         </button>
 
-        {step6Status && completedTenants === totalTenants && (
-          <div className="text-center">
-            {completedTenants > 0 && (
-              <button
-                onClick={handleDownloadCSV}
-                className="px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
-              >
-                📥 Download All Mailboxes CSV
-              </button>
-            )}
-          </div>
-        )}
+        <div className="flex gap-4 items-center">
+          {step6Status && completedTenants > 0 && (
+            <button
+              onClick={handleDownloadCSV}
+              className="px-6 py-3 bg-green-600 text-white rounded-lg font-medium hover:bg-green-700 transition-colors"
+            >
+              📥 Download CSV
+            </button>
+          )}
+          
+          {/* Manual mark complete button */}
+          {step6Status && completedTenants > 0 && (
+            <button
+              onClick={handleMarkBatchComplete}
+              disabled={isMarkingComplete}
+              className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+                isMarkingComplete
+                  ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                  : "bg-purple-600 text-white hover:bg-purple-700"
+              }`}
+            >
+              {isMarkingComplete ? "Marking Complete..." : "✅ Mark Batch Complete"}
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

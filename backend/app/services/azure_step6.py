@@ -26,7 +26,7 @@ from sqlalchemy import select, update, func
 
 from app.core.config import get_settings
 from app.db.session import SessionLocal, async_session_factory
-from app.models.batch import SetupBatch
+from app.models.batch import SetupBatch, BatchStatus
 from app.models.mailbox import Mailbox, MailboxStatus
 from app.models.tenant import Tenant, TenantStatus
 from app.services.email_generator import generate_emails_for_domain
@@ -134,6 +134,31 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         logger.info("=" * 80)
         logger.info("BATCH COMPLETE: %s/%s successful, %s failed", successful, len(tenants), failed)
         logger.info("=" * 80)
+
+        # Update batch status when step 6 completes
+        if failed == 0:
+            # All tenants succeeded - mark batch as completed
+            completed_steps = batch.completed_steps or []
+            if 6 not in completed_steps:
+                completed_steps.append(6)
+            
+            batch.completed_steps = sorted(completed_steps)
+            batch.current_step = 7
+            batch.status = BatchStatus.COMPLETED
+            batch.completed_at = datetime.utcnow()
+            await db.commit()
+            
+            logger.info("Batch %s marked as COMPLETED (step 6 done, all tenants succeeded)", batch_id)
+        else:
+            # Some tenants failed - mark step 6 in completed_steps but don't mark batch complete
+            completed_steps = batch.completed_steps or []
+            if 6 not in completed_steps:
+                completed_steps.append(6)
+            batch.completed_steps = sorted(completed_steps)
+            batch.current_step = 6  # Stay on step 6 for retry
+            await db.commit()
+            
+            logger.info("Batch %s step 6 finished with %s failures - batch NOT marked complete", batch_id, failed)
 
         return {
             "success": failed == 0,

@@ -2665,6 +2665,46 @@ async def retry_step6_for_tenant(
     }
 
 
+@router.post("/batches/{batch_id}/step6/mark-complete")
+async def mark_batch_step6_complete(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Manually mark a batch as complete when Step 6 is done.
+    
+    Use this when:
+    - All tenants have completed Step 6 but batch wasn't auto-marked
+    - You want to force-complete a batch even with some failures
+    - The automatic completion logic didn't trigger
+    """
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    # Update batch status
+    completed_steps = batch.completed_steps or []
+    if 6 not in completed_steps:
+        completed_steps.append(6)
+    batch.completed_steps = sorted(completed_steps)
+    batch.current_step = 7
+    batch.status = BatchStatus.COMPLETED
+    batch.completed_at = datetime.utcnow()
+
+    await db.commit()
+
+    logger.info(f"Manually marked batch {batch_id} as COMPLETED")
+
+    return {
+        "success": True,
+        "message": f"Batch '{batch.name}' marked as complete",
+        "batch_id": str(batch_id),
+        "status": "completed",
+    }
+
+
 @router.post("/tenants/{tenant_id}/step6/force-complete")
 async def force_complete_step6_for_tenant(
     tenant_id: UUID,
