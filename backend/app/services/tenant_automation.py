@@ -1745,13 +1745,64 @@ class BrowserWorker:
                     f"[W{self.worker_id}] [PASSWORD CHANGE] Waiting for page transition (up to {LONG_WAIT}s)..."
                 )
                 self._wait_for_password_change_complete(timeout=LONG_WAIT)
+
+                # Wait for actual page transition before checking result
+                logger.info(
+                    f"[W{self.worker_id}] [PASSWORD CHANGE] Password change submitted, waiting for page transition..."
+                )
+
+                try:
+                    old_page_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                except Exception:
+                    old_page_text = ""
+
+                page_changed = False
+                transition_indicators = [
+                    "more information required",
+                    "action required",
+                    "stay signed in",
+                    "keep me signed in",
+                    "microsoft authenticator",
+                ]
+
+                for i in range(15):
+                    time.sleep(1)
+                    try:
+                        new_page_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                    except Exception:
+                        new_page_text = ""
+
+                    if new_page_text != old_page_text and len(new_page_text) > 50:
+                        logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Page changed after {i + 1} seconds")
+                        page_changed = True
+                        break
+
+                    if any(indicator in new_page_text for indicator in transition_indicators):
+                        logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Detected next page after {i + 1} seconds")
+                        page_changed = True
+                        break
+
+                    logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Waiting for transition... ({i + 1}s)")
+
+                if not page_changed:
+                    self._screenshot("password_change_timeout")
+                    logger.warning(
+                        f"[W{self.worker_id}] [PASSWORD CHANGE] Page didn't change after 15s, checking anyway..."
+                    )
+
                 self._screenshot("08_after_password_change")
                 logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] After submit URL: {self.driver.current_url}")
-                
+
                 # Verify password change succeeded
-                new_page = self.driver.page_source.lower()
-                if any(x in new_page for x in password_keywords):
-                    logger.error(f"[W{self.worker_id}] ✗ [PASSWORD CHANGE] FAILED - still on password change page!")
+                try:
+                    current_text = self.driver.find_element(By.TAG_NAME, "body").text.lower()
+                except Exception:
+                    current_text = self.driver.page_source.lower()
+
+                if "update your password" in current_text or "change password" in current_text:
+                    logger.error(
+                        f"[W{self.worker_id}] ✗ [PASSWORD CHANGE] FAILED - still on password change page!"
+                    )
                     self._screenshot("08a_password_change_FAILED")
                     # Log what's on the page for debugging
                     logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Page title: {self.driver.title}")
