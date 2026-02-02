@@ -1306,13 +1306,22 @@ async def enable_org_smtp_auth(
             pass
 
         # =================================================================
-        # NAVIGATE TO MAIL FLOW SETTINGS
+        # NAVIGATE TO MAIL FLOW SETTINGS (Settings > Mail flow)
         # =================================================================
-        logger.info(f"[{domain}] Step 7: Navigating to Mail flow settings...")
-        driver.get("https://admin.exchange.microsoft.com/#/mailflow")
+        # IMPORTANT: The SMTP AUTH org setting is in Settings > Mail flow
+        # NOT in the Mail flow rules section
+        logger.info(f"[{domain}] Step 7: Navigating to Settings > Mail flow...")
+        driver.get("https://admin.exchange.microsoft.com/#/settings/mailflow")
         wait_for_page_load(driver, timeout=30)
-        time.sleep(5)
-        _save_screenshot(driver, domain, "step7_mailflow_page")
+        time.sleep(8)  # Extra time for Settings page to fully load
+        _save_screenshot(driver, domain, "step7_settings_mailflow_page")
+        
+        # Log current URL and page state for debugging
+        logger.info(f"[{domain}] Step 7: Current URL: {driver.current_url}")
+        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+        logger.info(f"[{domain}] Step 7: Page contains 'smtp': {'smtp' in page_text}")
+        logger.info(f"[{domain}] Step 7: Page contains 'turn off': {'turn off' in page_text}")
+        logger.info(f"[{domain}] Step 7: Page contains 'mail flow': {'mail flow' in page_text}")
 
         # The Mail flow settings page has a checkbox/toggle for:
         # "Turn off SMTP AUTH protocol for your organization"
@@ -1321,19 +1330,30 @@ async def enable_org_smtp_auth(
         smtp_auth_enabled = False
 
         # Multiple selector strategies for the SMTP AUTH setting
+        # The setting appears as a checkbox on the Settings > Mail flow page
         smtp_selectors = [
+            # Checkbox with label containing SMTP
+            "//input[@type='checkbox'][following-sibling::*[contains(text(), 'SMTP')]]",
+            "//input[@type='checkbox'][..//*[contains(text(), 'SMTP')]]",
+            "//input[@type='checkbox'][ancestor::*[contains(text(), 'Turn off SMTP')]]",
+            # Fluent UI checkbox patterns
+            "//div[contains(@class, 'ms-Checkbox')][.//span[contains(text(), 'SMTP')]]//input[@type='checkbox']",
+            "//div[contains(@class, 'ms-Checkbox')][.//label[contains(text(), 'SMTP')]]//input[@type='checkbox']",
             # Fluent UI toggle patterns
             "//span[contains(text(), 'SMTP')]/ancestor::div[contains(@class, 'ms-Toggle')]//button[@role='switch']",
             "//label[contains(text(), 'SMTP')]/ancestor::div[contains(@class, 'ms-Toggle')]//button[@role='switch']",
             "//span[contains(text(), 'Turn off SMTP')]/ancestor::div//button[@role='switch']",
             "//label[contains(text(), 'Turn off SMTP')]/ancestor::div//button[@role='switch']",
-            # Checkbox patterns
+            # Generic checkbox near SMTP text
             "//label[contains(text(), 'SMTP')]/preceding-sibling::input[@type='checkbox']",
             "//label[contains(text(), 'SMTP')]/ancestor::div//input[@type='checkbox']",
             "//span[contains(text(), 'Turn off SMTP')]/ancestor::div//input[@type='checkbox']",
             # Generic toggle near SMTP text
             "//div[contains(@class, 'ms-Toggle')][.//span[contains(text(), 'SMTP')]]//button",
             "//div[contains(@class, 'ms-Toggle')][.//label[contains(text(), 'SMTP')]]//button",
+            # Clickable label that contains SMTP text
+            "//label[contains(text(), 'Turn off SMTP')]",
+            "//span[contains(text(), 'Turn off SMTP')]",
         ]
 
         for selector in smtp_selectors:
