@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
+import Step7SequencerPrep from "@/components/wizard/Step7SequencerPrep";
 
 interface WizardStatus {
   batch_id: string;
@@ -123,7 +124,7 @@ export default function BatchWizard() {
           </button>
           <h1 className="text-2xl font-bold text-gray-900">{status?.batch_name}</h1>
           <p className="text-gray-600 mt-1">
-            Step {activeStep} of 6 • {status?.status === "completed" ? "Completed" : "In Progress"}
+            Step {activeStep} of 7 • {status?.status === "completed" ? "Completed" : "In Progress"}
           </p>
         </div>
       </div>
@@ -151,8 +152,14 @@ export default function BatchWizard() {
           {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(4)} />}
           {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={loadStatus} />}
           {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(6)} />}
-          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} />}
-          {activeStep === 7 && <StepComplete batchId={batchId} status={status} />}
+          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(7)} />}
+          {activeStep === 7 && (
+            <Step7SequencerPrep
+              batchId={batchId}
+              onComplete={() => setActiveStep(8)}
+            />
+          )}
+          {activeStep === 8 && <StepComplete batchId={batchId} status={status} />}
         </div>
       </div>
     </div>
@@ -170,6 +177,7 @@ function StepProgress({ currentStep }: { currentStep: number }) {
     { num: 4, name: "Tenants" },
     { num: 5, name: "Email Setup" },
     { num: 6, name: "Mailboxes" },
+    { num: 7, name: "Sequencer" },
   ];
 
   return (
@@ -2208,7 +2216,7 @@ interface Step6DetailedStatus {
   tenants: TenantStep6Status[];
 }
 
-function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
+function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: string; status: WizardStatus | null; onComplete: () => void; onNext: () => void }) {
   const [step6Status, setStep6Status] = useState<Step6DetailedStatus | null>(null);
   const [displayName, setDisplayName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -2315,9 +2323,9 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
     }
   };
 
-  // Mark batch as complete manually
+  // Mark batch as complete manually and advance to Step 7
   const handleMarkBatchComplete = async () => {
-    if (!confirm("Mark this batch as complete? This will move the batch to COMPLETED status.")) return;
+    if (!confirm("Continue to Sequencer Setup (Step 7)? This will enable SMTP Auth for all tenants.")) return;
     
     setIsMarkingComplete(true);
     setError(null);
@@ -2329,14 +2337,13 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
       
       if (!response.ok) {
         const data = await response.json().catch(() => ({}));
-        throw new Error(data.detail || "Failed to mark batch complete");
+        throw new Error(data.detail || "Failed to advance to Step 7");
       }
       
-      const data = await response.json();
-      alert(data.message || "Batch marked as complete!");
-      onComplete(); // Refresh status - will move to step 7
+      // Advance to Step 7 (Sequencer Prep)
+      onNext();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to mark batch complete");
+      setError(err instanceof Error ? err.message : "Failed to advance to Step 7");
     } finally {
       setIsMarkingComplete(false);
     }
@@ -2810,7 +2817,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
             </button>
           )}
           
-          {/* Manual mark complete button */}
+          {/* Continue to Step 7 button */}
           {step6Status && completedTenants > 0 && (
             <button
               onClick={handleMarkBatchComplete}
@@ -2821,7 +2828,7 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
                   : "bg-purple-600 text-white hover:bg-purple-700"
               }`}
             >
-              {isMarkingComplete ? "Marking Complete..." : "✅ Mark Batch Complete"}
+              {isMarkingComplete ? "Loading..." : "Continue to Sequencer Setup →"}
             </button>
           )}
         </div>

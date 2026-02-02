@@ -136,28 +136,23 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         logger.info("=" * 80)
 
         # Update batch status when step 6 completes
+        # IMPORTANT: Step 6 should NOT mark the batch as complete.
+        # Instead, advance to Step 7 when all tenants succeed.
+        completed_steps = batch.completed_steps or []
+        if 6 not in completed_steps:
+            completed_steps.append(6)
+
+        batch.completed_steps = sorted(completed_steps)
+
         if failed == 0:
-            # All tenants succeeded - mark batch as completed
-            completed_steps = batch.completed_steps or []
-            if 6 not in completed_steps:
-                completed_steps.append(6)
-            
-            batch.completed_steps = sorted(completed_steps)
+            # All tenants succeeded - advance to Step 7
             batch.current_step = 7
-            batch.status = BatchStatus.COMPLETED
-            batch.completed_at = datetime.utcnow()
             await db.commit()
-            
-            logger.info("Batch %s marked as COMPLETED (step 6 done, all tenants succeeded)", batch_id)
+            logger.info("Batch %s advanced to Step 7 (step 6 done, all tenants succeeded)", batch_id)
         else:
-            # Some tenants failed - mark step 6 in completed_steps but don't mark batch complete
-            completed_steps = batch.completed_steps or []
-            if 6 not in completed_steps:
-                completed_steps.append(6)
-            batch.completed_steps = sorted(completed_steps)
-            batch.current_step = 6  # Stay on step 6 for retry
+            # Some tenants failed - stay on Step 6 for retry
+            batch.current_step = 6
             await db.commit()
-            
             logger.info("Batch %s step 6 finished with %s failures - batch NOT marked complete", batch_id, failed)
 
         return {

@@ -103,6 +103,12 @@ class Tenant(TimestampUUIDMixin, Base):
     step6_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     step6_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # === STEP 7 PROGRESS TRACKING ===
+    step7_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step7_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    step7_smtp_auth_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step7_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # === STEP 5 PROGRESS TRACKING ===
     step5_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step5_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

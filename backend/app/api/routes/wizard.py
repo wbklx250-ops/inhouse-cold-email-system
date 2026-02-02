@@ -33,7 +33,7 @@ from app.services.mailbox_scripts import mailbox_scripts
 from app.services.orchestrator import process_batch, SetupConfig
 from app.services.m365_setup import run_step5_for_batch, run_step5_for_tenant, Step5Result
 from app.services.selenium.parallel_processor import run_parallel_step5, DomainTask
-from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress
+from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress, enable_org_smtp_auth
 from app.services.azure_step6 import (
     run_step6_for_batch as run_azure_step6_for_batch,
     run_step6_for_tenant as run_azure_step6_for_tenant,
@@ -142,6 +142,7 @@ class BatchWizardStatus(BaseModel):
     mailboxes_total: int
     mailboxes_pending: int
     mailboxes_ready: int
+    step7: dict
 
     class Config:
         from_attributes = True
@@ -293,7 +294,7 @@ async def advance_batch_step(batch_id: UUID, db: AsyncSession = Depends(get_db))
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     
-    # Advance to next step (max step is 7 - Complete)
+    # Advance to next step (max step is 7 - Sequencer Prep)
     if batch.current_step < 7:
         batch.current_step = batch.current_step + 1
         await db.commit()
@@ -385,6 +386,28 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         )
     ) or 0
     
+    # Step 7 stats (Sequencer prep)
+    step6_complete_count = await db.scalar(
+        select(func.count(Tenant.id)).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+        )
+    ) or 0
+    step7_complete_count = await db.scalar(
+        select(func.count(Tenant.id)).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step7_complete == True,
+        )
+    ) or 0
+    step7_failed_count = await db.scalar(
+        select(func.count(Tenant.id)).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+            Tenant.step7_complete == False,
+            Tenant.step7_error.isnot(None),
+        )
+    ) or 0
+
     # Determine step name
     step_names = {
         1: "Import Domains",
@@ -393,14 +416,17 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         4: "Import Tenants",
         5: "Email Setup",
         6: "Create Mailboxes",
-        7: "Complete"
+        7: "Sequencer Prep",
     }
+    step_name = step_names.get(batch.current_step, "Unknown")
+    if batch.status == BatchStatus.COMPLETED:
+        step_name = "Complete"
     
     return BatchWizardStatus(
         batch_id=batch.id,
         batch_name=batch.name,
         current_step=batch.current_step,
-        step_name=step_names.get(batch.current_step, "Unknown"),
+        step_name=step_name,
         can_proceed=True,
         status=batch.status.value,
         domains_total=domains_total,
@@ -416,6 +442,11 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         mailboxes_total=mailboxes_total,
         mailboxes_pending=mailboxes_pending,
         mailboxes_ready=mailboxes_ready,
+        step7={
+            "complete": step7_complete_count,
+            "failed": step7_failed_count,
+            "eligible": step6_complete_count,
+        },
     )
 
 
@@ -2670,7 +2701,7 @@ async def mark_batch_step6_complete(
     batch_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Manually mark a batch as complete when Step 6 is done.
+    """Manually advance a batch to Step 7 when Step 6 is done.
     
     Use this when:
     - All tenants have completed Step 6 but batch wasn't auto-marked
@@ -2690,18 +2721,16 @@ async def mark_batch_step6_complete(
         completed_steps.append(6)
     batch.completed_steps = sorted(completed_steps)
     batch.current_step = 7
-    batch.status = BatchStatus.COMPLETED
-    batch.completed_at = datetime.utcnow()
 
     await db.commit()
 
-    logger.info(f"Manually marked batch {batch_id} as COMPLETED")
+    logger.info(f"Manually advanced batch {batch_id} to Step 7")
 
     return {
         "success": True,
-        "message": f"Batch '{batch.name}' marked as complete",
+        "message": f"Batch '{batch.name}' advanced to Step 7",
         "batch_id": str(batch_id),
-        "status": "completed",
+        "current_step": 7,
     }
 
 
@@ -3032,8 +3061,6 @@ async def batch_create_mailboxes(batch_id: UUID, db: AsyncSession = Depends(get_
     
     if batch.current_step == 6:
         batch.current_step = 7
-        batch.status = BatchStatus.COMPLETED
-        batch.completed_at = datetime.utcnow()
         await db.commit()
     
     return StepResult(
@@ -3041,6 +3068,242 @@ async def batch_create_mailboxes(batch_id: UUID, db: AsyncSession = Depends(get_
         message="Mailbox creation - implementation pending",
         details={"note": "Requires PowerShell integration"}
     )
+
+
+# =============================================================================
+# STEP 7: SEQUENCER PREPARATION (ORG-LEVEL SMTP AUTH)
+# =============================================================================
+
+
+@router.post("/batches/{batch_id}/step7/start")
+async def start_step7(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Start Step 7: Enable org-level SMTP Auth via Exchange Admin Center Selenium.
+
+    Prerequisites: Step 6 must be complete for the tenant.
+    One toggle per tenant  fast.
+    """
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+        )
+    )
+    eligible = result.scalars().all()
+
+    if not eligible:
+        return {
+            "success": False,
+            "error": "No tenants with completed Step 6. Complete mailbox creation first.",
+        }
+
+    to_process = [t for t in eligible if not t.step7_complete]
+
+    if not to_process:
+        return {
+            "success": True,
+            "message": "All tenants already have SMTP Auth enabled.",
+            "total": len(eligible),
+            "already_complete": len(eligible),
+        }
+
+    import asyncio
+    asyncio.create_task(_run_step7_batch(batch_id, [t.id for t in to_process]))
+
+    return {
+        "success": True,
+        "message": f"Step 7 started for {len(to_process)} tenants",
+        "total": len(eligible),
+        "processing": len(to_process),
+        "already_complete": len(eligible) - len(to_process),
+    }
+
+
+async def _run_step7_batch(batch_id: UUID, tenant_ids: list):
+    """
+    Background task: Enable SMTP Auth for each tenant.
+
+    Uses 2 parallel browsers max (same as Step 5).
+    Each tenant is just one toggle  very fast (~30s each).
+
+    IMPORTANT: This task marks the BATCH as complete when all tenants finish.
+    """
+    import asyncio
+    from app.db.session import async_session_factory
+
+    MAX_PARALLEL = 2
+
+    async def process_tenant(tenant_id: UUID):
+        """Process one tenant  login to EAC, toggle SMTP AUTH, done."""
+        async with async_session_factory() as db:
+            result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
+            tenant = result.scalar_one_or_none()
+            if not tenant:
+                return
+
+            domain = tenant.custom_domain or tenant.name
+            logger.info(f"[{domain}] Step 7: Starting SMTP Auth enable...")
+
+            automation_result = await enable_org_smtp_auth(
+                admin_email=tenant.admin_email,
+                admin_password=tenant.admin_password,
+                totp_secret=tenant.totp_secret,
+                domain=domain,
+            )
+
+            tenant.step7_smtp_auth_enabled = automation_result.get("smtp_auth_enabled", False)
+            tenant.step7_error = automation_result.get("error")
+
+            if automation_result.get("success"):
+                tenant.step7_complete = True
+                tenant.step7_completed_at = datetime.utcnow()
+                logger.info(f"[{domain}] Step 7 COMPLETE  SMTP Auth enabled")
+            else:
+                tenant.step7_complete = False
+                logger.warning(f"[{domain}] Step 7 FAILED: {automation_result.get('error')}")
+
+            await db.commit()
+            logger.info(f"[{domain}] Step 7 database updated immediately")
+
+    semaphore = asyncio.Semaphore(MAX_PARALLEL)
+
+    async def limited_process(tenant_id):
+        async with semaphore:
+            await process_tenant(tenant_id)
+
+    tasks = [limited_process(tid) for tid in tenant_ids]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    logger.info(f"Step 7 batch {batch_id} processing complete")
+
+    async with async_session_factory() as db:
+        result = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.step6_complete == True,
+            )
+        )
+        eligible = result.scalars().all()
+
+        all_done = all(getattr(t, "step7_complete", False) for t in eligible)
+
+        if all_done and eligible:
+            batch_result = await db.execute(
+                select(SetupBatch).where(SetupBatch.id == batch_id)
+            )
+            batch = batch_result.scalar_one_or_none()
+            if batch:
+                batch.status = BatchStatus.COMPLETED
+                batch.completed_at = datetime.utcnow()
+                await db.commit()
+                logger.info(
+                    f"Batch {batch_id} marked COMPLETE  all tenants have SMTP Auth enabled"
+                )
+        else:
+            complete_count = sum(1 for t in eligible if getattr(t, "step7_complete", False))
+            logger.info(
+                f"Batch {batch_id}: {complete_count}/{len(eligible)} tenants complete. "
+                f"Batch NOT yet complete."
+            )
+
+
+@router.get("/batches/{batch_id}/step7/status")
+async def get_step7_status(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get Step 7 progress for all tenants in batch."""
+    result = await db.execute(
+        select(Tenant).where(Tenant.batch_id == batch_id)
+    )
+    tenants = result.scalars().all()
+
+    eligible = [t for t in tenants if getattr(t, "step6_complete", False)]
+    complete = [t for t in eligible if getattr(t, "step7_complete", False)]
+    failed = [
+        t
+        for t in eligible
+        if getattr(t, "step7_error", None) and not getattr(t, "step7_complete", False)
+    ]
+    pending = [
+        t
+        for t in eligible
+        if not getattr(t, "step7_complete", False) and not getattr(t, "step7_error", None)
+    ]
+
+    tenant_details = []
+    for t in eligible:
+        tenant_details.append(
+            {
+                "id": str(t.id),
+                "domain": t.custom_domain or t.name,
+                "step7_complete": getattr(t, "step7_complete", False) or False,
+                "smtp_auth_enabled": getattr(t, "step7_smtp_auth_enabled", False) or False,
+                "error": getattr(t, "step7_error", None),
+                "completed_at": t.step7_completed_at.isoformat()
+                if getattr(t, "step7_completed_at", None)
+                else None,
+            }
+        )
+
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    batch_complete = batch.status == BatchStatus.COMPLETED if batch else False
+
+    return {
+        "batch_complete": batch_complete,
+        "eligible": len(eligible),
+        "complete": len(complete),
+        "failed": len(failed),
+        "pending": len(pending),
+        "tenants": tenant_details,
+    }
+
+
+@router.post("/batches/{batch_id}/step7/retry-failed")
+async def retry_step7_failed(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry Step 7 for tenants that failed."""
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+            Tenant.step7_complete == False,
+        )
+    )
+    failed_tenants = result.scalars().all()
+    failed_tenants = [t for t in failed_tenants if t.step7_error]
+
+    if not failed_tenants:
+        return {"success": True, "message": "No failed tenants to retry."}
+
+    tenant_ids = []
+    for t in failed_tenants:
+        t.step7_error = None
+        tenant_ids.append(t.id)
+    await db.commit()
+
+    import asyncio
+    asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+
+    return {
+        "success": True,
+        "message": f"Retrying Step 7 for {len(failed_tenants)} tenants",
+    }
 
 
 @router.get("/batches/{batch_id}/step6/export-credentials")

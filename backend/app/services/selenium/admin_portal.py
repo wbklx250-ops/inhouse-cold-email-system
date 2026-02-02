@@ -55,6 +55,20 @@ def screenshot(driver, name, domain):
         pass
 
 
+def _save_screenshot(driver, domain: str, step: str):
+    """Save screenshot for debugging."""
+    try:
+        screenshot_dir = os.environ.get("SCREENSHOT_DIR", SCREENSHOT_DIR)
+        os.makedirs(screenshot_dir, exist_ok=True)
+        safe_domain = domain.replace(".", "_")
+        timestamp = int(time.time())
+        filepath = os.path.join(screenshot_dir, f"{step}_{safe_domain}_{timestamp}.png")
+        driver.save_screenshot(filepath)
+        logger.info(f"Screenshot: {filepath}")
+    except Exception as e:
+        logger.warning(f"Could not save screenshot: {e}")
+
+
 def update_status_file(domain: str, step: str, status: str, details: str = None):
     """Write status to file for UI polling - enables real-time updates."""
     try:
@@ -1214,4 +1228,232 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     logger.info(f"[{domain}] Browser closed and profile cleaned up")
     
     return result
+
+
+async def enable_org_smtp_auth(
+    admin_email: str,
+    admin_password: str,
+    totp_secret: str,
+    domain: str,
+) -> dict:
+    """
+    Enable SMTP Auth at the organization level in Exchange Admin Center.
+
+    This is Step 7 of the setup wizard.
+    Follows the same pattern as DKIM setup (Step 5).
+
+    Navigates to Exchange Admin Center -> Settings -> Mail flow
+    and UNCHECKS "Turn off SMTP AUTH protocol for your organization".
+
+    No per-mailbox configuration is needed for shared mailboxes.
+
+    Args:
+        admin_email: e.g. "admin@TenantName.onmicrosoft.com"
+        admin_password: The admin password from Step 4
+        totp_secret: The TOTP secret from Step 4
+        domain: e.g. "loancatermail13.info" (for logging)
+
+    Returns:
+        {
+            "success": bool,
+            "smtp_auth_enabled": bool,
+            "error": str or None
+        }
+    """
+    from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+    driver = None
+    result = {
+        "success": False,
+        "smtp_auth_enabled": False,
+        "error": None,
+    }
+
+    try:
+        logger.info(f"[{domain}] Step 7: Initializing browser")
+        worker = BrowserWorker(worker_id=f"step7-{uuid.uuid4()}", headless=True)
+        driver = worker._create_driver()
+        driver.implicitly_wait(10)
+        driver.set_page_load_timeout(60)
+
+        # === LOGIN TO M365 (reuse existing login flow) ===
+        logger.info(f"[{domain}] Step 7: Logging into M365 Admin Portal...")
+        _login_with_mfa(
+            driver=driver,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            totp_secret=totp_secret,
+            domain=domain,
+        )
+        _save_screenshot(driver, domain, "step7_login_complete")
+        time.sleep(3)
+
+        # === NAVIGATE TO EXCHANGE ADMIN CENTER ===
+        logger.info(f"[{domain}] Step 7: Opening Exchange Admin Center...")
+        driver.get("https://admin.exchange.microsoft.com")
+        wait_for_page_load(driver, timeout=30)
+        time.sleep(5)
+        _save_screenshot(driver, domain, "step7_eac_loaded")
+        logger.info(f"[{domain}] Step 7: Exchange Admin Center loaded. URL: {driver.current_url}")
+
+        # Dismiss any Teaching Bubbles / popups (same as Step 5 DKIM)
+        try:
+            bubbles = driver.find_elements(By.XPATH, "//div[contains(@class, 'ms-TeachingBubble')]//button")
+            for bubble in bubbles:
+                safe_click(driver, bubble, "Teaching bubble")
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+        # =================================================================
+        # NAVIGATE TO MAIL FLOW SETTINGS
+        # =================================================================
+        logger.info(f"[{domain}] Step 7: Navigating to Mail flow settings...")
+        driver.get("https://admin.exchange.microsoft.com/#/mailflow")
+        wait_for_page_load(driver, timeout=30)
+        time.sleep(5)
+        _save_screenshot(driver, domain, "step7_mailflow_page")
+
+        # The Mail flow settings page has a checkbox/toggle for:
+        # "Turn off SMTP AUTH protocol for your organization"
+        # We need to UNCHECK it (which ENABLES SMTP AUTH)
+
+        smtp_auth_enabled = False
+
+        # Multiple selector strategies for the SMTP AUTH setting
+        smtp_selectors = [
+            # Fluent UI toggle patterns
+            "//span[contains(text(), 'SMTP')]/ancestor::div[contains(@class, 'ms-Toggle')]//button[@role='switch']",
+            "//label[contains(text(), 'SMTP')]/ancestor::div[contains(@class, 'ms-Toggle')]//button[@role='switch']",
+            "//span[contains(text(), 'Turn off SMTP')]/ancestor::div//button[@role='switch']",
+            "//label[contains(text(), 'Turn off SMTP')]/ancestor::div//button[@role='switch']",
+            # Checkbox patterns
+            "//label[contains(text(), 'SMTP')]/preceding-sibling::input[@type='checkbox']",
+            "//label[contains(text(), 'SMTP')]/ancestor::div//input[@type='checkbox']",
+            "//span[contains(text(), 'Turn off SMTP')]/ancestor::div//input[@type='checkbox']",
+            # Generic toggle near SMTP text
+            "//div[contains(@class, 'ms-Toggle')][.//span[contains(text(), 'SMTP')]]//button",
+            "//div[contains(@class, 'ms-Toggle')][.//label[contains(text(), 'SMTP')]]//button",
+        ]
+
+        for selector in smtp_selectors:
+            try:
+                elem = driver.find_element(By.XPATH, selector)
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
+                time.sleep(0.5)
+
+                # Determine current state
+                # "Turn off SMTP AUTH" checked = SMTP AUTH is DISABLED
+                # "Turn off SMTP AUTH" unchecked = SMTP AUTH is ENABLED
+                is_checked = elem.get_attribute("aria-checked")
+                is_input_checked = elem.get_attribute("checked")
+
+                if is_checked == "true" or is_input_checked:
+                    # Currently checked (SMTP AUTH is OFF)  click to uncheck (enable SMTP AUTH)
+                    logger.info(f"[{domain}] Step 7: SMTP AUTH is currently OFF (toggle checked). Unchecking to enable...")
+                    safe_click(driver, elem, "SMTP AUTH toggle")
+                    time.sleep(1)
+                    smtp_auth_enabled = True
+                    logger.info(f"[{domain}] Step 7: Clicked toggle  SMTP AUTH now ENABLED")
+                else:
+                    # Already unchecked (SMTP AUTH is already enabled)
+                    logger.info(f"[{domain}] Step 7: SMTP AUTH is already ENABLED (toggle unchecked). No action needed.")
+                    smtp_auth_enabled = True
+
+                break
+            except (NoSuchElementException, Exception):
+                continue
+
+        if not smtp_auth_enabled:
+            # JavaScript fallback  find any toggle/checkbox near "SMTP" text
+            logger.warning(f"[{domain}] Step 7: Could not find SMTP toggle via selectors, trying JS fallback...")
+            try:
+                js_result = driver.execute_script("""
+                    // Look for toggle buttons (Fluent UI) near SMTP text
+                    var toggles = document.querySelectorAll('button[role="switch"]');
+                    for (var t of toggles) {
+                        var container = t.closest('div');
+                        if (container && container.textContent.includes('SMTP')) {
+                            if (t.getAttribute('aria-checked') === 'true') {
+                                t.click();
+                                return 'clicked';
+                            } else {
+                                return 'already_enabled';
+                            }
+                        }
+                    }
+                    // Also check regular checkboxes
+                    var checkboxes = document.querySelectorAll('input[type="checkbox"]');
+                    for (var cb of checkboxes) {
+                        var label = cb.closest('div');
+                        if (label && label.textContent.includes('SMTP')) {
+                            if (cb.checked) {
+                                cb.click();
+                                return 'clicked';
+                            } else {
+                                return 'already_enabled';
+                            }
+                        }
+                    }
+                    return 'not_found';
+                """)
+
+                if js_result in ("clicked", "already_enabled"):
+                    smtp_auth_enabled = True
+                    logger.info(f"[{domain}] Step 7: JS fallback result: {js_result}")
+                    time.sleep(1)
+                else:
+                    logger.error(f"[{domain}] Step 7: JS fallback could not find SMTP toggle")
+            except Exception as e:
+                logger.error(f"[{domain}] Step 7: JS fallback failed: {e}")
+
+        _save_screenshot(driver, domain, "step7_after_toggle")
+
+        # Click Save if there's a save button visible
+        if smtp_auth_enabled:
+            save_clicked = False
+            save_selectors = [
+                "//button[contains(text(), 'Save')]",
+                "//button[contains(@class, 'ms-Button--primary')][contains(text(), 'Save')]",
+                "//button[@type='submit']",
+            ]
+            for sel in save_selectors:
+                try:
+                    save_btn = driver.find_element(By.XPATH, sel)
+                    if save_btn.is_displayed() and save_btn.is_enabled():
+                        safe_click(driver, save_btn, "Save button")
+                        save_clicked = True
+                        time.sleep(3)
+                        logger.info(f"[{domain}] Step 7: Clicked Save on mail flow settings")
+                        break
+                except Exception:
+                    continue
+
+            if not save_clicked:
+                logger.info(f"[{domain}] Step 7: No Save button found (may auto-save)")
+
+        _save_screenshot(driver, domain, "step7_complete")
+
+        result["smtp_auth_enabled"] = smtp_auth_enabled
+        result["success"] = smtp_auth_enabled
+
+        if smtp_auth_enabled:
+            logger.info(f"[{domain}] Step 7 COMPLETE: Org-level SMTP AUTH enabled")
+        else:
+            result["error"] = "Could not find or toggle SMTP AUTH setting"
+            logger.error(f"[{domain}] Step 7 FAILED: Could not find SMTP AUTH toggle")
+
+        return result
+
+    except Exception as e:
+        logger.error(f"[{domain}] Step 7 FAILED: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        result["error"] = str(e)
+        if driver:
+            _save_screenshot(driver, domain, "step7_error")
+        return result
+
+    finally:
+        _cleanup_driver(driver)
 
