@@ -2738,6 +2738,229 @@ async def force_complete_step6_for_tenant(
     }
 
 
+@router.post("/batches/{batch_id}/step6/rerun")
+async def rerun_step6_automation(
+    batch_id: UUID,
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rerun Step 6 automation for remaining/failed tenants.
+    
+    This is useful when:
+    - Automation got stuck or crashed
+    - Some tenants failed and need retry
+    - New tenants became ready (step5 complete) after initial run
+    
+    Finds all tenants where step5 is complete but step6 is not complete,
+    resets their step6 status, and restarts automation.
+    """
+    display_name = request.get("display_name", "").strip()
+    if not display_name or " " not in display_name:
+        raise HTTPException(
+            400, "Display name must include first and last name (e.g., 'Jack Zuvelek')"
+        )
+    
+    # Verify batch exists
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find all tenants that need processing:
+    # 1. Step 5 complete (domain_verified + dkim_enabled OR step5_complete flag)
+    # 2. Step 6 NOT complete
+    # This includes both fresh tenants and failed tenants
+    tenant_result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == False,
+            # Step 5 complete check - either explicit flag or implied by dkim_enabled
+            ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True))
+        )
+    )
+    eligible_tenants = tenant_result.scalars().all()
+    
+    if not eligible_tenants:
+        # Also check for tenants with errors that might need retry
+        error_result = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.step6_error.isnot(None)
+            )
+        )
+        error_tenants = error_result.scalars().all()
+        
+        if error_tenants:
+            return {
+                "success": False,
+                "message": f"Found {len(error_tenants)} tenant(s) with errors. Use 'Retry Failed' to reset and retry them.",
+                "error_count": len(error_tenants),
+                "eligible_count": 0
+            }
+        
+        return {
+            "success": False,
+            "message": "No eligible tenants found for Step 6. Ensure tenants have completed Step 5.",
+            "eligible_count": 0
+        }
+    
+    # Reset step6 status for all eligible tenants so they get picked up
+    for tenant in eligible_tenants:
+        tenant.step6_started = False
+        tenant.step6_error = None
+        # Don't reset step6_complete if already True
+    
+    await db.commit()
+    
+    logger.info(f"Rerunning Step 6 for batch {batch_id}: {len(eligible_tenants)} eligible tenants")
+    
+    # Start Azure Automation in background
+    background_tasks.add_task(run_azure_step6_for_batch, batch_id, display_name)
+    
+    return {
+        "success": True,
+        "message": f"Restarted Step 6 automation for {len(eligible_tenants)} tenant(s)",
+        "display_name": display_name,
+        "eligible_count": len(eligible_tenants),
+        "tenants": [{"id": str(t.id), "name": t.name, "domain": t.custom_domain} for t in eligible_tenants]
+    }
+
+
+@router.post("/batches/{batch_id}/step6/retry-failed")
+async def retry_failed_step6_tenants(
+    batch_id: UUID,
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry Step 6 for all failed tenants in a batch.
+    
+    This specifically targets tenants that have step6_error set.
+    Resets their error state and reruns automation.
+    """
+    display_name = request.get("display_name", "").strip()
+    if not display_name or " " not in display_name:
+        raise HTTPException(
+            400, "Display name must include first and last name (e.g., 'Jack Zuvelek')"
+        )
+    
+    # Verify batch exists
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find all tenants with errors
+    tenant_result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_error.isnot(None),
+            Tenant.step6_complete == False
+        )
+    )
+    failed_tenants = tenant_result.scalars().all()
+    
+    if not failed_tenants:
+        return {
+            "success": False,
+            "message": "No failed tenants found to retry.",
+            "failed_count": 0
+        }
+    
+    # Reset error state for retry
+    for tenant in failed_tenants:
+        tenant.step6_started = False
+        tenant.step6_error = None
+        tenant.step6_complete = False
+    
+    await db.commit()
+    
+    logger.info(f"Retrying Step 6 for {len(failed_tenants)} failed tenants in batch {batch_id}")
+    
+    # Start Azure Automation in background
+    background_tasks.add_task(run_azure_step6_for_batch, batch_id, display_name)
+    
+    return {
+        "success": True,
+        "message": f"Retrying Step 6 for {len(failed_tenants)} failed tenant(s)",
+        "display_name": display_name,
+        "failed_count": len(failed_tenants),
+        "tenants": [{"id": str(t.id), "name": t.name, "domain": t.custom_domain, "error": t.step6_error} for t in failed_tenants]
+    }
+
+
+@router.post("/batches/{batch_id}/step6/reset-stuck")
+async def reset_stuck_step6_tenants(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Reset stuck tenants that show as 'started' but not progressing.
+    
+    Use this when automation appears stuck (showing 'Processing 0 tenant(s)' 
+    but some tenants are marked as started).
+    
+    This resets step6_started=False for tenants that:
+    - Have step6_started=True
+    - Have step6_complete=False
+    - Are not currently showing live progress
+    """
+    # Verify batch exists
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find stuck tenants (started but not complete and no live progress)
+    tenant_result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_started == True,
+            Tenant.step6_complete == False
+        )
+    )
+    stuck_tenants = tenant_result.scalars().all()
+    
+    # Get live progress to filter out actually processing tenants
+    all_progress = get_azure_step6_all_progress()
+    
+    truly_stuck = []
+    for tenant in stuck_tenants:
+        progress = all_progress.get(str(tenant.id), {})
+        # If no live progress or status is not "in_progress", it's stuck
+        if not progress or progress.get("status") != "in_progress":
+            truly_stuck.append(tenant)
+    
+    if not truly_stuck:
+        return {
+            "success": True,
+            "message": "No stuck tenants found.",
+            "reset_count": 0
+        }
+    
+    # Reset stuck tenants
+    for tenant in truly_stuck:
+        tenant.step6_started = False
+        # Keep the error if any, so we can see what happened
+    
+    await db.commit()
+    
+    logger.info(f"Reset {len(truly_stuck)} stuck Step 6 tenants in batch {batch_id}")
+    
+    return {
+        "success": True,
+        "message": f"Reset {len(truly_stuck)} stuck tenant(s). You can now rerun automation.",
+        "reset_count": len(truly_stuck),
+        "tenants": [{"id": str(t.id), "name": t.name, "domain": t.custom_domain} for t in truly_stuck]
+    }
+
+
 @router.post("/batches/{batch_id}/step6/generate-mailboxes", response_model=StepResult)
 async def batch_generate_mailboxes(
     batch_id: UUID,

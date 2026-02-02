@@ -2215,6 +2215,9 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
   const [isStarting, setIsStarting] = useState(false);
   const [isAutomationRunning, setIsAutomationRunning] = useState(false);
   const [isMarkingComplete, setIsMarkingComplete] = useState(false);
+  const [isRerunning, setIsRerunning] = useState(false);
+  const [isRetryingFailed, setIsRetryingFailed] = useState(false);
+  const [isResettingStuck, setIsResettingStuck] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const summary = step6Status?.summary ?? {
     total_tenants: 0,
@@ -2359,6 +2362,109 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
     }
   };
 
+  // Rerun automation for remaining tenants
+  const handleRerunAutomation = async () => {
+    if (!displayName.trim() || !displayName.includes(" ")) {
+      setError("Please enter a full name (first and last name)");
+      return;
+    }
+
+    setIsRerunning(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/rerun`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: displayName.trim() }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "Failed to rerun automation");
+      }
+
+      if (data.success) {
+        setIsAutomationRunning(true);
+        alert(`Restarted automation for ${data.eligible_count} tenant(s)`);
+        fetchStep6Status();
+      } else {
+        setError(data.message || "No eligible tenants found");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to rerun automation");
+    } finally {
+      setIsRerunning(false);
+    }
+  };
+
+  // Retry only failed tenants
+  const handleRetryFailed = async () => {
+    if (!displayName.trim() || !displayName.includes(" ")) {
+      setError("Please enter a full name (first and last name)");
+      return;
+    }
+
+    setIsRetryingFailed(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/retry-failed`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: displayName.trim() }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "Failed to retry failed tenants");
+      }
+
+      if (data.success) {
+        setIsAutomationRunning(true);
+        alert(`Retrying ${data.failed_count} failed tenant(s)`);
+        fetchStep6Status();
+      } else {
+        setError(data.message || "No failed tenants found");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to retry failed tenants");
+    } finally {
+      setIsRetryingFailed(false);
+    }
+  };
+
+  // Reset stuck tenants
+  const handleResetStuck = async () => {
+    setIsResettingStuck(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/reset-stuck`, {
+        method: "POST",
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "Failed to reset stuck tenants");
+      }
+
+      if (data.reset_count > 0) {
+        alert(`Reset ${data.reset_count} stuck tenant(s). You can now rerun automation.`);
+        fetchStep6Status();
+      } else {
+        alert("No stuck tenants found.");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to reset stuck tenants");
+    } finally {
+      setIsResettingStuck(false);
+    }
+  };
+
   // Get status icon
   const getStatusIcon = (tenant: TenantStep6Status) => {
     if (tenant.step6_complete) return "✅";
@@ -2497,6 +2603,60 @@ function Step6Mailboxes({ batchId, status, onComplete }: { batchId: string; stat
             </div>
             <p className="mt-2 text-sm text-blue-600">
               Processing {readyForStep6} tenant(s). This may take ~10 minutes per tenant.
+            </p>
+          </div>
+        )}
+
+        {/* Recovery Actions - shown when not running and there are incomplete/failed tenants */}
+        {!isAutomationRunning && step6Status && (completedTenants < totalTenants || step6Errors > 0) && (
+          <div className="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
+            <h4 className="font-medium text-yellow-800 mb-3">Recovery Actions</h4>
+            <div className="flex flex-wrap gap-3">
+              {/* Rerun for Remaining - show when some tenants haven't completed step6 */}
+              {completedTenants < totalTenants && (
+                <button
+                  onClick={handleRerunAutomation}
+                  disabled={isRerunning || !displayName.includes(" ")}
+                  className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+                    isRerunning || !displayName.includes(" ")
+                      ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                      : "bg-blue-600 text-white hover:bg-blue-700"
+                  }`}
+                >
+                  {isRerunning ? "Rerunning..." : `🔄 Rerun for Remaining (${totalTenants - completedTenants})`}
+                </button>
+              )}
+
+              {/* Retry Failed - show when there are errors */}
+              {step6Errors > 0 && (
+                <button
+                  onClick={handleRetryFailed}
+                  disabled={isRetryingFailed || !displayName.includes(" ")}
+                  className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+                    isRetryingFailed || !displayName.includes(" ")
+                      ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                      : "bg-orange-600 text-white hover:bg-orange-700"
+                  }`}
+                >
+                  {isRetryingFailed ? "Retrying..." : `🔁 Retry Failed (${step6Errors})`}
+                </button>
+              )}
+
+              {/* Reset Stuck - always available when incomplete */}
+              <button
+                onClick={handleResetStuck}
+                disabled={isResettingStuck}
+                className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+                  isResettingStuck
+                    ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                    : "bg-gray-600 text-white hover:bg-gray-700"
+                }`}
+              >
+                {isResettingStuck ? "Resetting..." : "🧹 Reset Stuck Tenants"}
+              </button>
+            </div>
+            <p className="mt-2 text-xs text-yellow-700">
+              💡 If automation appears stuck (showing "Processing 0 tenants"), use "Reset Stuck Tenants" first, then "Rerun for Remaining".
             </p>
           </div>
         )}
