@@ -305,8 +305,8 @@ def setup_domain_with_retry(
     
     for attempt in range(max_retries + 1):
         if attempt > 0:
-            logger.info(f"[{domain}] Retry attempt {attempt}/{max_retries} - waiting 30s before retry...")
-            time.sleep(30)  # Wait before retry to let things settle
+            logger.info(f"[{domain}] Retry attempt {attempt}/{max_retries} - waiting 60s before retry...")
+            time.sleep(60)  # Wait before retry to let resources free up (increased from 30s)
         
         try:
             logger.info(f"[{domain}] Starting setup attempt {attempt + 1}/{max_retries + 1}")
@@ -456,13 +456,37 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         "dkim_selector2_cname": None,
     }
     
-    # ===== SETUP BROWSER =====
+    # ===== SETUP BROWSER WITH RETRY =====
+    # Chrome can fail to start if resources are exhausted - retry up to 3 times
     logger.info(f"[{domain}] Creating browser with headless={headless}")
-    worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
-    driver = worker._create_driver()
-    driver.implicitly_wait(15)  # Increased from 10
-    driver.set_page_load_timeout(60)  # Add page load timeout
-    logger.info(f"[{domain}] Browser initialized successfully")
+    driver = None
+    CHROME_STARTUP_RETRIES = 3
+    CHROME_RETRY_DELAY = 30  # seconds
+    
+    for chrome_attempt in range(CHROME_STARTUP_RETRIES):
+        try:
+            worker = BrowserWorker(worker_id=f"step5-{uuid.uuid4()}", headless=headless)
+            driver = worker._create_driver()
+            driver.implicitly_wait(15)  # Increased from 10
+            driver.set_page_load_timeout(60)  # Add page load timeout
+            logger.info(f"[{domain}] Browser initialized successfully on attempt {chrome_attempt + 1}")
+            break
+        except Exception as e:
+            error_msg = str(e).lower()
+            if "session not created" in error_msg or "chrome" in error_msg:
+                logger.warning(f"[{domain}] Chrome startup failed (attempt {chrome_attempt + 1}/{CHROME_STARTUP_RETRIES}): {e}")
+                if chrome_attempt < CHROME_STARTUP_RETRIES - 1:
+                    logger.info(f"[{domain}] Waiting {CHROME_RETRY_DELAY}s before retrying Chrome startup...")
+                    time.sleep(CHROME_RETRY_DELAY)
+                else:
+                    logger.error(f"[{domain}] Chrome failed to start after {CHROME_STARTUP_RETRIES} attempts")
+                    raise Exception(f"Chrome failed to start after {CHROME_STARTUP_RETRIES} attempts: {e}")
+            else:
+                # Non-Chrome error, re-raise immediately
+                raise
+    
+    if not driver:
+        raise Exception("Failed to create browser driver")
     
     # ===== STEP 1: LOGIN =====
     logger.info(f"[{domain}] Step 1: Login")

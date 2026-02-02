@@ -196,7 +196,7 @@ async def run_step5_for_batch(
     tenants_data = []
     tenant_lookup = {}  # Map domain -> tenant for DB updates later
     
-    STAGGER_INTERVAL = 15  # Seconds between browser launches
+    STAGGER_INTERVAL = 45  # Seconds between browser launches (increased from 15 to prevent resource exhaustion)
     
     for idx, tenant in enumerate(tenants):
         domain_name = tenant.custom_domain or tenant.name
