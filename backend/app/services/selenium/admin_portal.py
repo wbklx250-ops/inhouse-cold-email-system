@@ -1318,98 +1318,199 @@ async def enable_org_smtp_auth(
         # =================================================================
         # STEP 7B: CLICK ON "MAIL FLOW" ROW TO OPEN FLYOUT
         # =================================================================
+        # The Settings page has a list/table with clickable rows
+        # We need to click the ROW itself, not just a text span inside it
         logger.info(f"[{domain}] Step 7: Looking for 'Mail flow' row to click...")
         
-        mail_flow_clicked = False
-        mail_flow_selectors = [
-            # Table row with Mail flow text
-            "//tr[.//td[contains(text(), 'Mail flow')]]",
-            "//div[contains(@class, 'ms-DetailsRow')][.//span[contains(text(), 'Mail flow')]]",
-            # Direct text link
-            "//span[text()='Mail flow']",
-            "//td[text()='Mail flow']",
-            "//a[contains(text(), 'Mail flow')]",
-            # Clickable container with Mail flow
-            "//*[contains(text(), 'Mail flow')][contains(text(), 'Manage')]",
-            "//div[contains(text(), 'Mail flow')]",
-            # Row by description text
-            "//tr[.//td[contains(text(), 'sending and receiving')]]",
-        ]
+        flyout_opened = False
+        max_click_attempts = 3
         
-        for selector in mail_flow_selectors:
-            try:
-                elem = driver.find_element(By.XPATH, selector)
-                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
-                time.sleep(0.5)
-                _save_screenshot(driver, domain, "step7_found_mailflow_row")
-                
-                # Click the element
-                safe_click(driver, elem, "Mail flow row")
-                mail_flow_clicked = True
-                logger.info(f"[{domain}] Step 7: Clicked Mail flow row with selector: {selector}")
-                break
-            except Exception as e:
-                logger.debug(f"[{domain}] Selector failed: {selector} - {e}")
+        for click_attempt in range(max_click_attempts):
+            logger.info(f"[{domain}] Step 7: Click attempt {click_attempt + 1}/{max_click_attempts}")
+            
+            mail_flow_clicked = False
+            
+            # Priority selectors - focus on parent row elements, not child spans/divs
+            mail_flow_selectors = [
+                # TABLE ROW containing Mail flow - highest priority
+                "//tr[.//td[contains(text(), 'Mail flow')]]",
+                "//tr[contains(., 'Mail flow')]",
+                # Fluent UI DetailsRow
+                "//div[@role='row'][.//span[contains(text(), 'Mail flow')]]",
+                "//div[contains(@class, 'ms-DetailsRow')][.//span[contains(text(), 'Mail flow')]]",
+                "//div[@data-automationid='DetailsRow'][.//span[contains(text(), 'Mail flow')]]",
+                # Table cell that's clickable
+                "//td[contains(text(), 'Mail flow')]",
+                # Link or button that opens Mail flow
+                "//a[text()='Mail flow']",
+                "//button[contains(text(), 'Mail flow')]",
+                # Span but get its clickable parent
+                "//span[text()='Mail flow']/ancestor::tr",
+                "//span[text()='Mail flow']/ancestor::div[@role='row']",
+            ]
+            
+            for selector in mail_flow_selectors:
+                try:
+                    elem = driver.find_element(By.XPATH, selector)
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", elem)
+                    time.sleep(0.5)
+                    _save_screenshot(driver, domain, f"step7_found_mailflow_attempt{click_attempt}")
+                    
+                    # Try multiple click methods
+                    click_success = False
+                    
+                    # Method 1: ActionChains with move and click
+                    try:
+                        ActionChains(driver).move_to_element(elem).click().perform()
+                        click_success = True
+                        logger.info(f"[{domain}] Step 7: ActionChains click on: {selector}")
+                    except Exception as e:
+                        logger.debug(f"ActionChains failed: {e}")
+                    
+                    # Method 2: JavaScript click
+                    if not click_success:
+                        try:
+                            driver.execute_script("arguments[0].click();", elem)
+                            click_success = True
+                            logger.info(f"[{domain}] Step 7: JS click on: {selector}")
+                        except Exception as e:
+                            logger.debug(f"JS click failed: {e}")
+                    
+                    # Method 3: Regular click
+                    if not click_success:
+                        try:
+                            elem.click()
+                            click_success = True
+                            logger.info(f"[{domain}] Step 7: Regular click on: {selector}")
+                        except Exception as e:
+                            logger.debug(f"Regular click failed: {e}")
+                    
+                    # Method 4: Double-click (some UIs need this)
+                    if not click_success:
+                        try:
+                            ActionChains(driver).double_click(elem).perform()
+                            click_success = True
+                            logger.info(f"[{domain}] Step 7: Double-click on: {selector}")
+                        except Exception as e:
+                            logger.debug(f"Double-click failed: {e}")
+                    
+                    if click_success:
+                        mail_flow_clicked = True
+                        break
+                        
+                except Exception as e:
+                    logger.debug(f"[{domain}] Selector failed: {selector} - {e}")
+                    continue
+            
+            # If XPath selectors didn't work, try JavaScript approach
+            if not mail_flow_clicked:
+                logger.warning(f"[{domain}] Step 7: Trying JS to find and click Mail flow...")
+                try:
+                    js_clicked = driver.execute_script("""
+                        // Strategy 1: Find the table row containing Mail flow
+                        var rows = document.querySelectorAll('tr');
+                        for (var row of rows) {
+                            if (row.textContent.includes('Mail flow') && 
+                                row.textContent.includes('sending and receiving')) {
+                                row.click();
+                                return 'clicked_tr';
+                            }
+                        }
+                        
+                        // Strategy 2: Find Fluent UI DetailsRow
+                        var detailRows = document.querySelectorAll('[role="row"], .ms-DetailsRow');
+                        for (var row of detailRows) {
+                            if (row.textContent.includes('Mail flow')) {
+                                row.click();
+                                return 'clicked_detailrow';
+                            }
+                        }
+                        
+                        // Strategy 3: Find card/list item
+                        var items = document.querySelectorAll('[role="listitem"], [role="option"], .ms-List-cell');
+                        for (var item of items) {
+                            if (item.textContent.includes('Mail flow')) {
+                                item.click();
+                                return 'clicked_listitem';
+                            }
+                        }
+                        
+                        // Strategy 4: Find any clickable element containing Mail flow
+                        var links = document.querySelectorAll('a, button, [role="button"]');
+                        for (var link of links) {
+                            if (link.textContent.includes('Mail flow')) {
+                                link.click();
+                                return 'clicked_link';
+                            }
+                        }
+                        
+                        // Strategy 5: Find td and simulate click on parent tr
+                        var tds = document.querySelectorAll('td');
+                        for (var td of tds) {
+                            if (td.textContent.trim() === 'Mail flow') {
+                                var tr = td.closest('tr');
+                                if (tr) {
+                                    tr.click();
+                                    return 'clicked_parent_tr';
+                                }
+                                td.click();
+                                return 'clicked_td';
+                            }
+                        }
+                        
+                        return 'not_found';
+                    """)
+                    if js_clicked != 'not_found':
+                        mail_flow_clicked = True
+                        logger.info(f"[{domain}] Step 7: JS clicked Mail flow: {js_clicked}")
+                except Exception as e:
+                    logger.error(f"[{domain}] Step 7: JS fallback failed: {e}")
+            
+            if not mail_flow_clicked:
+                logger.warning(f"[{domain}] Step 7: Could not click Mail flow on attempt {click_attempt + 1}")
+                time.sleep(2)
                 continue
+            
+            # Wait for flyout to open and verify it opened
+            time.sleep(3)
+            _save_screenshot(driver, domain, f"step7_after_click_attempt{click_attempt}")
+            
+            # Check if flyout opened by looking for SMTP content
+            page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+            if "mail flow settings" in page_text or "turn off smtp" in page_text or "smtp auth" in page_text:
+                flyout_opened = True
+                logger.info(f"[{domain}] Step 7: Flyout opened successfully on attempt {click_attempt + 1}")
+                break
+            else:
+                logger.warning(f"[{domain}] Step 7: Click successful but flyout not detected, retrying...")
+                time.sleep(2)
         
-        if not mail_flow_clicked:
-            # Try JavaScript fallback to find and click Mail flow
-            logger.warning(f"[{domain}] Step 7: Trying JS to find Mail flow row...")
-            try:
-                js_clicked = driver.execute_script("""
-                    // Find any element containing "Mail flow" text and click it
-                    var elements = document.querySelectorAll('tr, div, span, td, a');
-                    for (var el of elements) {
-                        if (el.textContent.includes('Mail flow') && 
-                            el.textContent.includes('Manage') ||
-                            el.textContent === 'Mail flow') {
-                            el.click();
-                            return 'clicked';
-                        }
-                    }
-                    // Try clicking on table rows
-                    var rows = document.querySelectorAll('tr');
-                    for (var row of rows) {
-                        if (row.textContent.includes('Mail flow')) {
-                            row.click();
-                            return 'clicked_row';
-                        }
-                    }
-                    return 'not_found';
-                """)
-                if js_clicked in ('clicked', 'clicked_row'):
-                    mail_flow_clicked = True
-                    logger.info(f"[{domain}] Step 7: JS clicked Mail flow: {js_clicked}")
-            except Exception as e:
-                logger.error(f"[{domain}] Step 7: JS fallback failed: {e}")
-        
-        if not mail_flow_clicked:
-            result["error"] = "Could not find or click Mail flow row"
-            logger.error(f"[{domain}] Step 7 FAILED: Could not click Mail flow row")
-            _save_screenshot(driver, domain, "step7_mailflow_not_found")
+        if not flyout_opened:
+            result["error"] = "Could not open Mail flow settings flyout"
+            logger.error(f"[{domain}] Step 7 FAILED: Flyout did not open after {max_click_attempts} attempts")
+            _save_screenshot(driver, domain, "step7_flyout_not_opened")
             return result
         
-        # Wait for flyout to open
-        time.sleep(3)
-        _save_screenshot(driver, domain, "step7_flyout_opening")
+        _save_screenshot(driver, domain, "step7_flyout_opened")
         
         # =================================================================
-        # STEP 7C: WAIT FOR FLYOUT AND FIND SMTP AUTH CHECKBOX
+        # STEP 7C: WAIT FOR FLYOUT CONTENT TO FULLY LOAD
         # =================================================================
-        logger.info(f"[{domain}] Step 7: Waiting for Mail flow settings flyout...")
+        logger.info(f"[{domain}] Step 7: Waiting for Mail flow settings content to load...")
         
-        # Wait for flyout to fully load - look for "Mail flow settings" header
-        flyout_loaded = False
-        for attempt in range(10):
+        # Wait for flyout content to fully load
+        content_loaded = False
+        for attempt in range(15):  # Wait up to 15 seconds
             time.sleep(1)
-            page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            if "mail flow settings" in page_text or "turn off smtp" in page_text:
-                flyout_loaded = True
-                logger.info(f"[{domain}] Step 7: Flyout loaded after {attempt + 1}s")
+            page_text = driver.find_element(By.TAG_NAME, "body").text
+            if "Turn off SMTP AUTH" in page_text or "SMTP AUTH protocol" in page_text:
+                content_loaded = True
+                logger.info(f"[{domain}] Step 7: Flyout content loaded after {attempt + 1}s")
                 break
+            logger.debug(f"[{domain}] Step 7: Waiting for SMTP setting... attempt {attempt + 1}/15")
         
-        if not flyout_loaded:
-            logger.warning(f"[{domain}] Step 7: Flyout may not have loaded, continuing anyway...")
+        if not content_loaded:
+            logger.warning(f"[{domain}] Step 7: SMTP setting text not found in page, trying anyway...")
         
         _save_screenshot(driver, domain, "step7_flyout_loaded")
         
