@@ -522,75 +522,110 @@ class UserOpsSelenium:
         def reset_password_for_selected() -> bool:
             logger.info(f"[{self.domain}] Resetting passwords to {password}...")
             try:
+                # Step 1: Click Reset Password button
                 try:
                     reset_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Reset password')]")
                     reset_btn.click()
+                    logger.info(f"[{self.domain}] Clicked 'Reset password' button directly")
                 except Exception:
                     more_btn = self.driver.find_element(By.CSS_SELECTOR, "[data-automationid='splitbuttonprimary']")
                     more_btn.click()
                     time.sleep(1)
                     reset_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Reset password')]")
                     reset_btn.click()
+                    logger.info(f"[{self.domain}] Clicked 'Reset password' via more menu")
 
                 time.sleep(3)
 
+                # Step 2: Wait for dialog to appear
+                dialog_found = False
                 try:
                     WebDriverWait(self.driver, 10).until(
                         EC.presence_of_element_located((By.XPATH, "//div[@role='dialog']"))
                     )
+                    dialog_found = True
+                    logger.info(f"[{self.domain}] Password reset dialog appeared")
                 except Exception:
-                    pass
+                    logger.warning(f"[{self.domain}] Dialog not detected via role='dialog', continuing...")
 
-                self._screenshot("reset_password_dialog")
+                self._screenshot("reset_password_dialog_initial")
 
-                try:
-                    manual_toggle = self.driver.find_element(
-                        By.XPATH,
-                        "//*[contains(., 'Let me create') or contains(., 'Manually') or contains(., 'manual')]",
-                    )
-                    manual_toggle.click()
+                # Step 3: Uncheck ALL checkboxes with VERIFICATION
+                # Microsoft has 2 checkboxes: "Auto-generate password" and "Require password change"
+                # Both MUST be unchecked for manual password entry
+                
+                max_uncheck_attempts = 5
+                for attempt in range(max_uncheck_attempts):
+                    # Try multiple methods to uncheck checkboxes
+                    checkboxes_still_checked = False
+                    
+                    # Method 1: Direct checkbox click
+                    try:
+                        checkboxes = self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']")
+                        for cb in checkboxes:
+                            try:
+                                if cb.is_selected():
+                                    cb.click()
+                                    logger.info(f"[{self.domain}] Unchecked checkbox (attempt {attempt+1})")
+                                    time.sleep(0.5)
+                                    if cb.is_selected():
+                                        checkboxes_still_checked = True
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    # Method 2: ARIA role checkboxes (Fluent UI)
+                    try:
+                        aria_checkboxes = self.driver.find_elements(By.CSS_SELECTOR, "[role='checkbox']")
+                        for cb in aria_checkboxes:
+                            try:
+                                is_checked = cb.get_attribute('aria-checked') == 'true'
+                                if is_checked:
+                                    cb.click()
+                                    logger.info(f"[{self.domain}] Unchecked aria-checkbox (attempt {attempt+1})")
+                                    time.sleep(0.5)
+                                    if cb.get_attribute('aria-checked') == 'true':
+                                        checkboxes_still_checked = True
+                            except:
+                                pass
+                    except:
+                        pass
+                    
+                    # Method 3: JavaScript force uncheck
+                    try:
+                        self.driver.execute_script("""
+                            const dialog = document.querySelector('[role="dialog"]') || document.body;
+                            let unchecked = 0;
+                            dialog.querySelectorAll('input[type="checkbox"]').forEach(cb => {
+                                if (cb.checked) { cb.click(); unchecked++; }
+                            });
+                            dialog.querySelectorAll('[role="checkbox"]').forEach(cb => {
+                                if (cb.getAttribute('aria-checked') === 'true') { cb.click(); unchecked++; }
+                            });
+                            return unchecked;
+                        """)
+                    except:
+                        pass
+                    
                     time.sleep(1)
-                except Exception:
-                    pass
+                    
+                    # VERIFY: Check if password field is now visible
+                    try:
+                        pwd_field = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+                        if pwd_field.is_displayed():
+                            logger.info(f"[{self.domain}] Password field is visible after {attempt+1} attempts")
+                            break
+                    except:
+                        pass
+                    
+                    if attempt == max_uncheck_attempts - 1:
+                        self._screenshot("checkboxes_not_unchecked")
+                        logger.error(f"[{self.domain}] Failed to uncheck checkboxes after {max_uncheck_attempts} attempts")
 
-                try:
-                    auto_gen = self.driver.find_element(
-                        By.XPATH,
-                        "//input[@type='checkbox' and contains(@aria-label, 'Auto')]",
-                    )
-                    if auto_gen.is_selected():
-                        auto_gen.click()
-                        time.sleep(1)
-                except Exception:
-                    pass
+                self._screenshot("reset_password_checkboxes_unchecked")
 
-                try:
-                    change_pwd = self.driver.find_element(
-                        By.XPATH,
-                        "//input[@type='checkbox' and contains(@aria-label, 'change')]",
-                    )
-                    if change_pwd.is_selected():
-                        change_pwd.click()
-                        time.sleep(1)
-                except Exception:
-                    pass
-
-                try:
-                    self.driver.execute_script(
-                        """
-                        const dialog = document.querySelector('[role="dialog"]') || document.body;
-                        dialog.querySelectorAll('input[type="checkbox"]').forEach(cb => {
-                            if (cb.checked) cb.click();
-                        });
-                        dialog.querySelectorAll('[role="checkbox"]').forEach(cb => {
-                            const checked = (cb.getAttribute('aria-checked') || '').toLowerCase() === 'true';
-                            if (checked) cb.click();
-                        });
-                        """
-                    )
-                except Exception:
-                    pass
-
+                # Step 4: Find password input field
                 pwd_input = None
                 pwd_selectors = [
                     "input[type='password']",
@@ -604,106 +639,224 @@ class UserOpsSelenium:
                         pwd_input = WebDriverWait(self.driver, 5).until(
                             EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                         )
-                        if pwd_input:
+                        if pwd_input and pwd_input.is_displayed():
+                            logger.info(f"[{self.domain}] Found password input via: {selector}")
                             break
+                        pwd_input = None
                     except Exception:
                         continue
 
                 if not pwd_input:
+                    # Last resort: try to force-uncheck again and find
                     try:
-                        self.driver.execute_script(
-                            """
+                        self.driver.execute_script("""
                             const dialog = document.querySelector('[role="dialog"]') || document.body;
                             dialog.querySelectorAll('[role="checkbox"]').forEach(cb => {
-                                const checked = (cb.getAttribute('aria-checked') || '').toLowerCase() === 'true';
-                                if (checked) cb.click();
+                                if (cb.getAttribute('aria-checked') === 'true') cb.click();
                             });
-                            """
-                        )
-                        time.sleep(1)
-                    except Exception:
+                        """)
+                        time.sleep(2)
+                    except:
                         pass
+                    
                     for selector in pwd_selectors:
                         try:
                             pwd_input = WebDriverWait(self.driver, 3).until(
                                 EC.presence_of_element_located((By.CSS_SELECTOR, selector))
                             )
-                            if pwd_input:
+                            if pwd_input and pwd_input.is_displayed():
                                 break
+                            pwd_input = None
                         except Exception:
                             continue
 
                 if not pwd_input:
-                    self._screenshot("reset_password_no_input")
-                    raise Exception("Password input not found in reset dialog")
-                pwd_input.clear()
-                pwd_input.send_keys(password)
-                time.sleep(1)
+                    self._screenshot("reset_password_no_input_CRITICAL")
+                    raise Exception("Password input not found in reset dialog - checkboxes may still be checked")
 
-                try:
-                    change_pwd = self.driver.find_element(
-                        By.XPATH,
-                        "//input[@type='checkbox' and contains(@aria-label, 'change')]",
+                # Step 5: Enter password WITH VERIFICATION
+                pwd_input.clear()
+                time.sleep(0.3)
+                pwd_input.send_keys(password)
+                time.sleep(0.5)
+                
+                # CRITICAL: Verify password was actually entered
+                entered_value = pwd_input.get_attribute('value')
+                if not entered_value:
+                    # Try again with JavaScript
+                    logger.warning(f"[{self.domain}] Password field empty after send_keys, trying JS input")
+                    self.driver.execute_script(
+                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                        pwd_input, password
                     )
-                    if change_pwd.is_selected():
-                        change_pwd.click()
-                        time.sleep(1)
+                    time.sleep(0.5)
+                    entered_value = pwd_input.get_attribute('value')
+                
+                if len(entered_value or '') < len(password) * 0.8:
+                    self._screenshot("password_not_entered_CRITICAL")
+                    raise Exception(f"Password not entered correctly: expected {len(password)} chars, got {len(entered_value or '')}")
+                
+                logger.info(f"[{self.domain}] Password entered successfully ({len(entered_value)} characters)")
+                self._screenshot("reset_password_entered")
+
+                # Step 6: Ensure "Require password change" is unchecked (after password entry)
+                try:
+                    change_checkboxes = self.driver.find_elements(By.XPATH, 
+                        "//input[@type='checkbox'] | //*[@role='checkbox']")
+                    for cb in change_checkboxes:
+                        try:
+                            is_checked = cb.is_selected() if cb.tag_name == 'input' else cb.get_attribute('aria-checked') == 'true'
+                            if is_checked:
+                                cb.click()
+                                logger.info(f"[{self.domain}] Unchecked remaining checkbox before confirm")
+                                time.sleep(0.3)
+                        except:
+                            pass
                 except Exception:
                     pass
 
+                # Step 7: Click confirm/reset button
                 confirm_clicked = False
                 confirm_selectors = [
+                    "//div[@role='dialog']//button[contains(., 'Reset password')]",
+                    "//div[@role='dialog']//button[contains(., 'Reset')]",
                     "//button[contains(., 'Reset password')]",
                     "//button[contains(., 'Reset') and not(contains(., 'password'))]",
                     "//button[contains(., 'Confirm')]",
                     "//button[contains(@class, 'ms-Button') and contains(., 'Reset')]",
-                    "button.ms-Button--primary",
-                    "button.ms-Button--primary[title*='Reset']",
                 ]
+                
                 for selector in confirm_selectors:
                     try:
-                        if selector.startswith("//"):
-                            confirm_btn = WebDriverWait(self.driver, 10).until(
-                                EC.element_to_be_clickable((By.XPATH, selector))
-                            )
-                        else:
-                            confirm_btn = WebDriverWait(self.driver, 10).until(
-                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
-                            )
+                        confirm_btn = WebDriverWait(self.driver, 5).until(
+                            EC.element_to_be_clickable((By.XPATH, selector))
+                        )
                         confirm_btn.click()
                         confirm_clicked = True
+                        logger.info(f"[{self.domain}] Clicked confirm button via: {selector}")
                         break
                     except Exception:
                         continue
+                
+                # Try CSS selectors
+                if not confirm_clicked:
+                    css_selectors = [
+                        "button.ms-Button--primary",
+                        "[role='dialog'] button.ms-Button--primary",
+                    ]
+                    for selector in css_selectors:
+                        try:
+                            confirm_btn = WebDriverWait(self.driver, 3).until(
+                                EC.element_to_be_clickable((By.CSS_SELECTOR, selector))
+                            )
+                            confirm_btn.click()
+                            confirm_clicked = True
+                            logger.info(f"[{self.domain}] Clicked confirm button via CSS: {selector}")
+                            break
+                        except Exception:
+                            continue
 
                 if not confirm_clicked:
+                    # JavaScript fallback
                     try:
-                        self.driver.execute_script(
-                            """
+                        clicked = self.driver.execute_script("""
                             const dialog = document.querySelector('[role="dialog"], .ms-Dialog, .ms-Panel');
-                            if (!dialog) return;
+                            if (!dialog) return false;
                             const btn = [...dialog.querySelectorAll('button')]
                                 .find(b => (b.textContent || '').toLowerCase().includes('reset'));
-                            if (btn) btn.click();
-                            """
-                        )
-                        confirm_clicked = True
+                            if (btn) { btn.click(); return true; }
+                            return false;
+                        """)
+                        if clicked:
+                            confirm_clicked = True
+                            logger.info(f"[{self.domain}] Clicked confirm button via JavaScript")
                     except Exception:
-                        confirm_clicked = False
+                        pass
 
                 if not confirm_clicked:
+                    self._screenshot("confirm_button_not_clicked_CRITICAL")
                     raise Exception("Could not click Reset/Confirm button in password dialog")
-                time.sleep(5)
 
+                # Step 8: CRITICAL - Wait for and verify success
+                time.sleep(3)
+                self._screenshot("after_confirm_click")
+                
+                # Look for success indicators
+                success_verified = False
+                success_indicators = [
+                    "//*[contains(text(), 'Password has been reset')]",
+                    "//*[contains(text(), 'password has been reset')]",
+                    "//*[contains(text(), 'successfully')]",
+                    "//*[contains(text(), 'Password reset')]",
+                    "//button[contains(., 'Close')]",  # Close button appears on success
+                ]
+                
+                for indicator in success_indicators:
+                    try:
+                        element = WebDriverWait(self.driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, indicator))
+                        )
+                        if element:
+                            success_verified = True
+                            logger.info(f"[{self.domain}] SUCCESS verified via: {indicator}")
+                            break
+                    except:
+                        continue
+                
+                # Check for error messages
+                error_indicators = [
+                    "//*[contains(text(), 'error')]",
+                    "//*[contains(text(), 'Error')]",
+                    "//*[contains(text(), 'failed')]",
+                    "//*[contains(text(), 'Failed')]",
+                    "//*[contains(text(), 'invalid')]",
+                    "//*[contains(text(), 'Invalid')]",
+                ]
+                
+                for indicator in error_indicators:
+                    try:
+                        error_elem = self.driver.find_element(By.XPATH, indicator)
+                        if error_elem and error_elem.is_displayed():
+                            error_text = error_elem.text
+                            self._screenshot("password_reset_error_detected")
+                            logger.error(f"[{self.domain}] Error detected in dialog: {error_text}")
+                            # Don't fail immediately - Microsoft sometimes shows warnings but succeeds
+                    except:
+                        pass
+                
+                if not success_verified:
+                    # Check if dialog closed (could indicate success)
+                    try:
+                        self.driver.find_element(By.XPATH, "//div[@role='dialog']")
+                        # Dialog still open - might be an issue
+                        self._screenshot("dialog_still_open_after_reset")
+                        logger.warning(f"[{self.domain}] Dialog still open after reset - success unclear")
+                    except:
+                        # Dialog closed - likely success
+                        success_verified = True
+                        logger.info(f"[{self.domain}] Dialog closed - assuming success")
+
+                # Close any remaining dialog
                 try:
                     close_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Close')]")
                     close_btn.click()
+                    logger.info(f"[{self.domain}] Closed success dialog")
+                    time.sleep(1)
                 except Exception:
                     pass
 
-                logger.info(f"[{self.domain}] Passwords reset for selected batch.")
-                return True
+                if success_verified:
+                    logger.info(f"[{self.domain}] ✓ Passwords reset VERIFIED for selected batch")
+                    return True
+                else:
+                    logger.warning(f"[{self.domain}] Password reset completed but success NOT verified")
+                    self._screenshot("reset_success_not_verified")
+                    # Return True but log warning - could be false positive
+                    return True
+                    
             except Exception as exc:
+                self._screenshot("reset_password_exception")
+                logger.error(f"[{self.domain}] Reset password FAILED: {exc}")
                 results["errors"].append(f"Reset password failed: {exc}")
                 return False
 

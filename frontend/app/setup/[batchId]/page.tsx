@@ -60,6 +60,30 @@ async function postStep(batchId: string, endpoint: string, formData?: FormData):
   return res.json();
 }
 
+async function setStep(batchId: string, step: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/set-step`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ step }),
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Request failed" }));
+    throw new Error(error.detail || "Request failed");
+  }
+  return res.json();
+}
+
+async function rerunStep(batchId: string, stepNumber: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/rerun-step/${stepNumber}`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    const error = await res.json().catch(() => ({ detail: "Request failed" }));
+    throw new Error(error.detail || "Request failed");
+  }
+  return res.json();
+}
+
 export default function BatchWizard() {
   const params = useParams();
   const router = useRouter();
@@ -130,7 +154,46 @@ export default function BatchWizard() {
       </div>
 
       <div className="max-w-4xl mx-auto px-4 py-6">
-        <StepProgress currentStep={activeStep} />
+        <StepProgress 
+          currentStep={activeStep} 
+          batchId={batchId} 
+          onStepClick={async (step) => {
+            // Navigate to the clicked step
+            try {
+              await setStep(batchId, step);
+              setActiveStep(step);
+              await loadStatus();
+            } catch (e) {
+              console.error("Failed to navigate to step:", e);
+            }
+          }}
+        />
+      </div>
+
+      {/* Step Navigation Bar */}
+      <div className="max-w-4xl mx-auto px-4 mb-4">
+        <StepNavigation
+          batchId={batchId}
+          currentStep={activeStep}
+          onNavigate={async (step) => {
+            try {
+              await setStep(batchId, step);
+              setActiveStep(step);
+              await loadStatus();
+            } catch (e) {
+              console.error("Failed to navigate:", e);
+            }
+          }}
+          onRerun={async (step) => {
+            try {
+              const result = await rerunStep(batchId, step);
+              alert(result.message);
+              await loadStatus();
+            } catch (e) {
+              alert(`Failed to rerun step: ${e instanceof Error ? e.message : "Unknown error"}`);
+            }
+          }}
+        />
       </div>
 
       <div className="max-w-4xl mx-auto px-4 pb-12">
@@ -169,7 +232,13 @@ export default function BatchWizard() {
 // ============== STEP COMPONENTS ==============
 // These are the same as before, but pass batchId to postStep()
 
-function StepProgress({ currentStep }: { currentStep: number }) {
+interface StepProgressProps {
+  currentStep: number;
+  batchId?: string;
+  onStepClick?: (step: number) => void;
+}
+
+function StepProgress({ currentStep, batchId, onStepClick }: StepProgressProps) {
   const steps = [
     { num: 1, name: "Domains" },
     { num: 2, name: "Zones" },
@@ -184,16 +253,133 @@ function StepProgress({ currentStep }: { currentStep: number }) {
     <div className="flex items-center justify-between">
       {steps.map((step, i) => (
         <div key={step.num} className="flex items-center">
-          <div className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm
-            ${currentStep > step.num ? "bg-green-500 text-white" : ""}
-            ${currentStep === step.num ? "bg-blue-600 text-white" : ""}
-            ${currentStep < step.num ? "bg-gray-200 text-gray-500" : ""}`}>
+          <button
+            onClick={() => onStepClick?.(step.num)}
+            disabled={!onStepClick}
+            className={`w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm transition-all
+              ${currentStep > step.num ? "bg-green-500 text-white hover:bg-green-600" : ""}
+              ${currentStep === step.num ? "bg-blue-600 text-white ring-2 ring-blue-300" : ""}
+              ${currentStep < step.num ? "bg-gray-200 text-gray-500 hover:bg-gray-300" : ""}
+              ${onStepClick ? "cursor-pointer" : "cursor-default"}`}
+            title={`Go to Step ${step.num}: ${step.name}`}
+          >
             {currentStep > step.num ? "✓" : step.num}
-          </div>
+          </button>
           <span className="ml-2 text-sm font-medium hidden sm:inline">{step.name}</span>
           {i < steps.length - 1 && <div className="w-8 lg:w-16 h-1 mx-2 bg-gray-200" />}
         </div>
       ))}
+    </div>
+  );
+}
+
+interface StepNavigationProps {
+  batchId: string;
+  currentStep: number;
+  onNavigate: (step: number) => void;
+  onRerun: (step: number) => void;
+}
+
+function StepNavigation({ batchId, currentStep, onNavigate, onRerun }: StepNavigationProps) {
+  const [rerunning, setRerunning] = useState<number | null>(null);
+
+
+  // Steps that support re-run automation
+  const rerunableSteps = [4, 5, 6, 7];
+  const stepNames: Record<number, string> = {
+    1: "Domains",
+    2: "Zones", 
+    3: "Nameservers",
+    4: "Tenants",
+    5: "Email Setup",
+    6: "Mailboxes",
+    7: "Sequencer",
+  };
+
+  const handleRerun = async (step: number) => {
+    setRerunning(step);
+    try {
+      await onRerun(step);
+    } finally {
+      setRerunning(null);
+    }
+  };
+
+  return (
+    <div className="bg-white border rounded-lg p-4 shadow-sm">
+      <div className="flex items-center justify-between">
+        {/* Previous/Next Navigation */}
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => onNavigate(currentStep - 1)}
+            disabled={currentStep <= 1}
+            className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors
+              ${currentStep <= 1 
+                ? "bg-gray-100 text-gray-400 cursor-not-allowed" 
+                : "bg-gray-200 text-gray-700 hover:bg-gray-300"
+              }`}
+          >
+            ← Previous
+          </button>
+          
+          <span className="text-sm text-gray-600 font-medium">
+            Step {currentStep}: {stepNames[currentStep] || "Complete"}
+          </span>
+
+          <button
+            onClick={() => onNavigate(currentStep + 1)}
+            disabled={currentStep >= 7}
+            className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors
+              ${currentStep >= 7 
+                ? "bg-gray-100 text-gray-400 cursor-not-allowed" 
+                : "bg-blue-600 text-white hover:bg-blue-700"
+              }`}
+          >
+            Next →
+          </button>
+        </div>
+
+        {/* Re-run Button for Current Step */}
+        <div className="flex items-center gap-2">
+          {rerunableSteps.includes(currentStep) && (
+            <button
+              onClick={() => handleRerun(currentStep)}
+              disabled={rerunning !== null}
+              className={`px-4 py-2 rounded-lg font-medium flex items-center gap-2 transition-colors
+                ${rerunning !== null
+                  ? "bg-orange-100 text-orange-400 cursor-not-allowed"
+                  : "bg-orange-500 text-white hover:bg-orange-600"
+                }`}
+              title={`Re-run Step ${currentStep} automation`}
+            >
+              {rerunning === currentStep ? (
+                <>
+                  <span className="animate-spin">⟳</span>
+                  Rerunning...
+                </>
+              ) : (
+                <>
+                  🔄 Re-run Step {currentStep}
+                </>
+              )}
+            </button>
+          )}
+          
+          {/* Quick jump dropdown for all steps */}
+          <select
+            value={currentStep}
+            onChange={(e) => onNavigate(parseInt(e.target.value))}
+            className="px-3 py-2 border rounded-lg text-sm bg-white hover:bg-gray-50 cursor-pointer"
+            title="Jump to step"
+          >
+            {[1, 2, 3, 4, 5, 6, 7].map((step) => (
+              <option key={step} value={step}>
+                Step {step}: {stepNames[step]}
+              </option>
+            ))}
+          </select>
+        </div>
+      </div>
     </div>
   );
 }

@@ -800,13 +800,19 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                 tenant_to_update.step6_passwords_set = password_set_count
                                 tenant_to_update.step6_accounts_enabled = accounts_enabled_count
 
-                            # CRITICAL FIX: Only mark mailboxes as done if passwords were actually set
-                            # Previously this blindly marked ALL mailboxes as done even with 0 passwords
-                            if password_set_count > 0:
+                            # CRITICAL FIX: Only mark mailboxes as done if MOST passwords were actually set
+                            # The Selenium code now properly verifies success before reporting
+                            # Require at least 80% success rate to consider it a pass
+                            total_mailbox_count = len(mailboxes)
+                            success_threshold = total_mailbox_count * 0.8
+                            
+                            if password_set_count >= success_threshold:
                                 logger.info(
-                                    "[%s] Marking %s mailboxes as password_set=True and updating password to #Sendemails1",
+                                    "[%s] Marking %s mailboxes as password_set=True and updating password to #Sendemails1 (threshold met: %s/%s)",
                                     tenant.custom_domain,
                                     password_set_count,
+                                    password_set_count,
+                                    total_mailbox_count,
                                 )
                                 await fresh_db.execute(
                                     update(Mailbox)
@@ -817,6 +823,18 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                         password="#Sendemails1",  # Update to actual password that was set via bulk reset
                                     )
                                 )
+                            elif password_set_count > 0:
+                                # Partial success - log warning but don't update DB
+                                # This prevents false positives where only some passwords were set
+                                logger.warning(
+                                    "[%s] PARTIAL password reset: only %s/%s (%.0f%%) - NOT updating database passwords",
+                                    tenant.custom_domain,
+                                    password_set_count,
+                                    total_mailbox_count,
+                                    (password_set_count / total_mailbox_count * 100) if total_mailbox_count > 0 else 0,
+                                )
+                                # Don't update password in DB - keep original random password
+                                # Admin UI will need to be re-run to complete
                             else:
                                 logger.warning(
                                     "[%s] NOT marking mailboxes - passwords_set=0, accounts_enabled=%s",

@@ -302,6 +302,171 @@ async def advance_batch_step(batch_id: UUID, db: AsyncSession = Depends(get_db))
     return {"success": True, "current_step": batch.current_step}
 
 
+class SetStepRequest(BaseModel):
+    """Schema for setting step directly."""
+    step: int
+
+
+@router.post("/batches/{batch_id}/set-step")
+async def set_batch_step(
+    batch_id: UUID,
+    request: SetStepRequest,
+    db: AsyncSession = Depends(get_db)
+):
+    """Set batch to a specific step (allows backward and forward navigation)."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    step = request.step
+    if step < 1 or step > 7:
+        raise HTTPException(status_code=400, detail="Step must be between 1 and 7")
+    
+    old_step = batch.current_step
+    batch.current_step = step
+    await db.commit()
+    
+    logger.info(f"Batch {batch_id} moved from step {old_step} to step {step}")
+    
+    return {
+        "success": True,
+        "previous_step": old_step,
+        "current_step": step
+    }
+
+
+@router.post("/batches/{batch_id}/rerun-step/{step_number}")
+async def rerun_step(
+    batch_id: UUID,
+    step_number: int,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Re-run automation for a specific step.
+    
+    This resets the relevant flags for entries that haven't completed
+    that step and triggers the automation again.
+    
+    Supported steps:
+    - Step 2: Re-run zone creation for domains without zones
+    - Step 3: Re-run propagation check
+    - Step 4: Re-run first-login for tenants not completed
+    - Step 5: Re-run M365/DKIM for tenants not completed
+    - Step 6: Re-run mailbox creation for tenants not completed
+    - Step 7: Re-run SMTP auth for tenants not completed
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    if step_number < 1 or step_number > 7:
+        raise HTTPException(status_code=400, detail="Step must be between 1 and 7")
+    
+    result = {"success": True, "step": step_number, "message": "", "reset_count": 0}
+    
+    if step_number == 1:
+        # Step 1: Import domains - nothing to rerun, just navigation
+        result["message"] = "Step 1 (Import Domains) has no automation to rerun. Use the upload form to add more domains."
+    
+    elif step_number == 2:
+        # Step 2: Create zones - count domains without zones
+        domains_without_zones = await db.scalar(
+            select(func.count(Domain.id)).where(
+                Domain.batch_id == batch_id,
+                Domain.cloudflare_zone_id.is_(None)
+            )
+        ) or 0
+        result["reset_count"] = domains_without_zones
+        result["message"] = f"Ready to create zones for {domains_without_zones} domain(s). Use 'Create Zones' button."
+    
+    elif step_number == 3:
+        # Step 3: Propagation check - just triggers a new check
+        result["message"] = "Propagation check will be re-run. Use 'Check Propagation' button."
+    
+    elif step_number == 4:
+        # Step 4: First login - reset failed tenants
+        failed_tenants = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.first_login_completed == False
+            )
+        )
+        tenants_to_reset = failed_tenants.scalars().all()
+        
+        for tenant in tenants_to_reset:
+            tenant.setup_error = None
+        
+        await db.commit()
+        
+        result["reset_count"] = len(tenants_to_reset)
+        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for first-login automation. Use 'Start Automation' button."
+    
+    elif step_number == 5:
+        # Step 5: M365/DKIM - reset incomplete tenants
+        incomplete_tenants = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.dkim_enabled != True
+            )
+        )
+        tenants_to_reset = incomplete_tenants.scalars().all()
+        
+        for tenant in tenants_to_reset:
+            tenant.setup_error = None
+        
+        await db.commit()
+        
+        result["reset_count"] = len(tenants_to_reset)
+        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for M365/DKIM automation. Use 'Start Automation' button."
+    
+    elif step_number == 6:
+        # Step 6: Mailbox creation - reset incomplete tenants
+        incomplete_tenants = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.step6_complete == False
+            )
+        )
+        tenants_to_reset = incomplete_tenants.scalars().all()
+        
+        for tenant in tenants_to_reset:
+            tenant.step6_started = False
+            tenant.step6_error = None
+        
+        await db.commit()
+        
+        result["reset_count"] = len(tenants_to_reset)
+        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for mailbox creation. Use 'Start Mailbox Creation' button."
+    
+    elif step_number == 7:
+        # Step 7: SMTP Auth - reset incomplete tenants
+        incomplete_tenants = await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.step6_complete == True,
+                Tenant.step7_complete == False
+            )
+        )
+        tenants_to_reset = incomplete_tenants.scalars().all()
+        
+        for tenant in tenants_to_reset:
+            tenant.step7_error = None
+        
+        await db.commit()
+        
+        result["reset_count"] = len(tenants_to_reset)
+        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth. Use 'Start Step 7' button."
+    
+    # Update batch to target step
+    batch.current_step = step_number
+    await db.commit()
+    
+    logger.info(f"Batch {batch_id} rerun step {step_number}: {result['message']}")
+    
+    return result
+
+
 # ============== BATCH STATUS ==============
 
 @router.get("/batches/{batch_id}/status", response_model=BatchWizardStatus)
