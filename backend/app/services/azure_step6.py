@@ -220,21 +220,12 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         )
         actual_password_set_count = password_set_count_result.scalar() or 0
         
-        # Determine what needs to run based on actual mailbox state
-        # RETRY FIX: Run PowerShell if ANY mailbox needs creation or delegation (not threshold-based)
-        # This ensures retries will attempt to complete partial work
-        if total_mailbox_count > 0:
-            # Run PowerShell if ANY mailbox is missing creation OR delegation
-            needs_powershell = (
-                actual_created_count < total_mailbox_count or 
-                actual_delegated_count < total_mailbox_count
-            )
-            # Run Admin UI if ANY mailbox is missing password
-            needs_admin_ui = actual_password_set_count < total_mailbox_count
-        else:
-            # No mailboxes yet - need to create them
-            needs_powershell = True
-            needs_admin_ui = True
+        # FORCE RETRY FIX: ALWAYS run PowerShell and Admin UI on retry
+        # The database may falsely show completion when M365 tenant was recreated
+        # Licensed user check happens separately and correctly skips if already created
+        # But mailbox creation/delegation/passwords must ALWAYS be re-attempted
+        needs_powershell = True  # ALWAYS attempt PowerShell operations
+        needs_admin_ui = True    # ALWAYS attempt Admin UI password reset
         
         logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
                     tenant.custom_domain, total_mailbox_count, actual_created_count, 
@@ -547,15 +538,12 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                         "Creating shared mailboxes via PowerShell",
                     )
 
-                    # RETRY FIX: Include mailboxes that need creation OR delegation (not just uncreated)
-                    # This ensures retries will complete partial work from previous runs
-                    mailboxes_to_process = [
-                        mb for mb in mailbox_data_payload
-                        if not mailboxes_by_email.get(mb["email"]).created_in_exchange
-                        or not mailboxes_by_email.get(mb["email"]).delegated
-                    ]
+                    # FORCE RETRY FIX: ALWAYS process ALL mailboxes on retry
+                    # The database may falsely show completion when M365 tenant was recreated
+                    # PowerShell handles "already exists" gracefully for creation and delegation
+                    mailboxes_to_process = mailbox_data_payload  # Process ALL mailboxes
                     
-                    logger.info("[%s] Mailboxes to process: %s (need creation or delegation)", 
+                    logger.info("[%s] FORCE RETRY: Processing ALL %s mailboxes (ignoring DB flags)", 
                                 tenant.custom_domain, len(mailboxes_to_process))
 
                     try:
