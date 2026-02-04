@@ -221,21 +221,20 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         actual_password_set_count = password_set_count_result.scalar() or 0
         
         # Determine what needs to run based on actual mailbox state
-        # PowerShell is needed if we don't have 90%+ created AND delegated
-        completion_threshold = 0.9
+        # RETRY FIX: Run PowerShell if ANY mailbox needs creation or delegation (not threshold-based)
+        # This ensures retries will attempt to complete partial work
         if total_mailbox_count > 0:
-            powershell_done = (
-                actual_created_count >= total_mailbox_count * completion_threshold and 
-                actual_delegated_count >= total_mailbox_count * completion_threshold
+            # Run PowerShell if ANY mailbox is missing creation OR delegation
+            needs_powershell = (
+                actual_created_count < total_mailbox_count or 
+                actual_delegated_count < total_mailbox_count
             )
-            admin_ui_done = actual_password_set_count >= total_mailbox_count * completion_threshold
+            # Run Admin UI if ANY mailbox is missing password
+            needs_admin_ui = actual_password_set_count < total_mailbox_count
         else:
             # No mailboxes yet - need to create them
-            powershell_done = False
-            admin_ui_done = False
-        
-        needs_powershell = not powershell_done
-        needs_admin_ui = not admin_ui_done
+            needs_powershell = True
+            needs_admin_ui = True
         
         logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
                     tenant.custom_domain, total_mailbox_count, actual_created_count, 
@@ -548,16 +547,22 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                         "Creating shared mailboxes via PowerShell",
                     )
 
-                    mailboxes_to_create = [
+                    # RETRY FIX: Include mailboxes that need creation OR delegation (not just uncreated)
+                    # This ensures retries will complete partial work from previous runs
+                    mailboxes_to_process = [
                         mb for mb in mailbox_data_payload
                         if not mailboxes_by_email.get(mb["email"]).created_in_exchange
+                        or not mailboxes_by_email.get(mb["email"]).delegated
                     ]
+                    
+                    logger.info("[%s] Mailboxes to process: %s (need creation or delegation)", 
+                                tenant.custom_domain, len(mailboxes_to_process))
 
                     try:
                         ps_results = await run_with_powershell_retry(
                             "PowerShell mailbox creation",
                             lambda: ps_service.create_shared_mailboxes(
-                                mailboxes=mailboxes_to_create,
+                                mailboxes=mailboxes_to_process,
                                 delegate_to=delegate_to,
                             ),
                         )
