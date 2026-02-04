@@ -206,7 +206,8 @@ class BrowserWorker:
     def _create_driver(self):
         opts = Options()
         if self.headless:
-            opts.add_argument("--headless=new")
+            # Use legacy headless flag for maximum compatibility on Windows
+            opts.add_argument("--headless")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")

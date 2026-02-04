@@ -94,10 +94,12 @@ export default function BatchWizard() {
   const [error, setError] = useState<string | null>(null);
   const [activeStep, setActiveStep] = useState(1);
   const [nameserversConfirmed, setNameserversConfirmed] = useState(false);
+  const [suppressStep7AutoComplete, setSuppressStep7AutoComplete] = useState(false);
 
   useEffect(() => {
     if (batchId) {
       setNameserversConfirmed(false);
+      setSuppressStep7AutoComplete(false);
       loadStatus();
     }
   }, [batchId]);
@@ -148,7 +150,7 @@ export default function BatchWizard() {
           </button>
           <h1 className="text-2xl font-bold text-gray-900">{status?.batch_name}</h1>
           <p className="text-gray-600 mt-1">
-            Step {activeStep} of 7 • {status?.status === "completed" ? "Completed" : "In Progress"}
+            Step {activeStep > 7 ? 7 : activeStep} of 7 • {status?.status === "completed" ? "Completed" : "In Progress"}
           </p>
         </div>
       </div>
@@ -160,6 +162,7 @@ export default function BatchWizard() {
           onStepClick={async (step) => {
             // Navigate to the clicked step
             try {
+              setSuppressStep7AutoComplete(step === 7);
               await setStep(batchId, step);
               setActiveStep(step);
               await loadStatus();
@@ -177,6 +180,7 @@ export default function BatchWizard() {
           currentStep={activeStep}
           onNavigate={async (step) => {
             try {
+              setSuppressStep7AutoComplete(step === 7);
               await setStep(batchId, step);
               setActiveStep(step);
               await loadStatus();
@@ -215,11 +219,12 @@ export default function BatchWizard() {
           {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(4)} />}
           {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={loadStatus} />}
           {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(6)} />}
-          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(7)} />}
+          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} onNext={() => { setSuppressStep7AutoComplete(false); setActiveStep(7); }} />}
           {activeStep === 7 && (
             <Step7SequencerPrep
               batchId={batchId}
-              onComplete={() => setActiveStep(8)}
+              suppressAutoComplete={suppressStep7AutoComplete}
+              onComplete={() => { setSuppressStep7AutoComplete(false); setActiveStep(8); }}
             />
           )}
           {activeStep === 8 && (
@@ -228,6 +233,7 @@ export default function BatchWizard() {
               status={status} 
               onGoBack={async (step) => {
                 try {
+                  setSuppressStep7AutoComplete(step === 7);
                   await setStep(batchId, step);
                   setActiveStep(step);
                   await loadStatus();

@@ -339,7 +339,8 @@ async def set_batch_step(
 async def rerun_step(
     batch_id: UUID,
     step_number: int,
-    background_tasks: BackgroundTasks,
+    force: bool = False,
+    background_tasks: BackgroundTasks = None,
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -348,13 +349,17 @@ async def rerun_step(
     This resets the relevant flags for entries that haven't completed
     that step and triggers the automation again.
     
+    Query Parameters:
+    - force: If True, resets ALL tenants (even those marked as completed).
+             Use this when the system thinks it succeeded but it actually didn't.
+    
     Supported steps:
     - Step 2: Re-run zone creation for domains without zones
     - Step 3: Re-run propagation check
-    - Step 4: Re-run first-login for tenants not completed
-    - Step 5: Re-run M365/DKIM for tenants not completed
-    - Step 6: Re-run mailbox creation for tenants not completed
-    - Step 7: Re-run SMTP auth for tenants not completed
+    - Step 4: Re-run first-login for tenants not completed (or ALL if force=true)
+    - Step 5: Re-run M365/DKIM for tenants not completed (or ALL if force=true)
+    - Step 6: Re-run mailbox creation for tenants not completed (or ALL if force=true)
+    - Step 7: Re-run SMTP auth for tenants not completed (or ALL if force=true)
     """
     batch = await db.get(SetupBatch, batch_id)
     if not batch:
@@ -363,7 +368,7 @@ async def rerun_step(
     if step_number < 1 or step_number > 7:
         raise HTTPException(status_code=400, detail="Step must be between 1 and 7")
     
-    result = {"success": True, "step": step_number, "message": "", "reset_count": 0}
+    result = {"success": True, "step": step_number, "message": "", "reset_count": 0, "force": force}
     
     if step_number == 1:
         # Step 1: Import domains - nothing to rerun, just navigation
@@ -385,84 +390,192 @@ async def rerun_step(
         result["message"] = "Propagation check will be re-run. Use 'Check Propagation' button."
     
     elif step_number == 4:
-        # Step 4: First login - reset failed tenants
-        failed_tenants = await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.first_login_completed == False
+        # Step 4: First login - reset tenants
+        if force:
+            # FORCE: Reset ALL tenants (even completed ones)
+            all_tenants = await db.execute(
+                select(Tenant).where(Tenant.batch_id == batch_id)
             )
-        )
-        tenants_to_reset = failed_tenants.scalars().all()
-        
-        for tenant in tenants_to_reset:
-            tenant.setup_error = None
-        
-        await db.commit()
-        
-        result["reset_count"] = len(tenants_to_reset)
-        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for first-login automation. Use 'Start Automation' button."
+            tenants_to_reset = all_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.first_login_completed = False
+                tenant.totp_secret = None
+                tenant.password_changed = False
+                tenant.first_login_at = None
+                tenant.security_defaults_disabled = False
+                tenant.setup_error = None
+                tenant.status = TenantStatus.IMPORTED if tenant.domain_id else TenantStatus.IMPORTED
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for first-login automation. Use 'Start Automation' button."
+            logger.warning(f"FORCE RERUN Step 4: Reset {len(tenants_to_reset)} tenants including completed ones")
+        else:
+            # Normal: Only reset failed/incomplete tenants
+            failed_tenants = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.first_login_completed == False
+                )
+            )
+            tenants_to_reset = failed_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.setup_error = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for first-login automation. Use 'Start Automation' button."
     
     elif step_number == 5:
-        # Step 5: M365/DKIM - reset incomplete tenants
-        incomplete_tenants = await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.dkim_enabled != True
+        # Step 5: M365/DKIM - reset tenants
+        if force:
+            # FORCE: Reset ALL tenants (even completed ones)
+            all_tenants = await db.execute(
+                select(Tenant).where(Tenant.batch_id == batch_id)
             )
-        )
-        tenants_to_reset = incomplete_tenants.scalars().all()
-        
-        for tenant in tenants_to_reset:
-            tenant.setup_error = None
-        
-        await db.commit()
-        
-        result["reset_count"] = len(tenants_to_reset)
-        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for M365/DKIM automation. Use 'Start Automation' button."
+            tenants_to_reset = all_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.domain_added_to_m365 = False
+                tenant.domain_verified_in_m365 = False
+                tenant.domain_verified_at = None
+                tenant.m365_verification_txt = None
+                tenant.mx_record_added = False
+                tenant.spf_record_added = False
+                tenant.autodiscover_added = False
+                tenant.dkim_selector1 = None
+                tenant.dkim_selector2 = None
+                tenant.dkim_cnames_added = False
+                tenant.dkim_enabled = False
+                tenant.dkim_enabled_at = None
+                tenant.step5_complete = False
+                tenant.step5_completed_at = None
+                tenant.setup_error = None
+                # Reset status to DOMAIN_LINKED if has domain, else keep current
+                if tenant.domain_id:
+                    tenant.status = TenantStatus.DOMAIN_LINKED
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for M365/DKIM automation. All verification and DKIM flags cleared. Use 'Start Automation' button."
+            logger.warning(f"FORCE RERUN Step 5: Reset {len(tenants_to_reset)} tenants including completed ones")
+        else:
+            # Normal: Only reset incomplete tenants
+            incomplete_tenants = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.dkim_enabled != True
+                )
+            )
+            tenants_to_reset = incomplete_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.setup_error = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for M365/DKIM automation. Use 'Start Automation' button."
     
     elif step_number == 6:
-        # Step 6: Mailbox creation - reset incomplete tenants
-        incomplete_tenants = await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.step6_complete == False
+        # Step 6: Mailbox creation - reset tenants
+        if force:
+            # FORCE: Reset ALL tenants (even completed ones)
+            all_tenants = await db.execute(
+                select(Tenant).where(Tenant.batch_id == batch_id)
             )
-        )
-        tenants_to_reset = incomplete_tenants.scalars().all()
-        
-        for tenant in tenants_to_reset:
-            tenant.step6_started = False
-            tenant.step6_error = None
-        
-        await db.commit()
-        
-        result["reset_count"] = len(tenants_to_reset)
-        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for mailbox creation. Use 'Start Mailbox Creation' button."
+            tenants_to_reset = all_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.step6_started = False
+                tenant.step6_complete = False
+                tenant.step6_completed_at = None
+                tenant.step6_error = None
+                tenant.step6_mailboxes_created = 0
+                tenant.step6_display_names_fixed = 0
+                tenant.step6_accounts_enabled = 0
+                tenant.step6_passwords_set = 0
+                tenant.step6_upns_fixed = 0
+                tenant.step6_delegations_done = 0
+                tenant.licensed_user_upn = None
+                tenant.licensed_user_password = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for mailbox creation. All Step 6 progress cleared. Use 'Start Mailbox Creation' button."
+            logger.warning(f"FORCE RERUN Step 6: Reset {len(tenants_to_reset)} tenants including completed ones")
+        else:
+            # Normal: Only reset incomplete tenants
+            incomplete_tenants = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == False
+                )
+            )
+            tenants_to_reset = incomplete_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.step6_started = False
+                tenant.step6_error = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for mailbox creation. Use 'Start Mailbox Creation' button."
     
     elif step_number == 7:
-        # Step 7: SMTP Auth - reset incomplete tenants
-        incomplete_tenants = await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.step6_complete == True,
-                Tenant.step7_complete == False
+        # Step 7: SMTP Auth - reset tenants
+        if force:
+            # FORCE: Reset ALL tenants with step6 complete (even those with step7 complete)
+            all_tenants = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == True
+                )
             )
-        )
-        tenants_to_reset = incomplete_tenants.scalars().all()
-        
-        for tenant in tenants_to_reset:
-            tenant.step7_error = None
-        
-        await db.commit()
-        
-        result["reset_count"] = len(tenants_to_reset)
-        result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth. Use 'Start Step 7' button."
+            tenants_to_reset = all_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.step7_complete = False
+                tenant.step7_completed_at = None
+                tenant.step7_smtp_auth_enabled = False
+                tenant.step7_error = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for SMTP Auth. All Step 7 flags cleared. Use 'Start Step 7' button."
+            logger.warning(f"FORCE RERUN Step 7: Reset {len(tenants_to_reset)} tenants including completed ones")
+        else:
+            # Normal: Only reset incomplete tenants
+            incomplete_tenants = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == True,
+                    Tenant.step7_complete == False
+                )
+            )
+            tenants_to_reset = incomplete_tenants.scalars().all()
+            
+            for tenant in tenants_to_reset:
+                tenant.step7_error = None
+            
+            await db.commit()
+            
+            result["reset_count"] = len(tenants_to_reset)
+            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth. Use 'Start Step 7' button."
     
     # Update batch to target step
     batch.current_step = step_number
     await db.commit()
     
-    logger.info(f"Batch {batch_id} rerun step {step_number}: {result['message']}")
+    logger.info(f"Batch {batch_id} rerun step {step_number} (force={force}): {result['message']}")
     
     return result
 
@@ -3327,6 +3440,7 @@ async def _run_step7_batch(batch_id: UUID, tenant_ids: list):
             )
 
             tenant.step7_smtp_auth_enabled = automation_result.get("smtp_auth_enabled", False)
+            tenant.security_defaults_disabled = automation_result.get("security_defaults_disabled", False)
             tenant.step7_error = automation_result.get("error")
 
             if automation_result.get("success"):
@@ -3414,6 +3528,7 @@ async def get_step7_status(
                 "domain": t.custom_domain or t.name,
                 "step7_complete": getattr(t, "step7_complete", False) or False,
                 "smtp_auth_enabled": getattr(t, "step7_smtp_auth_enabled", False) or False,
+                "security_defaults_disabled": getattr(t, "security_defaults_disabled", False) or False,
                 "error": getattr(t, "step7_error", None),
                 "completed_at": t.step7_completed_at.isoformat()
                 if getattr(t, "step7_completed_at", None)
@@ -3468,6 +3583,45 @@ async def retry_step7_failed(
     return {
         "success": True,
         "message": f"Retrying Step 7 for {len(failed_tenants)} tenants",
+    }
+
+
+@router.post("/batches/{batch_id}/step7/rerun-all")
+async def rerun_step7_all(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Rerun Step 7 for all eligible tenants (resets completion + errors)."""
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+        )
+    )
+    eligible = result.scalars().all()
+
+    if not eligible:
+        return {
+            "success": False,
+            "error": "No tenants with completed Step 6. Complete mailbox creation first.",
+        }
+
+    for tenant in eligible:
+        tenant.step7_complete = False
+        tenant.step7_error = None
+        tenant.step7_smtp_auth_enabled = False
+        tenant.security_defaults_disabled = False
+
+    await db.commit()
+
+    tenant_ids = [t.id for t in eligible]
+    import asyncio
+    asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+
+    return {
+        "success": True,
+        "message": f"Rerunning Step 7 for {len(tenant_ids)} tenants",
+        "processing": len(tenant_ids),
     }
 
 

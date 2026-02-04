@@ -7,6 +7,7 @@ interface TenantStep7Status {
   domain: string;
   step7_complete: boolean;
   smtp_auth_enabled: boolean;
+  security_defaults_disabled: boolean;
   error: string | null;
   completed_at: string | null;
 }
@@ -23,9 +24,10 @@ interface Step7Status {
 interface Props {
   batchId: string;
   onComplete?: () => void;
+  suppressAutoComplete?: boolean;
 }
 
-export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
+export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoComplete }: Props) {
   const [status, setStatus] = useState<Step7Status | null>(null);
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -48,7 +50,7 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
         }
 
         // Notify parent if batch is fully complete
-        if (data.batch_complete) {
+        if (data.batch_complete && !suppressAutoComplete) {
           onComplete?.();
         }
       }
@@ -57,7 +59,7 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
     } finally {
       setLoading(false);
     }
-  }, [batchId, API_BASE, onComplete]);
+  }, [batchId, API_BASE, onComplete, suppressAutoComplete]);
 
   useEffect(() => {
     fetchStatus();
@@ -108,6 +110,25 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
     }
   };
 
+  const rerunAll = async () => {
+    setError(null);
+    setIsRunning(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/wizard/batches/${batchId}/step7/rerun-all`,
+        { method: "POST" }
+      );
+      const data = await res.json();
+      if (!data.success) {
+        setError(data.error || "Failed to rerun Step 7");
+        setIsRunning(false);
+      }
+    } catch (err) {
+      setError("Network error rerunning Step 7");
+      setIsRunning(false);
+    }
+  };
+
   if (loading) {
     return <div className="p-6 text-gray-500">Loading Step 7 status...</div>;
   }
@@ -134,9 +155,10 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          Logs into each tenant's Exchange Admin Center and unchecks "Turn off
-          SMTP AUTH protocol" under Settings &rarr; Mail flow. This is one
-          toggle per tenant and takes about 30 seconds each.
+          Disables Security Defaults in Entra ID, then logs into each tenant's
+          Exchange Admin Center and unchecks "Turn off SMTP AUTH protocol"
+          under Settings &rarr; Mail flow. This is one toggle per tenant and
+          takes about 30 seconds each.
         </p>
         <p className="mt-2 text-blue-600">
           <strong>Note:</strong> Microsoft may take up to 1 hour to fully sync
@@ -243,6 +265,20 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
             Retry {status.failed} Failed
           </button>
         )}
+
+        {status && status.eligible > 0 && (
+          <button
+            onClick={rerunAll}
+            disabled={isRunning}
+            className={`px-6 py-2.5 rounded-lg font-medium transition-colors ${
+              isRunning
+                ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                : "bg-gray-100 text-gray-700 hover:bg-gray-200"
+            }`}
+          >
+            Rerun Step 7
+          </button>
+        )}
       </div>
 
       {/* Error */}
@@ -286,6 +322,9 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
                   Domain
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                  Security Defaults
+                </th>
+                <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                   SMTP Auth
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
@@ -301,6 +340,15 @@ export default function Step7SequencerPrep({ batchId, onComplete }: Props) {
                 <tr key={t.id} className="hover:bg-gray-50">
                   <td className="px-4 py-3 text-sm font-medium text-gray-900">
                     {t.domain}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    {t.security_defaults_disabled ? (
+                      <span className="text-green-500 text-lg">&#10003;</span>
+                    ) : t.error ? (
+                      <span className="text-red-500 text-lg">&#10007;</span>
+                    ) : (
+                      <span className="text-gray-300">&mdash;</span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-center">
                     {t.smtp_auth_enabled ? (
