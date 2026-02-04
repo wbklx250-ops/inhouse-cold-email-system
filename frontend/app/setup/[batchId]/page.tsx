@@ -222,7 +222,21 @@ export default function BatchWizard() {
               onComplete={() => setActiveStep(8)}
             />
           )}
-          {activeStep === 8 && <StepComplete batchId={batchId} status={status} />}
+          {activeStep === 8 && (
+            <StepComplete 
+              batchId={batchId} 
+              status={status} 
+              onGoBack={async (step) => {
+                try {
+                  await setStep(batchId, step);
+                  setActiveStep(step);
+                  await loadStatus();
+                } catch (e) {
+                  console.error("Failed to navigate back:", e);
+                }
+              }}
+            />
+          )}
         </div>
       </div>
     </div>
@@ -294,6 +308,7 @@ function StepNavigation({ batchId, currentStep, onNavigate, onRerun }: StepNavig
     5: "Email Setup",
     6: "Mailboxes",
     7: "Sequencer",
+    8: "Complete",
   };
 
   const handleRerun = async (step: number) => {
@@ -367,7 +382,7 @@ function StepNavigation({ batchId, currentStep, onNavigate, onRerun }: StepNavig
           
           {/* Quick jump dropdown for all steps */}
           <select
-            value={currentStep}
+            value={currentStep > 7 ? 7 : currentStep}
             onChange={(e) => onNavigate(parseInt(e.target.value))}
             className="px-3 py-2 border rounded-lg text-sm bg-white hover:bg-gray-50 cursor-pointer"
             title="Jump to step"
@@ -3023,16 +3038,47 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
   );
 }
 
-function StepComplete({ batchId, status }: { batchId: string; status: WizardStatus | null }) {
+interface StepCompleteProps {
+  batchId: string;
+  status: WizardStatus | null;
+  onGoBack?: (step: number) => void;
+}
+
+function StepComplete({ batchId, status, onGoBack }: StepCompleteProps) {
   return (
     <div className="text-center py-12">
       <div className="text-6xl mb-6">🎉</div>
       <h2 className="text-2xl font-bold">Setup Complete!</h2>
       <p className="text-gray-600 mt-4">{status?.mailboxes_ready || 0} mailboxes ready</p>
       <a href={`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/export-credentials`}
-        className="inline-block mt-6 px-6 py-3 bg-blue-600 text-white font-bold rounded-lg">
+        className="inline-block mt-6 px-6 py-3 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700">
         📥 Download Credentials
       </a>
+      
+      {/* Navigation buttons */}
+      <div className="mt-8 pt-6 border-t border-gray-200">
+        <p className="text-sm text-gray-500 mb-4">Need to review or make changes?</p>
+        <div className="flex justify-center gap-4 flex-wrap">
+          <button
+            onClick={() => onGoBack?.(7)}
+            className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
+          >
+            ← Back to Sequencer (Step 7)
+          </button>
+          <button
+            onClick={() => onGoBack?.(6)}
+            className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
+          >
+            ← Back to Mailboxes (Step 6)
+          </button>
+          <button
+            onClick={() => onGoBack?.(5)}
+            className="px-4 py-2 bg-gray-200 text-gray-700 rounded-lg hover:bg-gray-300 transition-colors"
+          >
+            ← Back to Email Setup (Step 5)
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
