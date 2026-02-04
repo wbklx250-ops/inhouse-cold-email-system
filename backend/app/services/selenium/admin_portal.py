@@ -1583,7 +1583,13 @@ async def enable_org_smtp_auth(
         # =================================================================
         # STEP 7D: FIND AND HANDLE SMTP AUTH CHECKBOX
         # =================================================================
+        # IMPORTANT: The checkbox is "Turn off SMTP AUTH protocol for your organization"
+        #   - CHECKED = SMTP AUTH is DISABLED (turned off)
+        #   - UNCHECKED = SMTP AUTH is ENABLED (turned on)
+        # We ONLY want to UNCHECK (if checked), NEVER re-check on reruns!
+        # =================================================================
         smtp_auth_enabled = False
+        checkbox_found = False
         
         # The checkbox HTML is: <label class="ms-Checkbox-label label-800" for="checkbox-XXXX">
         # We need to find the checkbox input associated with "Turn off SMTP AUTH"
@@ -1607,32 +1613,54 @@ async def enable_org_smtp_auth(
                 checkbox = driver.find_element(By.XPATH, selector)
                 driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", checkbox)
                 time.sleep(0.5)
+                checkbox_found = True
                 
-                # Check current state
-                is_checked = checkbox.is_selected() or checkbox.get_attribute("checked")
-                logger.info(f"[{domain}] Step 7: Found SMTP checkbox, checked={is_checked}")
+                # Check current state - handle both boolean and string "true"/"false"
+                checked_attr = checkbox.get_attribute("checked")
+                is_checked = checkbox.is_selected() or checked_attr == "true" or checked_attr == True
+                logger.info(f"[{domain}] Step 7: Found SMTP checkbox, is_selected={checkbox.is_selected()}, checked_attr={checked_attr}, is_checked={is_checked}")
                 
                 if is_checked:
-                    # Currently checked = SMTP AUTH is OFF, need to uncheck to enable
-                    logger.info(f"[{domain}] Step 7: SMTP AUTH is OFF (checked). Unchecking to enable...")
-                    safe_click(driver, checkbox, "SMTP AUTH checkbox")
+                    # Currently CHECKED = SMTP AUTH is OFF
+                    # We need to UNCHECK to ENABLE SMTP AUTH
+                    logger.info(f"[{domain}] Step 7: SMTP AUTH is OFF (checkbox checked). UNCHECKING to enable...")
+                    safe_click(driver, checkbox, "SMTP AUTH checkbox - unchecking to enable")
                     time.sleep(1)
-                    smtp_auth_enabled = True
-                    logger.info(f"[{domain}] Step 7: Unchecked - SMTP AUTH now ENABLED")
+                    
+                    # VERIFY the checkbox is now unchecked
+                    new_checked_attr = checkbox.get_attribute("checked")
+                    is_still_checked = checkbox.is_selected() or new_checked_attr == "true" or new_checked_attr == True
+                    
+                    if is_still_checked:
+                        logger.warning(f"[{domain}] Step 7: Checkbox still checked after click, retrying with JS...")
+                        driver.execute_script("arguments[0].checked = false; arguments[0].click();", checkbox)
+                        time.sleep(1)
+                        # Check again
+                        final_checked = checkbox.is_selected() or checkbox.get_attribute("checked") == "true"
+                        if final_checked:
+                            logger.error(f"[{domain}] Step 7: Could not uncheck SMTP checkbox after retry")
+                        else:
+                            smtp_auth_enabled = True
+                            logger.info(f"[{domain}] Step 7: SMTP AUTH ENABLED (unchecked via JS retry)")
+                    else:
+                        smtp_auth_enabled = True
+                        logger.info(f"[{domain}] Step 7: SMTP AUTH ENABLED (checkbox successfully unchecked)")
                 else:
-                    # Already unchecked = SMTP AUTH is already enabled
-                    logger.info(f"[{domain}] Step 7: SMTP AUTH is already ENABLED (unchecked)")
+                    # Already UNCHECKED = SMTP AUTH is already ENABLED
+                    # DO NOT CLICK - clicking would RE-CHECK and DISABLE SMTP AUTH!
                     smtp_auth_enabled = True
+                    logger.info(f"[{domain}] Step 7: SMTP AUTH already ENABLED (checkbox already unchecked) - NO ACTION NEEDED")
                 
                 break
             except Exception as e:
                 logger.debug(f"[{domain}] Checkbox selector failed: {selector} - {e}")
                 continue
         
-        # JavaScript fallback for finding the checkbox
-        if not smtp_auth_enabled:
+        # JavaScript fallback for finding the checkbox - ONLY if not already handled
+        if not checkbox_found:
             logger.warning(f"[{domain}] Step 7: Trying JS to find SMTP checkbox...")
             try:
+                # DEFENSIVE JS: Only uncheck if checked, NEVER check if unchecked
                 js_result = driver.execute_script("""
                     // Find checkbox by looking for label with SMTP text
                     var labels = document.querySelectorAll('label');
@@ -1643,11 +1671,13 @@ async def enable_org_smtp_auth(
                             if (forId) {
                                 var checkbox = document.getElementById(forId);
                                 if (checkbox) {
+                                    // ONLY click if CHECKED (to uncheck and enable SMTP AUTH)
                                     if (checkbox.checked) {
                                         checkbox.click();
-                                        return 'unchecked';
+                                        return 'unchecked_now_enabled';
                                     } else {
-                                        return 'already_enabled';
+                                        // Already unchecked = already enabled - DO NOT CLICK!
+                                        return 'already_enabled_no_action';
                                     }
                                 }
                             }
@@ -1656,11 +1686,13 @@ async def enable_org_smtp_auth(
                             if (parent) {
                                 var cb = parent.querySelector('input[type="checkbox"]');
                                 if (cb) {
+                                    // ONLY click if CHECKED (to uncheck and enable SMTP AUTH)
                                     if (cb.checked) {
                                         cb.click();
-                                        return 'unchecked';
+                                        return 'unchecked_now_enabled';
                                     } else {
-                                        return 'already_enabled';
+                                        // Already unchecked = already enabled - DO NOT CLICK!
+                                        return 'already_enabled_no_action';
                                     }
                                 }
                             }
@@ -1672,20 +1704,24 @@ async def enable_org_smtp_auth(
                     for (var cb of checkboxes) {
                         var container = cb.closest('div');
                         if (container && container.textContent.includes('SMTP AUTH')) {
+                            // ONLY click if CHECKED (to uncheck and enable SMTP AUTH)
                             if (cb.checked) {
                                 cb.click();
-                                return 'unchecked';
+                                return 'unchecked_now_enabled';
                             } else {
-                                return 'already_enabled';
+                                // Already unchecked = already enabled - DO NOT CLICK!
+                                return 'already_enabled_no_action';
                             }
                         }
                     }
                     return 'not_found';
                 """)
                 
-                if js_result in ('unchecked', 'already_enabled'):
+                if js_result in ('unchecked_now_enabled', 'already_enabled_no_action'):
                     smtp_auth_enabled = True
                     logger.info(f"[{domain}] Step 7: JS result: {js_result}")
+                    if js_result == 'already_enabled_no_action':
+                        logger.info(f"[{domain}] Step 7: JS confirmed SMTP AUTH already enabled - no click performed")
                     time.sleep(1)
                 else:
                     logger.error(f"[{domain}] Step 7: JS could not find SMTP checkbox")

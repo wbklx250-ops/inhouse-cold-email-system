@@ -77,6 +77,8 @@ class Tenant(TimestampUUIDMixin, Base):
     first_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     password_changed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     security_defaults_disabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    security_defaults_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    security_defaults_disabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # === OAUTH TOKENS ===
     access_token: Mapped[str | None] = mapped_column(Text, nullable=True)  # ENCRYPT IN PROD!

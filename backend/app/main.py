@@ -33,6 +33,7 @@ from app.api.routes import (
     wizard_router,
     stats_router,
     webhooks_router,
+    step8_router,
 )
 from app.db.session import get_db_session
 from app.core.config import get_settings
@@ -128,6 +129,7 @@ app.include_router(tenants_router)
 app.include_router(wizard_router)
 app.include_router(stats_router)
 app.include_router(webhooks_router)
+app.include_router(step8_router)
 
 
 @app.get("/", tags=["root"])
