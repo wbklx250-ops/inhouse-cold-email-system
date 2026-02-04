@@ -7,7 +7,6 @@ interface TenantStep7Status {
   domain: string;
   step7_complete: boolean;
   smtp_auth_enabled: boolean;
-  security_defaults_disabled: boolean;
   error: string | null;
   completed_at: string | null;
 }
@@ -155,10 +154,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          Disables Security Defaults in Entra ID, then logs into each tenant's
-          Exchange Admin Center and unchecks "Turn off SMTP AUTH protocol"
-          under Settings &rarr; Mail flow. This is one toggle per tenant and
-          takes about 30 seconds each.
+          Logs into each tenant's Exchange Admin Center and unchecks
+          "Turn off SMTP AUTH protocol" under Settings &rarr; Mail flow. This
+          is one toggle per tenant and takes about 30 seconds each.
         </p>
         <p className="mt-2 text-blue-600">
           <strong>Note:</strong> Microsoft may take up to 1 hour to fully sync
@@ -322,9 +320,6 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                   Domain
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
-                  Security Defaults
-                </th>
-                <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                   SMTP Auth
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
@@ -340,15 +335,6 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                 <tr key={t.id} className="hover:bg-gray-50">
                   <td className="px-4 py-3 text-sm font-medium text-gray-900">
                     {t.domain}
-                  </td>
-                  <td className="px-4 py-3 text-center">
-                    {t.security_defaults_disabled ? (
-                      <span className="text-green-500 text-lg">&#10003;</span>
-                    ) : t.error ? (
-                      <span className="text-red-500 text-lg">&#10007;</span>
-                    ) : (
-                      <span className="text-gray-300">&mdash;</span>
-                    )}
                   </td>
                   <td className="px-4 py-3 text-center">
                     {t.smtp_auth_enabled ? (

@@ -1292,191 +1292,6 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     return result
 
 
-def disable_security_defaults(driver, domain: str) -> dict:
-    """
-    Disable Microsoft Entra ID Security Defaults via UI automation.
-
-    Returns:
-        {
-            "success": bool,
-            "security_defaults_disabled": bool,
-            "error": str or None,
-        }
-    """
-    result = {
-        "success": False,
-        "security_defaults_disabled": False,
-        "error": None,
-    }
-
-    try:
-        logger.info(f"[{domain}] Disabling Security Defaults...")
-        driver.get("https://entra.microsoft.com/#view/Microsoft_AAD_IAM/SecurityDefaultsBlade")
-        wait_for_page_load(driver, timeout=45)
-        page_text = wait_for_body_text(driver, min_length=80, timeout=30).lower()
-        _save_screenshot(driver, domain, "security_defaults_page")
-
-        # Already disabled?
-        if "security defaults is disabled" in page_text or "security defaults are disabled" in page_text:
-            logger.info(f"[{domain}] Security Defaults already disabled")
-            result["success"] = True
-            result["security_defaults_disabled"] = True
-            return result
-
-        # Try radio-style controls first
-        radio_selectors = [
-            (By.XPATH, "//label[contains(., 'Disabled')]"),
-            (By.XPATH, "//span[normalize-space()='Disabled']/ancestor::*[@role='radio']"),
-            (By.XPATH, "//span[normalize-space()='No']/ancestor::*[@role='radio']"),
-        ]
-        clicked = False
-        for by, value in radio_selectors:
-            try:
-                elem = WebDriverWait(driver, 10).until(
-                    EC.element_to_be_clickable((by, value))
-                )
-                if safe_click(driver, elem, "Security Defaults Disabled option"):
-                    clicked = True
-                    break
-            except Exception:
-                continue
-
-        # Try toggle switch if radio didn't work
-        if not clicked:
-            try:
-                switches = driver.find_elements(By.XPATH, "//*[@role='switch']")
-            except Exception:
-                switches = []
-
-            for sw in switches:
-                try:
-                    aria_checked = (sw.get_attribute("aria-checked") or "").lower()
-                    container_text = ""
-                    try:
-                        container_text = sw.find_element(By.XPATH, "./ancestor::*[1]").text.lower()
-                    except Exception:
-                        container_text = ""
-
-                    if "security defaults" in container_text or "enable security defaults" in container_text:
-                        if aria_checked == "true":
-                            if safe_click(driver, sw, "Security Defaults switch"):
-                                clicked = True
-                                break
-                        elif aria_checked == "false":
-                            # Already off
-                            logger.info(f"[{domain}] Security Defaults switch already off")
-                            clicked = True
-                            break
-                except Exception:
-                    continue
-
-        # JS fallback: find a switch near "Security defaults"
-        if not clicked:
-            try:
-                js_clicked = driver.execute_script(
-                    """
-                    const nodes = Array.from(document.querySelectorAll('[role="switch"]'));
-                    const match = nodes.find(n => {
-                        const text = (n.innerText || n.textContent || '').toLowerCase();
-                        const parentText = (n.closest('div')?.innerText || '').toLowerCase();
-                        return text.includes('security defaults') || parentText.includes('security defaults');
-                    });
-                    if (match) { match.click(); return true; }
-                    return false;
-                    """
-                )
-                if js_clicked:
-                    clicked = True
-            except Exception:
-                pass
-
-        _save_screenshot(driver, domain, "security_defaults_after_toggle")
-
-        # Select reason (best effort)
-        try:
-            selects = driver.find_elements(By.TAG_NAME, "select")
-            for select in selects:
-                try:
-                    options = select.find_elements(By.TAG_NAME, "option")
-                    for opt in options:
-                        if "other" in (opt.text or "").lower():
-                            opt.click()
-                            break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        try:
-            # Combobox / dropdown
-            combo = driver.find_elements(By.XPATH, "//*[@role='combobox']")
-            for cb in combo:
-                label = (cb.get_attribute("aria-label") or "").lower()
-                if "reason" in label or "select" in label:
-                    safe_click(driver, cb, "Reason combobox")
-                    time.sleep(1)
-                    try:
-                        opt = driver.find_element(By.XPATH, "//*[@role='option' and contains(., 'Other')]")
-                        safe_click(driver, opt, "Reason: Other")
-                    except Exception:
-                        pass
-                    break
-        except Exception:
-            pass
-
-        # Save
-        saved = False
-        save_selectors = [
-            (By.XPATH, "//button[contains(., 'Save')]"),
-            (By.CSS_SELECTOR, "button[type='submit']"),
-        ]
-        for by, value in save_selectors:
-            if safe_find_and_click(driver, by, value, "Save Security Defaults", timeout=10):
-                saved = True
-                break
-
-        if not saved:
-            logger.warning(f"[{domain}] Save button not found for Security Defaults")
-
-        time.sleep(5)
-        wait_for_page_load(driver, timeout=30)
-        page_text = wait_for_body_text(driver, min_length=80, timeout=20).lower()
-        _save_screenshot(driver, domain, "security_defaults_saved")
-
-        # Verify disabled state
-        if "security defaults is disabled" in page_text or "security defaults are disabled" in page_text:
-            result["success"] = True
-            result["security_defaults_disabled"] = True
-            return result
-
-        # Check switch state if text didn't update
-        try:
-            switches = driver.find_elements(By.XPATH, "//*[@role='switch']")
-            for sw in switches:
-                aria_checked = (sw.get_attribute("aria-checked") or "").lower()
-                container_text = ""
-                try:
-                    container_text = sw.find_element(By.XPATH, "./ancestor::*[1]").text.lower()
-                except Exception:
-                    container_text = ""
-                if "security defaults" in container_text and aria_checked == "false":
-                    result["success"] = True
-                    result["security_defaults_disabled"] = True
-                    return result
-        except Exception:
-            pass
-
-        result["error"] = "Security Defaults did not verify as disabled"
-        _save_screenshot(driver, domain, "security_defaults_error")
-        return result
-
-    except Exception as e:
-        result["error"] = str(e)
-        logger.error(f"[{domain}] Security Defaults disable failed: {e}")
-        _save_screenshot(driver, domain, "security_defaults_exception")
-        return result
-
-
 async def enable_org_smtp_auth(
     admin_email: str,
     admin_password: str,
@@ -1505,17 +1320,14 @@ async def enable_org_smtp_auth(
         {
             "success": bool,
             "smtp_auth_enabled": bool,
-            "security_defaults_disabled": bool,
             "error": str or None
         }
     """
-    from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
     driver = None
     result = {
         "success": False,
         "smtp_auth_enabled": False,
-        "security_defaults_disabled": False,
         "error": None,
     }
 
@@ -1537,14 +1349,6 @@ async def enable_org_smtp_auth(
         )
         _save_screenshot(driver, domain, "step7_login_complete")
         time.sleep(3)
-
-        # === STEP 7A: DISABLE SECURITY DEFAULTS ===
-        sd_result = disable_security_defaults(driver, domain)
-        result["security_defaults_disabled"] = sd_result.get("security_defaults_disabled", False)
-        if not sd_result.get("success"):
-            result["error"] = sd_result.get("error") or "Failed to disable Security Defaults"
-            logger.error(f"[{domain}] Step 7 failed: {result['error']}")
-            return result
 
         # =================================================================
         # STEP 7A: NAVIGATE TO EXCHANGE ADMIN CENTER SETTINGS PAGE

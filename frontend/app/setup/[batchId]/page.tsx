@@ -73,8 +73,8 @@ async function setStep(batchId: string, step: number): Promise<any> {
   return res.json();
 }
 
-async function rerunStep(batchId: string, stepNumber: number): Promise<any> {
-  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/rerun-step/${stepNumber}`, {
+async function rerunStep(batchId: string, stepNumber: number, force: boolean = true): Promise<any> {
+  const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/rerun-step/${stepNumber}?force=${force}`, {
     method: "POST",
   });
   if (!res.ok) {

@@ -3440,7 +3440,6 @@ async def _run_step7_batch(batch_id: UUID, tenant_ids: list):
             )
 
             tenant.step7_smtp_auth_enabled = automation_result.get("smtp_auth_enabled", False)
-            tenant.security_defaults_disabled = automation_result.get("security_defaults_disabled", False)
             tenant.step7_error = automation_result.get("error")
 
             if automation_result.get("success"):
@@ -3528,7 +3527,6 @@ async def get_step7_status(
                 "domain": t.custom_domain or t.name,
                 "step7_complete": getattr(t, "step7_complete", False) or False,
                 "smtp_auth_enabled": getattr(t, "step7_smtp_auth_enabled", False) or False,
-                "security_defaults_disabled": getattr(t, "security_defaults_disabled", False) or False,
                 "error": getattr(t, "step7_error", None),
                 "completed_at": t.step7_completed_at.isoformat()
                 if getattr(t, "step7_completed_at", None)
@@ -3610,7 +3608,6 @@ async def rerun_step7_all(
         tenant.step7_complete = False
         tenant.step7_error = None
         tenant.step7_smtp_auth_enabled = False
-        tenant.security_defaults_disabled = False
 
     await db.commit()
 
