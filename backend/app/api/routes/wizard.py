@@ -3201,6 +3201,75 @@ async def retry_failed_step6_tenants(
     }
 
 
+@router.post("/batches/{batch_id}/step6/resume")
+async def resume_step6_processing(
+    batch_id: UUID,
+    request: dict,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Resume Step 6 processing for pending tenants.
+    
+    This is a one-click solution when Step 6 appears stuck:
+    1. Finds all tenants eligible for Step 6 (step5 complete, step6 not complete)
+    2. Resets stuck state (step6_started=False, clears errors)
+    3. Immediately starts automation
+    
+    Use this when automation shows as "pending" but nothing is processing.
+    """
+    display_name = request.get("display_name", "").strip()
+    if not display_name or " " not in display_name:
+        raise HTTPException(
+            400, "Display name must include first and last name (e.g., 'Jack Zuvelek')"
+        )
+    
+    # Verify batch exists
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find all eligible tenants (step5 complete, step6 not complete)
+    tenant_result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == False,
+            # Step 5 complete check
+            ((Tenant.step5_complete == True) | (Tenant.domain_verified_in_m365 == True))
+        )
+    )
+    eligible_tenants = tenant_result.scalars().all()
+    
+    if not eligible_tenants:
+        return {
+            "success": False,
+            "message": "No pending tenants found for Step 6. All tenants may be complete or not ready.",
+            "eligible_count": 0
+        }
+    
+    # Reset ALL eligible tenants to unstuck state
+    for tenant in eligible_tenants:
+        tenant.step6_started = False
+        tenant.step6_error = None
+    
+    await db.commit()
+    
+    logger.info(f"Resuming Step 6 for batch {batch_id}: Reset {len(eligible_tenants)} tenants")
+    
+    # Start automation immediately
+    background_tasks.add_task(run_azure_step6_for_batch, batch_id, display_name)
+    
+    return {
+        "success": True,
+        "message": f"Resumed Step 6 processing for {len(eligible_tenants)} tenant(s)",
+        "display_name": display_name,
+        "eligible_count": len(eligible_tenants),
+        "tenants": [{"id": str(t.id), "name": t.name, "domain": t.custom_domain} for t in eligible_tenants]
+    }
+
+
 @router.post("/batches/{batch_id}/step6/reset-stuck")
 async def reset_stuck_step6_tenants(
     batch_id: UUID,
@@ -3619,6 +3688,111 @@ async def rerun_step7_all(
         "success": True,
         "message": f"Rerunning Step 7 for {len(tenant_ids)} tenants",
         "processing": len(tenant_ids),
+    }
+
+
+@router.post("/batches/{batch_id}/step7/force-complete/{tenant_id}")
+async def force_complete_step7_for_tenant(
+    batch_id: UUID,
+    tenant_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Force Step 7 to complete for a single tenant.
+    
+    Use this when:
+    - SMTP Auth was enabled manually in the admin center
+    - Automation succeeded but DB wasn't updated
+    - Need to mark as complete to proceed
+    """
+    tenant_result = await db.execute(
+        select(Tenant).where(Tenant.id == tenant_id)
+    )
+    tenant = tenant_result.scalar_one_or_none()
+    if not tenant:
+        raise HTTPException(404, "Tenant not found")
+    
+    if tenant.batch_id != batch_id:
+        raise HTTPException(400, "Tenant does not belong to this batch")
+
+    tenant.step7_complete = True
+    tenant.step7_completed_at = datetime.utcnow()
+    tenant.step7_smtp_auth_enabled = True
+    tenant.step7_error = None
+
+    await db.commit()
+    
+    logger.info(f"Force-completed Step 7 for tenant {tenant.custom_domain or tenant.name}")
+
+    return {
+        "success": True,
+        "message": f"Marked Step 7 complete for {tenant.custom_domain or tenant.name}",
+        "tenant_id": str(tenant_id),
+    }
+
+
+@router.post("/batches/{batch_id}/step7/force-complete-all")
+async def force_complete_step7_for_all(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Force Step 7 to complete for ALL pending tenants in batch.
+    
+    Use this when:
+    - SMTP Auth has been enabled manually for all tenants
+    - Automation ran but some tenants weren't marked complete
+    - Need to proceed despite some automation failures
+    
+    This will:
+    - Mark ALL eligible tenants (step6_complete) as step7_complete
+    - Mark the batch as COMPLETED
+    """
+    batch_result = await db.execute(
+        select(SetupBatch).where(SetupBatch.id == batch_id)
+    )
+    batch = batch_result.scalar_one_or_none()
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find all eligible tenants (step6 complete)
+    result = await db.execute(
+        select(Tenant).where(
+            Tenant.batch_id == batch_id,
+            Tenant.step6_complete == True,
+        )
+    )
+    eligible = result.scalars().all()
+
+    if not eligible:
+        return {
+            "success": False,
+            "message": "No eligible tenants found (need Step 6 complete)",
+            "updated_count": 0
+        }
+
+    # Force complete all
+    updated_count = 0
+    for tenant in eligible:
+        if not tenant.step7_complete:
+            tenant.step7_complete = True
+            tenant.step7_completed_at = datetime.utcnow()
+            tenant.step7_smtp_auth_enabled = True
+            tenant.step7_error = None
+            updated_count += 1
+
+    # Mark batch as complete
+    batch.status = BatchStatus.COMPLETED
+    batch.completed_at = datetime.utcnow()
+    
+    await db.commit()
+    
+    logger.info(f"Force-completed Step 7 for {updated_count} tenants in batch {batch_id}")
+
+    return {
+        "success": True,
+        "message": f"Marked Step 7 complete for {updated_count} tenant(s). Batch marked as COMPLETED.",
+        "updated_count": updated_count,
+        "total_eligible": len(eligible),
+        "batch_status": "completed",
     }
 
 

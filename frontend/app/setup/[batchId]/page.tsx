@@ -2433,6 +2433,7 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
   const [isRerunning, setIsRerunning] = useState(false);
   const [isRetryingFailed, setIsRetryingFailed] = useState(false);
   const [isResettingStuck, setIsResettingStuck] = useState(false);
+  const [isResumingProcessing, setIsResumingProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const summary = step6Status?.summary ?? {
     total_tenants: 0,
@@ -2679,6 +2680,43 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
     }
   };
 
+  // Resume Processing - One-click solution: resets stuck state AND immediately restarts automation
+  const handleResumeProcessing = async () => {
+    if (!displayName.trim() || !displayName.includes(" ")) {
+      setError("Please enter a full name (first and last name)");
+      return;
+    }
+
+    setIsResumingProcessing(true);
+    setError(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/resume`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ display_name: displayName.trim() }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || data.message || "Failed to resume processing");
+      }
+
+      if (data.success) {
+        setIsAutomationRunning(true);
+        alert(`Resumed processing for ${data.eligible_count} tenant(s)${data.reset_count > 0 ? ` (reset ${data.reset_count} stuck)` : ''}`);
+        fetchStep6Status();
+      } else {
+        setError(data.message || "No eligible tenants found");
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to resume processing");
+    } finally {
+      setIsResumingProcessing(false);
+    }
+  };
+
   // Get status icon
   const getStatusIcon = (tenant: TenantStep6Status) => {
     if (tenant.step6_complete) return "✅";
@@ -2826,18 +2864,25 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
           <div className="mt-6 p-4 bg-yellow-50 border border-yellow-200 rounded-lg">
             <h4 className="font-medium text-yellow-800 mb-3">Recovery Actions</h4>
             <div className="flex flex-wrap gap-3">
-              {/* Rerun for Remaining - show when some tenants haven't completed step6 */}
+              {/* RESUME PROCESSING - Primary one-click solution */}
               {completedTenants < totalTenants && (
                 <button
-                  onClick={handleRerunAutomation}
-                  disabled={isRerunning || !displayName.includes(" ")}
-                  className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
-                    isRerunning || !displayName.includes(" ")
+                  onClick={handleResumeProcessing}
+                  disabled={isResumingProcessing || !displayName.includes(" ")}
+                  className={`px-5 py-2.5 rounded-lg font-medium text-sm transition-colors ${
+                    isResumingProcessing || !displayName.includes(" ")
                       ? "bg-gray-300 text-gray-500 cursor-not-allowed"
-                      : "bg-blue-600 text-white hover:bg-blue-700"
+                      : "bg-green-600 text-white hover:bg-green-700"
                   }`}
                 >
-                  {isRerunning ? "Rerunning..." : `🔄 Rerun for Remaining (${totalTenants - completedTenants})`}
+                  {isResumingProcessing ? (
+                    <span className="flex items-center gap-2">
+                      <span className="animate-spin">⏳</span>
+                      Resuming...
+                    </span>
+                  ) : (
+                    `▶️ Resume Processing (${totalTenants - completedTenants} pending)`
+                  )}
                 </button>
               )}
 
@@ -2856,7 +2901,7 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
                 </button>
               )}
 
-              {/* Reset Stuck - always available when incomplete */}
+              {/* Reset Stuck - available as advanced option */}
               <button
                 onClick={handleResetStuck}
                 disabled={isResettingStuck}
@@ -2868,9 +2913,24 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
               >
                 {isResettingStuck ? "Resetting..." : "🧹 Reset Stuck Tenants"}
               </button>
+
+              {/* Rerun for Remaining - secondary option */}
+              {completedTenants < totalTenants && (
+                <button
+                  onClick={handleRerunAutomation}
+                  disabled={isRerunning || !displayName.includes(" ")}
+                  className={`px-4 py-2 rounded-lg font-medium text-sm transition-colors ${
+                    isRerunning || !displayName.includes(" ")
+                      ? "bg-gray-300 text-gray-500 cursor-not-allowed"
+                      : "bg-blue-600 text-white hover:bg-blue-700"
+                  }`}
+                >
+                  {isRerunning ? "Rerunning..." : `🔄 Rerun Remaining`}
+                </button>
+              )}
             </div>
             <p className="mt-2 text-xs text-yellow-700">
-              💡 If automation appears stuck (showing "Processing 0 tenants"), use "Reset Stuck Tenants" first, then "Rerun for Remaining".
+              💡 <strong>Resume Processing</strong> is the recommended one-click solution - it resets any stuck state and immediately restarts automation.
             </p>
           </div>
         )}

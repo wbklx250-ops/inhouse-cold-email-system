@@ -31,6 +31,8 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [forceCompletingTenant, setForceCompletingTenant] = useState<string | null>(null);
+  const [forceCompletingAll, setForceCompletingAll] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -128,6 +130,55 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
     }
   };
 
+  // Force complete a single tenant
+  const forceCompleteTenant = async (tenantId: string) => {
+    if (!confirm("Force-complete Step 7 for this tenant? This marks SMTP Auth as enabled.")) return;
+    
+    setForceCompletingTenant(tenantId);
+    setError(null);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/wizard/batches/${batchId}/step7/force-complete/${tenantId}`,
+        { method: "POST" }
+      );
+      const data = await res.json();
+      if (data.success) {
+        await fetchStatus();
+      } else {
+        setError(data.message || "Failed to force complete tenant");
+      }
+    } catch (err) {
+      setError("Network error force completing tenant");
+    } finally {
+      setForceCompletingTenant(null);
+    }
+  };
+
+  // Force complete ALL pending tenants
+  const forceCompleteAll = async () => {
+    if (!confirm("Force-complete Step 7 for ALL pending tenants? This marks all tenants as having SMTP Auth enabled and completes the batch.")) return;
+    
+    setForceCompletingAll(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/wizard/batches/${batchId}/step7/force-complete-all`,
+        { method: "POST" }
+      );
+      const data = await res.json();
+      if (data.success) {
+        await fetchStatus();
+        alert(`Force-completed ${data.updated_count} tenant(s). Batch marked as complete.`);
+      } else {
+        setError(data.message || "Failed to force complete all tenants");
+      }
+    } catch (err) {
+      setError("Network error force completing all tenants");
+    } finally {
+      setForceCompletingAll(false);
+    }
+  };
+
   if (loading) {
     return <div className="p-6 text-gray-500">Loading Step 7 status...</div>;
   }
@@ -211,7 +262,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       )}
 
       {/* Action buttons */}
-      <div className="flex gap-3">
+      <div className="flex flex-wrap gap-3">
         {!allComplete && (
           <button
             onClick={startStep7}
@@ -277,7 +328,39 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
             Rerun Step 7
           </button>
         )}
+
+        {/* Force Complete All - shown when there are pending/failed tenants */}
+        {status && status.pending + status.failed > 0 && !isRunning && (
+          <button
+            onClick={forceCompleteAll}
+            disabled={forceCompletingAll}
+            className={`px-6 py-2.5 rounded-lg font-medium transition-colors ${
+              forceCompletingAll
+                ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                : "bg-yellow-500 text-white hover:bg-yellow-600"
+            }`}
+          >
+            {forceCompletingAll ? (
+              <span className="flex items-center gap-2">
+                <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+                Force Completing...
+              </span>
+            ) : (
+              `⚡ Force Complete All (${status.pending + status.failed})`
+            )}
+          </button>
+        )}
       </div>
+
+      {/* Force Complete Info */}
+      {status && status.pending + status.failed > 0 && !isRunning && (
+        <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800">
+          <p><strong>💡 Manual Override:</strong> If you've already enabled SMTP Auth manually in the Exchange Admin Center, use "Force Complete" to update the database without re-running automation.</p>
+        </div>
+      )}
 
       {/* Error */}
       {error && (
@@ -328,6 +411,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
                   Error
                 </th>
+                <th className="px-4 py-3 text-right text-xs font-medium text-gray-500 uppercase">
+                  Actions
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200">
@@ -360,6 +446,21 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                   </td>
                   <td className="px-4 py-3 text-sm text-red-500 max-w-xs truncate">
                     {t.error || "\u2014"}
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    {!t.step7_complete && (
+                      <button
+                        onClick={() => forceCompleteTenant(t.id)}
+                        disabled={forceCompletingTenant === t.id || isRunning}
+                        className={`px-2 py-1 text-xs rounded transition-colors ${
+                          forceCompletingTenant === t.id || isRunning
+                            ? "bg-gray-100 text-gray-400 cursor-not-allowed"
+                            : "bg-yellow-100 text-yellow-800 hover:bg-yellow-200"
+                        }`}
+                      >
+                        {forceCompletingTenant === t.id ? "..." : "Force Complete"}
+                      </button>
+                    )}
                   </td>
                 </tr>
               ))}
