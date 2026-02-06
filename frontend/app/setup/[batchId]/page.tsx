@@ -1215,7 +1215,6 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [loadingTenants, setLoadingTenants] = useState(false);
 
   // Auto-Run state (Auto-Complete Steps 4→7)
-  const [autoRunPassword, setAutoRunPassword] = useState("#Sendemails1");
   const [autoRunDisplayName, setAutoRunDisplayName] = useState("");
   const [autoRunStarting, setAutoRunStarting] = useState(false);
   const [autoRunStatus, setAutoRunStatus] = useState<AutoRunStatus | null>(null);
@@ -1329,7 +1328,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          new_password: autoRunPassword,
+          new_password: "#Sendemails1",
           display_name: autoRunDisplayName.trim()
         })
       });
@@ -2093,27 +2092,11 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
                 type="text"
                 value={autoRunDisplayName}
                 onChange={(e) => setAutoRunDisplayName(e.target.value)}
-                placeholder="e.g., Jack Zuvelek"
+                placeholder="e.g., Ryan Chen"
                 className="w-full px-4 py-2 border rounded-lg"
               />
               <p className="text-xs text-gray-500 mt-1">
                 Full name (first and last) used for all mailbox display names
-              </p>
-            </div>
-
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">
-                New Password for Tenants *
-              </label>
-              <input
-                type="text"
-                value={autoRunPassword}
-                onChange={(e) => setAutoRunPassword(e.target.value)}
-                placeholder="#Sendemails1"
-                className="w-full px-4 py-2 border rounded-lg"
-              />
-              <p className="text-xs text-gray-500 mt-1">
-                Password to set for all tenant admin accounts
               </p>
             </div>
 
