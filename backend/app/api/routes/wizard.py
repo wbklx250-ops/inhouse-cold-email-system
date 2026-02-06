@@ -369,19 +369,19 @@ async def start_auto_run(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    FEATURE 2: Auto-run steps 4-5-6-7 automatically from Step 3.
-    
+    Auto-run steps 4-5-6-7 automatically from Step 4 (after tenant/credential import).
+
     This endpoint:
-    1. Validates batch is at Step 3 or later
+    1. Validates tenants are imported in the batch
     2. Enables auto_progress_enabled flag
-    3. Chains through Steps 4, 5, 6, 7 automatically
+    3. Chains through Steps 4 (first-login), 5, 6, 7 automatically
     4. Auto-retries failed tenants up to 4 times before moving on
     5. Reports progress and final status
-    
+
     Required parameters:
     - new_password: Password to set during first login (Step 4)
     - display_name: Full name for mailboxes e.g. "Jack Zuvelek" (Step 6)
-    
+
     Progress tracking:
     - GET /batches/{batch_id}/auto-run/status for real-time progress
     """
