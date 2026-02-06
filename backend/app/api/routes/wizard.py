@@ -346,7 +346,7 @@ async def unmark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_d
     }
 
 
-# ============== FEATURE 2: AUTO-RUN (Steps 4’5’6’7 automatically) ==============
+# ============== FEATURE 2: AUTO-RUN (Steps 4-5-6-7 automatically) ==============
 
 # Store auto-run job progress
 auto_run_jobs = {}
@@ -369,7 +369,7 @@ async def start_auto_run(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    FEATURE 2: Auto-run steps 4’5’6’7 automatically from Step 3.
+    FEATURE 2: Auto-run steps 4-5-6-7 automatically from Step 3.
     
     This endpoint:
     1. Validates batch is at Step 3 or later
@@ -462,7 +462,7 @@ async def start_auto_run(
 
 async def _run_auto_progression(batch_id: UUID, new_password: str, display_name: str):
     """
-    Background task: Run steps 4’5’6’7 with auto-retry.
+    Background task: Run steps 4-5-6-7 with auto-retry.
     
     Each step:
     1. Process all eligible tenants
