@@ -241,19 +241,38 @@ class TenantImportService:
     ) -> Dict[str, Any]:
         """
         Import tenants from both files.
-        
+
         Matches by onmicrosoft domain, NOT by row position.
+
+        Only imports as many tenants as there are domains needing tenants
+        in the batch (domains without a linked tenant). Tenants already
+        in the system are skipped and do not count toward this limit.
         """
-        
+
+        # Count how many domains in this batch still need a tenant
+        domains_needing_tenants = (await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id == None
+            )
+        )).scalars().all()
+        needed_count = len(domains_needing_tenants)
+
         tenant_list = self.parse_tenant_csv(csv_content)
         credentials = self.parse_credentials_txt(credentials_content)
         merged, unmatched_tenants, unmatched_creds = self.merge_data(tenant_list, credentials)
-        
+
         imported = 0
         skipped = 0
+        skipped_limit = 0
         missing_pwd = 0
-        
+
         for data in merged:
+            # Stop importing once we have enough tenants for the available domains
+            if imported >= needed_count:
+                skipped_limit += 1
+                continue
+
             # Check duplicate by tenant ID or domain
             existing = None
             if data["microsoft_tenant_id"]:
@@ -263,7 +282,7 @@ class TenantImportService:
                     )
                 )
                 existing = existing.scalar_one_or_none()
-            
+
             if not existing:
                 # Also check by domain
                 existing = await db.execute(
@@ -272,16 +291,16 @@ class TenantImportService:
                     )
                 )
                 existing = existing.scalar_one_or_none()
-            
+
             if existing:
                 skipped += 1
                 continue
-            
+
             if not data["admin_password"]:
                 missing_pwd += 1
-            
+
             initial_pwd = data["admin_password"] or ""
-            
+
             tenant = Tenant(
                 batch_id=batch_id,
                 name=data["name"],
@@ -299,14 +318,16 @@ class TenantImportService:
             )
             db.add(tenant)
             imported += 1
-        
+
         await db.commit()
-        
+
         return {
             "total_csv": len(tenant_list),
             "total_credentials": len(credentials),
             "imported": imported,
-            "skipped": skipped,
+            "skipped_duplicate": skipped,
+            "skipped_not_needed": skipped_limit,
+            "domains_needing_tenants": needed_count,
             "missing_password": missing_pwd,
             "unmatched_tenants": len(unmatched_tenants),
             "unmatched_credentials": len(unmatched_creds),

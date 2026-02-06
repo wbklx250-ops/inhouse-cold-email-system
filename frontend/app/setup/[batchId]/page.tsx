@@ -1685,8 +1685,11 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
           <div className="bg-green-50 border border-green-200 rounded-lg p-4">
             <p className="text-green-800 font-medium">✅ Import Successful!</p>
             <div className="mt-2 text-sm text-green-700">
-              <p>• Imported: {importResult.imported} tenants</p>
-              <p>• Skipped (duplicates): {importResult.skipped}</p>
+              <p>• Imported: {importResult.imported} tenants (of {importResult.domains_needing_tenants} needed)</p>
+              <p>• Skipped (duplicates): {importResult.skipped_duplicate}</p>
+              {importResult.skipped_not_needed > 0 && (
+                <p className="text-blue-600">• Skipped (not needed): {importResult.skipped_not_needed}</p>
+              )}
               {importResult.missing_password > 0 && (
                 <p className="text-orange-600">• Missing passwords: {importResult.missing_password}</p>
               )}
