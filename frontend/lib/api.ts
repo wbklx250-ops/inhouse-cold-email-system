@@ -906,3 +906,71 @@ export const wizardExportCredentials = async (): Promise<void> => {
   document.body.removeChild(link);
   window.URL.revokeObjectURL(url);
 };
+
+// ============================================================================
+// Batch Upload Tracking API Functions (Feature 3)
+// ============================================================================
+
+export const markBatchUploaded = async (batchId: string): Promise<{ message: string }> => {
+  return apiRequest<{ message: string }>(`${API_BASE}/api/v1/wizard/batches/${batchId}/mark-uploaded`, {
+    method: "POST",
+  });
+};
+
+export const unmarkBatchUploaded = async (batchId: string): Promise<{ message: string }> => {
+  return apiRequest<{ message: string }>(`${API_BASE}/api/v1/wizard/batches/${batchId}/unmark-uploaded`, {
+    method: "POST",
+  });
+};
+
+// ============================================================================
+// Auto-Run API Functions (Feature 2 - Auto-progression)
+// ============================================================================
+
+export interface AutoRunRequest {
+  new_password: string;
+  display_name: string;
+}
+
+export interface AutoRunStatus {
+  batch_id: string;
+  status: "idle" | "running" | "completed" | "failed" | "stopped";
+  current_step: number;
+  current_step_name: string;
+  progress: {
+    step4: { completed: number; failed: number; total: number };
+    step5: { completed: number; failed: number; total: number };
+    step6: { completed: number; failed: number; total: number };
+    step7: { completed: number; failed: number; total: number };
+  };
+  started_at: string | null;
+  completed_at: string | null;
+  error: string | null;
+  message: string;
+}
+
+export const startAutoRun = async (
+  batchId: string,
+  request: AutoRunRequest
+): Promise<{ success: boolean; message: string; batch_id: string }> => {
+  return apiRequest<{ success: boolean; message: string; batch_id: string }>(
+    `${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run`,
+    {
+      method: "POST",
+      body: request,
+    }
+  );
+};
+
+export const getAutoRunStatus = async (batchId: string): Promise<AutoRunStatus> => {
+  return apiRequest<AutoRunStatus>(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
+};
+
+export const stopAutoRun = async (batchId: string): Promise<{ success: boolean; message: string }> => {
+  return apiRequest<{ success: boolean; message: string }>(
+    `${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/stop`,
+    {
+      method: "POST",
+    }
+  );
+};

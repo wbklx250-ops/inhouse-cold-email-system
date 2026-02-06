@@ -114,6 +114,8 @@ class BatchResponse(BaseModel):
     domains_count: int
     tenants_count: int
     mailboxes_count: int
+    uploaded_to_sequencer: bool = False
+    uploaded_at: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -182,6 +184,8 @@ async def list_batches(db: AsyncSession = Depends(get_db)):
             domains_count=domains_count,
             tenants_count=tenants_count,
             mailboxes_count=mailboxes_count,
+            uploaded_to_sequencer=getattr(batch, 'uploaded_to_sequencer', False) or False,
+            uploaded_at=batch.uploaded_at.isoformat() if getattr(batch, 'uploaded_at', None) else None,
         ))
     
     return response
@@ -285,6 +289,604 @@ async def delete_batch(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     await db.delete(batch)
     await db.commit()
     return {"success": True, "message": f"Batch '{batch.name}' deleted"}
+
+
+# ============== FEATURE 3: MARK BATCH AS UPLOADED TO SEQUENCER ==============
+
+@router.post("/batches/{batch_id}/mark-uploaded")
+async def mark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Mark a batch as uploaded to sequencer.
+    
+    This helps distinguish between:
+    - Batches that are complete but not yet uploaded to sequencer software
+    - Batches that have been completed AND uploaded to sequencer
+    
+    Returns success with timestamp.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    batch.uploaded_to_sequencer = True
+    batch.uploaded_at = datetime.utcnow()
+    
+    await db.commit()
+    
+    logger.info(f"Batch {batch_id} ({batch.name}) marked as uploaded to sequencer")
+    
+    return {
+        "success": True,
+        "message": f"Batch '{batch.name}' marked as uploaded to sequencer",
+        "uploaded_at": batch.uploaded_at.isoformat()
+    }
+
+
+@router.post("/batches/{batch_id}/unmark-uploaded")
+async def unmark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Remove the uploaded to sequencer marking from a batch.
+    
+    Useful if you accidentally marked it or need to re-upload.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    batch.uploaded_to_sequencer = False
+    batch.uploaded_at = None
+    
+    await db.commit()
+    
+    logger.info(f"Batch {batch_id} ({batch.name}) unmarked from sequencer upload")
+    
+    return {
+        "success": True,
+        "message": f"Batch '{batch.name}' unmarked from sequencer upload"
+    }
+
+
+# ============== FEATURE 2: AUTO-RUN (Steps 4𗮼�7 automatically) ==============
+
+# Store auto-run job progress
+auto_run_jobs = {}
+
+# Maximum retries per tenant per step
+MAX_AUTO_RETRIES = 4
+
+
+class AutoRunRequest(BaseModel):
+    """Schema for auto-run request."""
+    new_password: str  # Password for first login (Step 4)
+    display_name: str  # Full name for mailboxes e.g. "Jack Zuvelek"
+
+
+@router.post("/batches/{batch_id}/auto-run")
+async def start_auto_run(
+    batch_id: UUID,
+    request: AutoRunRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    FEATURE 2: Auto-run steps 4𗮼�7 automatically from Step 3.
+    
+    This endpoint:
+    1. Validates batch is at Step 3 or later
+    2. Enables auto_progress_enabled flag
+    3. Chains through Steps 4, 5, 6, 7 automatically
+    4. Auto-retries failed tenants up to 4 times before moving on
+    5. Reports progress and final status
+    
+    Required parameters:
+    - new_password: Password to set during first login (Step 4)
+    - display_name: Full name for mailboxes e.g. "Jack Zuvelek" (Step 6)
+    
+    Progress tracking:
+    - GET /batches/{batch_id}/auto-run/status for real-time progress
+    """
+    # Validate display_name has first and last name
+    if not request.display_name or " " not in request.display_name.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Display name must include first and last name (e.g., 'Jack Zuvelek')"
+        )
+    
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    # Check if auto-run is already in progress
+    job_id = str(batch_id)
+    if job_id in auto_run_jobs and auto_run_jobs[job_id].get("status") == "running":
+        return {
+            "success": False,
+            "message": "Auto-run already in progress for this batch",
+            "job_id": job_id,
+            "started_at": auto_run_jobs[job_id].get("started_at")
+        }
+    
+    # Count tenants
+    tenant_count = await db.scalar(
+        select(func.count(Tenant.id)).where(Tenant.batch_id == batch_id)
+    ) or 0
+    
+    if tenant_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No tenants in batch. Import tenants first (Step 4 import)."
+        )
+    
+    # Enable auto-progress flag
+    batch.auto_progress_enabled = True
+    await db.commit()
+    
+    # Initialize job tracking
+    auto_run_jobs[job_id] = {
+        "status": "running",
+        "batch_id": str(batch_id),
+        "batch_name": batch.name,
+        "started_at": datetime.utcnow().isoformat(),
+        "current_step": 4,
+        "current_step_name": "First Login",
+        "tenant_count": tenant_count,
+        "steps": {
+            "step4": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
+            "step5": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
+            "step6": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
+            "step7": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
+        },
+        "errors": [],
+        "display_name": request.display_name,
+    }
+    
+    # Run in background
+    background_tasks.add_task(
+        _run_auto_progression,
+        batch_id,
+        request.new_password,
+        request.display_name
+    )
+    
+    logger.info(f"Auto-run started for batch {batch_id} ({batch.name})")
+    
+    return {
+        "success": True,
+        "message": f"Auto-run started for batch '{batch.name}'",
+        "job_id": job_id,
+        "tenant_count": tenant_count,
+        "steps_to_run": ["Step 4: First Login", "Step 5: Email Setup", "Step 6: Mailboxes", "Step 7: SMTP Auth"],
+        "note": "Use GET /batches/{batch_id}/auto-run/status to track progress"
+    }
+
+
+async def _run_auto_progression(batch_id: UUID, new_password: str, display_name: str):
+    """
+    Background task: Run steps 4𗮼�7 with auto-retry.
+    
+    Each step:
+    1. Process all eligible tenants
+    2. After completion, retry failed tenants up to MAX_AUTO_RETRIES times
+    3. After max retries, mark remaining failures as skipped and proceed
+    4. Move to next step
+    """
+    import asyncio
+    
+    job_id = str(batch_id)
+    
+    try:
+        # === STEP 4: First Login ===
+        auto_run_jobs[job_id]["current_step"] = 4
+        auto_run_jobs[job_id]["current_step_name"] = "First Login"
+        auto_run_jobs[job_id]["steps"]["step4"]["status"] = "running"
+        
+        await _run_step4_with_retry(batch_id, new_password, job_id)
+        
+        auto_run_jobs[job_id]["steps"]["step4"]["status"] = "completed"
+        
+        # === STEP 5: Email Setup (Domain + DKIM) ===
+        auto_run_jobs[job_id]["current_step"] = 5
+        auto_run_jobs[job_id]["current_step_name"] = "Email Setup"
+        auto_run_jobs[job_id]["steps"]["step5"]["status"] = "running"
+        
+        await _run_step5_with_retry(batch_id, job_id)
+        
+        auto_run_jobs[job_id]["steps"]["step5"]["status"] = "completed"
+        
+        # === STEP 6: Mailbox Creation ===
+        auto_run_jobs[job_id]["current_step"] = 6
+        auto_run_jobs[job_id]["current_step_name"] = "Mailbox Creation"
+        auto_run_jobs[job_id]["steps"]["step6"]["status"] = "running"
+        
+        await _run_step6_with_retry(batch_id, display_name, job_id)
+        
+        auto_run_jobs[job_id]["steps"]["step6"]["status"] = "completed"
+        
+        # === STEP 7: SMTP Auth ===
+        auto_run_jobs[job_id]["current_step"] = 7
+        auto_run_jobs[job_id]["current_step_name"] = "SMTP Auth"
+        auto_run_jobs[job_id]["steps"]["step7"]["status"] = "running"
+        
+        await _run_step7_with_retry(batch_id, job_id)
+        
+        auto_run_jobs[job_id]["steps"]["step7"]["status"] = "completed"
+        
+        # === COMPLETE ===
+        auto_run_jobs[job_id]["status"] = "completed"
+        auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        
+        # Mark batch as completed
+        async with async_session_factory() as db:
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.status = BatchStatus.COMPLETED
+                batch.completed_at = datetime.utcnow()
+                batch.current_step = 7
+                await db.commit()
+        
+        logger.info(f"Auto-run COMPLETED for batch {batch_id}")
+        
+    except Exception as e:
+        auto_run_jobs[job_id]["status"] = "error"
+        auto_run_jobs[job_id]["error"] = str(e)
+        auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        logger.error(f"Auto-run FAILED for batch {batch_id}: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+
+async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
+    """Run Step 4 with auto-retry for failures."""
+    for attempt in range(MAX_AUTO_RETRIES + 1):  # Initial + retries
+        async with async_session_factory() as db:
+            # Find tenants needing step 4
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.first_login_completed == False,
+                    Tenant.step4_retry_count <= MAX_AUTO_RETRIES
+                )
+            )
+            tenants = result.scalars().all()
+            
+            if not tenants:
+                break  # All done or max retries exceeded
+            
+            auto_run_jobs[job_id]["steps"]["step4"]["total"] = len(tenants)
+            
+            # Build tenant data
+            tenant_data = [
+                {"tenant_id": str(t.id), "admin_email": t.admin_email, "initial_password": t.admin_password}
+                for t in tenants
+            ]
+            
+            # Run automation (max 2 workers for step 4)
+            results = await process_tenants_parallel(tenant_data, new_password, max_workers=2)
+            
+            # Process results
+            for r in results:
+                async with async_session_factory() as session:
+                    t = await session.get(Tenant, UUID(r["tenant_id"]))
+                    if t:
+                        if r["success"]:
+                            t.first_login_completed = True
+                            t.totp_secret = r["totp_secret"]
+                            t.security_defaults_disabled = r["security_defaults_disabled"]
+                            if r["new_password"]:
+                                t.admin_password = r["new_password"]
+                                t.password_changed = True
+                            t.first_login_at = datetime.utcnow()
+                            t.setup_error = None
+                            auto_run_jobs[job_id]["steps"]["step4"]["completed"] += 1
+                        else:
+                            t.step4_retry_count += 1
+                            t.setup_error = r["error"]
+                            if t.step4_retry_count > MAX_AUTO_RETRIES:
+                                # Skip after max retries
+                                t.first_login_completed = True
+                                t.setup_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {r['error']}"
+                                auto_run_jobs[job_id]["steps"]["step4"]["skipped"] += 1
+                            else:
+                                auto_run_jobs[job_id]["steps"]["step4"]["failed"] += 1
+                        await session.commit()
+            
+            # Brief pause before retry
+            if attempt < MAX_AUTO_RETRIES:
+                await asyncio.sleep(5)
+    
+    # Update batch step
+    async with async_session_factory() as db:
+        batch = await db.get(SetupBatch, batch_id)
+        if batch:
+            batch.current_step = 5
+            await db.commit()
+
+
+async def _run_step5_with_retry(batch_id: UUID, job_id: str):
+    """Run Step 5 with auto-retry for failures."""
+    import asyncio
+    
+    for attempt in range(MAX_AUTO_RETRIES + 1):
+        async with async_session_factory() as db:
+            # Find tenants needing step 5
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.first_login_completed == True,
+                    Tenant.domain_id.isnot(None),
+                    Tenant.dkim_enabled != True,
+                    Tenant.step5_retry_count <= MAX_AUTO_RETRIES
+                )
+            )
+            tenants = result.scalars().all()
+            
+            if not tenants:
+                break
+            
+            auto_run_jobs[job_id]["steps"]["step5"]["total"] = len(tenants)
+        
+        # Run step 5 for batch
+        def on_progress(tenant_id: str, step: str, status: str):
+            auto_run_jobs[job_id]["current_detail"] = f"{step}: {status}"
+        
+        summary = await run_step5_for_batch(batch_id, on_progress)
+        
+        # Update retry counts and stats
+        async with async_session_factory() as db:
+            for r in summary.get("results", []):
+                tenant = await db.get(Tenant, UUID(r["tenant_id"]))
+                if tenant:
+                    if r.get("success"):
+                        auto_run_jobs[job_id]["steps"]["step5"]["completed"] += 1
+                    else:
+                        tenant.step5_retry_count += 1
+                        if tenant.step5_retry_count > MAX_AUTO_RETRIES:
+                            tenant.step5_complete = True  # Skip
+                            tenant.setup_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries"
+                            auto_run_jobs[job_id]["steps"]["step5"]["skipped"] += 1
+                        else:
+                            auto_run_jobs[job_id]["steps"]["step5"]["failed"] += 1
+                    await db.commit()
+        
+        if attempt < MAX_AUTO_RETRIES:
+            await asyncio.sleep(10)
+    
+    # Update batch step
+    async with async_session_factory() as db:
+        batch = await db.get(SetupBatch, batch_id)
+        if batch:
+            batch.current_step = 6
+            await db.commit()
+
+
+async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
+    """Run Step 6 with auto-retry for failures."""
+    import asyncio
+    
+    for attempt in range(MAX_AUTO_RETRIES + 1):
+        async with async_session_factory() as db:
+            # Find tenants needing step 6
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True)),
+                    Tenant.step6_complete == False,
+                    Tenant.step6_retry_count <= MAX_AUTO_RETRIES
+                )
+            )
+            tenants = result.scalars().all()
+            
+            if not tenants:
+                break
+            
+            auto_run_jobs[job_id]["steps"]["step6"]["total"] = len(tenants)
+            
+            # Reset started flag for retry
+            for tenant in tenants:
+                tenant.step6_started = False
+                tenant.step6_error = None
+            await db.commit()
+        
+        # Run step 6
+        await run_azure_step6_for_batch(batch_id, display_name)
+        
+        # Wait for completion (with timeout)
+        max_wait = 60 * 30  # 30 minutes max
+        waited = 0
+        while waited < max_wait:
+            await asyncio.sleep(30)
+            waited += 30
+            
+            # Check progress
+            async with async_session_factory() as db:
+                still_running = await db.scalar(
+                    select(func.count(Tenant.id)).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.step6_started == True,
+                        Tenant.step6_complete == False,
+                        Tenant.step6_error.is_(None)
+                    )
+                ) or 0
+                
+                if still_running == 0:
+                    break
+        
+        # Update retry counts
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_error.isnot(None),
+                    Tenant.step6_complete == False
+                )
+            )
+            failed_tenants = result.scalars().all()
+            
+            for tenant in failed_tenants:
+                tenant.step6_retry_count += 1
+                if tenant.step6_retry_count > MAX_AUTO_RETRIES:
+                    tenant.step6_complete = True  # Skip
+                    tenant.step6_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {tenant.step6_error}"
+                    auto_run_jobs[job_id]["steps"]["step6"]["skipped"] += 1
+                else:
+                    auto_run_jobs[job_id]["steps"]["step6"]["failed"] += 1
+            
+            # Count completed
+            completed = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == True,
+                    Tenant.step6_error.is_(None)
+                )
+            ) or 0
+            auto_run_jobs[job_id]["steps"]["step6"]["completed"] = completed
+            
+            await db.commit()
+        
+        if attempt < MAX_AUTO_RETRIES:
+            await asyncio.sleep(10)
+    
+    # Update batch step
+    async with async_session_factory() as db:
+        batch = await db.get(SetupBatch, batch_id)
+        if batch:
+            batch.current_step = 7
+            await db.commit()
+
+
+async def _run_step7_with_retry(batch_id: UUID, job_id: str):
+    """Run Step 7 with auto-retry for failures."""
+    import asyncio
+    
+    for attempt in range(MAX_AUTO_RETRIES + 1):
+        async with async_session_factory() as db:
+            # Find tenants needing step 7
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step6_complete == True,
+                    Tenant.step7_complete == False,
+                    Tenant.step7_retry_count <= MAX_AUTO_RETRIES
+                )
+            )
+            tenants = result.scalars().all()
+            
+            if not tenants:
+                break
+            
+            auto_run_jobs[job_id]["steps"]["step7"]["total"] = len(tenants)
+            
+            tenant_ids = [t.id for t in tenants]
+        
+        # Run step 7
+        await _run_step7_batch(batch_id, tenant_ids)
+        
+        # Wait for completion
+        await asyncio.sleep(len(tenant_ids) * 30 + 60)  # ~30s per tenant + buffer
+        
+        # Update retry counts
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Tenant).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step7_error.isnot(None),
+                    Tenant.step7_complete == False
+                )
+            )
+            failed_tenants = result.scalars().all()
+            
+            for tenant in failed_tenants:
+                tenant.step7_retry_count += 1
+                if tenant.step7_retry_count > MAX_AUTO_RETRIES:
+                    tenant.step7_complete = True  # Skip
+                    tenant.step7_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {tenant.step7_error}"
+                    auto_run_jobs[job_id]["steps"]["step7"]["skipped"] += 1
+                else:
+                    auto_run_jobs[job_id]["steps"]["step7"]["failed"] += 1
+            
+            # Count completed
+            completed = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id,
+                    Tenant.step7_complete == True,
+                    Tenant.step7_error.is_(None)
+                )
+            ) or 0
+            auto_run_jobs[job_id]["steps"]["step7"]["completed"] = completed
+            
+            await db.commit()
+        
+        if attempt < MAX_AUTO_RETRIES:
+            await asyncio.sleep(10)
+
+
+@router.get("/batches/{batch_id}/auto-run/status")
+async def get_auto_run_status(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Get real-time status of auto-run job.
+    
+    Returns:
+    - Overall status (running/completed/error)
+    - Current step being processed
+    - Per-step progress (completed/failed/skipped counts)
+    - Any errors encountered
+    """
+    job_id = str(batch_id)
+    
+    if job_id not in auto_run_jobs:
+        # Check if batch has auto_progress_enabled
+        batch = await db.get(SetupBatch, batch_id)
+        if batch and batch.auto_progress_enabled:
+            return {
+                "status": "unknown",
+                "message": "Auto-run was enabled but no active job found. May have completed.",
+                "batch_status": batch.status.value,
+                "current_step": batch.current_step
+            }
+        return {
+            "status": "not_started",
+            "message": "No auto-run job found for this batch"
+        }
+    
+    return auto_run_jobs[job_id]
+
+
+@router.post("/batches/{batch_id}/auto-run/stop")
+async def stop_auto_run(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """
+    Stop an auto-run job.
+    
+    Note: This marks the job as stopped but doesn't immediately halt
+    in-progress browser automation. Current operations will complete.
+    """
+    job_id = str(batch_id)
+    
+    if job_id not in auto_run_jobs:
+        raise HTTPException(status_code=404, detail="No auto-run job found for this batch")
+    
+    if auto_run_jobs[job_id].get("status") != "running":
+        return {
+            "success": False,
+            "message": f"Job is not running (status: {auto_run_jobs[job_id].get('status')})"
+        }
+    
+    # Mark as stopped
+    auto_run_jobs[job_id]["status"] = "stopped"
+    auto_run_jobs[job_id]["stopped_at"] = datetime.utcnow().isoformat()
+    
+    # Disable auto-progress on batch
+    batch = await db.get(SetupBatch, batch_id)
+    if batch:
+        batch.auto_progress_enabled = False
+        await db.commit()
+    
+    logger.info(f"Auto-run STOPPED for batch {batch_id}")
+    
+    return {
+        "success": True,
+        "message": "Auto-run job marked as stopped. In-progress operations will complete.",
+        "current_step": auto_run_jobs[job_id].get("current_step")
+    }
 
 
 @router.post("/batches/{batch_id}/advance")

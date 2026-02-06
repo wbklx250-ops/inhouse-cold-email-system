@@ -63,6 +63,13 @@ class SetupBatch(TimestampUUIDMixin, Base):
     completed_steps: Mapped[Optional[List[int]]] = mapped_column(JSONB, nullable=True, default=list)  # e.g., [1, 2, 3]
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
+    # Upload to sequencer tracking (Feature 3)
+    uploaded_to_sequencer: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    
+    # Auto-progression mode (Feature 2)
+    auto_progress_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    
     # Step 6 batch-level tracking
     step6_emails_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step6_emails_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)

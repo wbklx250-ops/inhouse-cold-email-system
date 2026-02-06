@@ -14,6 +14,9 @@ interface Batch {
   domains_count: number;
   tenants_count: number;
   mailboxes_count: number;
+  // Upload tracking (Feature 3)
+  uploaded_to_sequencer: boolean;
+  uploaded_at: string | null;
 }
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -88,6 +91,12 @@ export default function SetupBatchList() {
   const deleteBatch = async (id: string, name: string) => {
     if (!confirm(`Delete batch "${name}"? This cannot be undone.`)) return;
     await fetch(`${API_BASE}/api/v1/wizard/batches/${id}`, { method: "DELETE" });
+    loadBatches();
+  };
+
+  const toggleUploadedToSequencer = async (id: string, currentlyUploaded: boolean) => {
+    const endpoint = currentlyUploaded ? "unmark-uploaded" : "mark-uploaded";
+    await fetch(`${API_BASE}/api/v1/wizard/batches/${id}/${endpoint}`, { method: "POST" });
     loadBatches();
   };
 
@@ -195,6 +204,7 @@ export default function SetupBatchList() {
                 onPause={() => pauseBatch(batch.id)}
                 onResume={() => resumeBatch(batch.id)}
                 onDelete={() => deleteBatch(batch.id, batch.name)}
+                onToggleUploaded={() => toggleUploadedToSequencer(batch.id, batch.uploaded_to_sequencer)}
               />
             ))}
           </div>
@@ -210,12 +220,14 @@ function BatchCard({
   onPause,
   onResume,
   onDelete,
+  onToggleUploaded,
 }: {
   batch: Batch;
   onOpen: () => void;
   onPause: () => void;
   onResume: () => void;
   onDelete: () => void;
+  onToggleUploaded: () => void;
 }) {
   const statusColors: Record<string, string> = {
     active: "bg-green-100 text-green-800",
@@ -226,10 +238,12 @@ function BatchCard({
   const stepProgress = Math.min((batch.current_step / 7) * 100, 100);
 
   return (
-    <div className="bg-white rounded-lg shadow p-6 hover:shadow-lg transition-shadow">
+    <div className={`bg-white rounded-lg shadow p-6 hover:shadow-lg transition-shadow ${
+      batch.uploaded_to_sequencer ? "border-2 border-purple-300 bg-purple-50/30" : ""
+    }`}>
       <div className="flex justify-between items-start">
         <div className="flex-1">
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-3 flex-wrap">
             <h3 className="text-lg font-bold text-gray-900">{batch.name}</h3>
             <span
               className={`px-2 py-1 rounded-full text-xs font-medium ${
@@ -238,6 +252,12 @@ function BatchCard({
             >
               {batch.status}
             </span>
+            {/* Upload to Sequencer Badge */}
+            {batch.uploaded_to_sequencer && (
+              <span className="px-2 py-1 rounded-full text-xs font-medium bg-purple-100 text-purple-800 flex items-center gap-1">
+                ✅ Uploaded to Sequencer
+              </span>
+            )}
           </div>
           {batch.description && (
             <p className="text-gray-600 text-sm mt-1">{batch.description}</p>
@@ -252,6 +272,7 @@ function BatchCard({
             <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
               <div
                 className={`h-full transition-all ${
+                  batch.uploaded_to_sequencer ? "bg-purple-500" : 
                   batch.status === "completed" ? "bg-green-500" : "bg-blue-500"
                 }`}
                 style={{ width: `${stepProgress}%` }}
@@ -275,9 +296,16 @@ function BatchCard({
             </div>
           </div>
 
-          <p className="text-xs text-gray-400 mt-3">
-            Created: {new Date(batch.created_at).toLocaleDateString()}
-          </p>
+          <div className="flex items-center gap-4 mt-3">
+            <p className="text-xs text-gray-400">
+              Created: {new Date(batch.created_at).toLocaleDateString()}
+            </p>
+            {batch.uploaded_at && (
+              <p className="text-xs text-purple-600">
+                Uploaded: {new Date(batch.uploaded_at).toLocaleDateString()}
+              </p>
+            )}
+          </div>
         </div>
 
         {/* Actions */}
@@ -288,6 +316,22 @@ function BatchCard({
           >
             {batch.status === "completed" ? "View" : "Continue"}
           </button>
+          
+          {/* Upload to Sequencer Toggle - only show for completed batches */}
+          {batch.status === "completed" && (
+            <button
+              onClick={onToggleUploaded}
+              className={`px-4 py-2 border font-medium rounded-lg text-sm transition-colors ${
+                batch.uploaded_to_sequencer
+                  ? "border-purple-300 text-purple-700 bg-purple-50 hover:bg-purple-100"
+                  : "border-gray-300 text-gray-700 hover:bg-gray-50"
+              }`}
+              title={batch.uploaded_to_sequencer ? "Click to unmark as uploaded" : "Click to mark as uploaded to sequencer"}
+            >
+              {batch.uploaded_to_sequencer ? "📤 Unmark Uploaded" : "📤 Mark Uploaded"}
+            </button>
+          )}
+          
           {batch.status === "active" && (
             <button
               onClick={onPause}

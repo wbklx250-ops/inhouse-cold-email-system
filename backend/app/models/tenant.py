@@ -115,6 +115,12 @@ class Tenant(TimestampUUIDMixin, Base):
     step5_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step5_completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # === AUTO-RETRY TRACKING (max 4 retries per step) ===
+    step4_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step5_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step7_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # === DOMAIN LINKING ===
     custom_domain: Mapped[str | None] = mapped_column(String(255), nullable=True)
     domain_id: Mapped[UUID | None] = mapped_column(
