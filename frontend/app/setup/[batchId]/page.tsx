@@ -1696,8 +1696,8 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
         )}
 
         {/* Import Button */}
-        <button 
-          onClick={handleImport} 
+        <button
+          onClick={handleImport}
           disabled={!tenantCsv || !credentialsTxt || importing}
           className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
         >
@@ -1710,6 +1710,26 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
             "Import Tenants →"
           )}
         </button>
+
+        {/* Display Name for Mailboxes */}
+        <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6 space-y-4">
+          <h3 className="text-lg font-bold text-purple-900">Display Name for Mailboxes</h3>
+          <p className="text-sm text-purple-700">
+            Enter the display name to use for all mailboxes. This is required for auto-complete.
+          </p>
+          <div>
+            <input
+              type="text"
+              value={autoRunDisplayName}
+              onChange={(e) => setAutoRunDisplayName(e.target.value)}
+              placeholder="e.g., Ryan Chen"
+              className="w-full px-4 py-2 border rounded-lg"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Full name (first and last) used for all mailbox display names
+            </p>
+          </div>
+        </div>
 
         {/* Info */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
