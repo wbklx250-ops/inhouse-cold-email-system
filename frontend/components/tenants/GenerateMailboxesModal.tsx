@@ -153,7 +153,7 @@ export const GenerateMailboxesModal = ({
                 <option value="">-- Select a tenant --</option>
                 {tenants.map((tenant) => (
                   <option key={tenant.id} value={tenant.id}>
-                    {tenant.name} ({tenant.mailboxes_created} mailboxes)
+                    {tenant.name} ({tenant.mailbox_count} mailboxes)
                   </option>
                 ))}
               </select>
@@ -172,7 +172,7 @@ export const GenerateMailboxesModal = ({
               <p className="text-purple-600 text-xs mt-1">
                 Domain: {selectedTenant.domain_id ? "Linked" : "Not linked"} | 
                 Status: {selectedTenant.status} | 
-                Existing mailboxes: {selectedTenant.mailboxes_created}
+                Existing mailboxes: {selectedTenant.mailbox_count}
               </p>
             </div>
           )}

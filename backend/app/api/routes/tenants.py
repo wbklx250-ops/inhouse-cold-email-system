@@ -38,7 +38,7 @@ async def get_tenant_or_404(tenant_id: UUID, db: AsyncSession) -> Tenant:
     return tenant
 
 
-@router.get("", response_model=list[TenantRead])
+@router.get("/", response_model=list[TenantRead])
 async def list_tenants(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=500),

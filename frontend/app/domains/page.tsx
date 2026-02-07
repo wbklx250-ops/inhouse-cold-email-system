@@ -32,13 +32,18 @@ const STATUS_OPTIONS: { value: DomainStatus | "all"; label: string }[] = [
   { value: "purchased", label: "Purchased" },
   { value: "cf_zone_pending", label: "Zone Pending" },
   { value: "cf_zone_active", label: "Zone Active" },
+  { value: "zone_created", label: "Zone Created" },
   { value: "ns_updating", label: "NS Updating" },
   { value: "ns_propagating", label: "NS Propagating" },
+  { value: "ns_propagated", label: "NS Propagated" },
   { value: "dns_configuring", label: "DNS Configuring" },
+  { value: "tenant_linked", label: "Tenant Linked" },
   { value: "pending_m365", label: "Pending M365" },
+  { value: "m365_verified", label: "M365 Verified" },
   { value: "pending_dkim", label: "Pending DKIM" },
   { value: "active", label: "Active" },
   { value: "problem", label: "Problem" },
+  { value: "error", label: "Error" },
   { value: "retired", label: "Retired" },
 ];
 

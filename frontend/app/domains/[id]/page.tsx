@@ -15,13 +15,18 @@ const statusConfig: Record<DomainStatus, { label: string; variant: "success" | "
   purchased: { label: "Purchased", variant: "default" },
   cf_zone_pending: { label: "CF Zone Pending", variant: "warning" },
   cf_zone_active: { label: "CF Zone Active", variant: "success" },
+  zone_created: { label: "Zone Created", variant: "success" },
   ns_updating: { label: "NS Updating", variant: "warning" },
   ns_propagating: { label: "NS Propagating", variant: "warning" },
+  ns_propagated: { label: "NS Propagated", variant: "success" },
   dns_configuring: { label: "DNS Configuring", variant: "warning" },
+  tenant_linked: { label: "Tenant Linked", variant: "warning" },
   pending_m365: { label: "Pending M365", variant: "warning" },
+  m365_verified: { label: "M365 Verified", variant: "success" },
   pending_dkim: { label: "Pending DKIM", variant: "warning" },
   active: { label: "Active", variant: "success" },
   problem: { label: "Problem", variant: "error" },
+  error: { label: "Error", variant: "error" },
   retired: { label: "Retired", variant: "default" },
 };
 
