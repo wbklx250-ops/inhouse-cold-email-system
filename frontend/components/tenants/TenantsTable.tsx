@@ -13,15 +13,22 @@ interface TenantsTableProps {
 const statusConfig: Record<TenantStatus, { label: string; variant: "success" | "warning" | "error" | "default" | "info"; step?: number }> = {
   new: { label: "New", variant: "default", step: 1 },
   imported: { label: "Imported", variant: "default", step: 1 },
+  first_login_pending: { label: "First Login Pending", variant: "default", step: 1 },
+  first_login_complete: { label: "First Login Complete", variant: "info", step: 1 },
   domain_linked: { label: "Domain Linked", variant: "info", step: 2 },
+  domain_added: { label: "Domain Added", variant: "info", step: 3 },
   m365_connected: { label: "M365 Connected", variant: "info", step: 3 },
   domain_verified: { label: "M365 Verified", variant: "warning", step: 3 },
   dns_configuring: { label: "DNS Configuring", variant: "warning", step: 4 },
+  dns_configured: { label: "DNS Configured", variant: "warning", step: 4 },
   dkim_configuring: { label: "DKIM Configuring", variant: "warning", step: 5 },
+  pending_dkim: { label: "Pending DKIM", variant: "warning", step: 5 },
   dkim_enabled: { label: "DKIM Enabled", variant: "warning", step: 5 },
   mailboxes_creating: { label: "Creating Mailboxes", variant: "warning", step: 6 },
   mailboxes_configuring: { label: "Configuring Mailboxes", variant: "warning", step: 6 },
+  mailboxes_created: { label: "Mailboxes Created", variant: "warning", step: 6 },
   configuring: { label: "Configuring", variant: "warning", step: 6 },
+  ready: { label: "Ready", variant: "success", step: 7 },
   active: { label: "Active", variant: "success", step: 7 },
   suspended: { label: "Suspended", variant: "error" },
   retired: { label: "Retired", variant: "default" },
@@ -162,7 +169,7 @@ export function TenantsTable({ tenants, selectedIds, onSelectionChange }: Tenant
                 </td>
                 <td className="px-6 py-4 whitespace-nowrap">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-gray-900">{tenant.mailboxes_created}</span>
+                    <span className="text-sm font-medium text-gray-900">{tenant.mailbox_count}</span>
                     <span className="text-xs text-gray-500">({tenant.mailboxes_configured} configured)</span>
                   </div>
                 </td>

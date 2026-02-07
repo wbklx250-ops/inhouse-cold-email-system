@@ -22,20 +22,27 @@ const statusConfig: Record<TenantStatus, { label: string; variant: "success" | "
   // Import/creation states
   new: { label: "New", variant: "default" },
   imported: { label: "Imported", variant: "default" },
+  first_login_pending: { label: "First Login Pending", variant: "default" },
+  first_login_complete: { label: "First Login Complete", variant: "default" },
   // Domain linking
   domain_linked: { label: "Domain Linked", variant: "warning" },
+  domain_added: { label: "Domain Added", variant: "warning" },
   // M365 connection states
   m365_connected: { label: "M365 Connected", variant: "warning" },
   domain_verified: { label: "Domain Verified", variant: "warning" },
   // DNS/DKIM configuration
   dns_configuring: { label: "DNS Configuring", variant: "warning" },
+  dns_configured: { label: "DNS Configured", variant: "warning" },
   dkim_configuring: { label: "DKIM Configuring", variant: "warning" },
+  pending_dkim: { label: "Pending DKIM", variant: "warning" },
   dkim_enabled: { label: "DKIM Enabled", variant: "warning" },
   // Mailbox states
   mailboxes_creating: { label: "Creating Mailboxes", variant: "warning" },
   mailboxes_configuring: { label: "Configuring Mailboxes", variant: "warning" },
+  mailboxes_created: { label: "Mailboxes Created", variant: "warning" },
   configuring: { label: "Configuring", variant: "warning" },
   // Final states
+  ready: { label: "Ready", variant: "success" },
   active: { label: "Active", variant: "success" },
   suspended: { label: "Suspended", variant: "error" },
   retired: { label: "Retired", variant: "default" },
@@ -218,7 +225,7 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
           </div>
           <div>
             <p className="text-xs font-medium text-gray-500 uppercase tracking-wider">Total Mailboxes</p>
-            <p className="mt-1 text-sm font-medium text-gray-900">{tenant.mailboxes_created}</p>
+            <p className="mt-1 text-sm font-medium text-gray-900">{tenant.mailbox_count}</p>
           </div>
         </div>
       </div>
@@ -314,7 +321,7 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-4">
               <div className="p-4 bg-gray-50 rounded-lg text-center">
-                <p className="text-3xl font-bold text-gray-900">{tenant.mailboxes_created}</p>
+                <p className="text-3xl font-bold text-gray-900">{tenant.mailbox_count}</p>
                 <p className="text-sm text-gray-500">Created</p>
               </div>
               <div className="p-4 bg-green-50 rounded-lg text-center">
@@ -326,12 +333,12 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
             <div className="space-y-2">
               <div className="flex justify-between text-sm">
                 <span className="text-gray-600">Capacity Used</span>
-                <span className="font-medium">{tenant.mailboxes_created} / {tenant.target_mailbox_count}</span>
+                <span className="font-medium">{tenant.mailbox_count} / {tenant.target_mailbox_count}</span>
               </div>
               <div className="w-full bg-gray-200 rounded-full h-2">
                 <div
                   className="bg-blue-600 h-2 rounded-full transition-all"
-                  style={{ width: `${Math.min((tenant.mailboxes_created / tenant.target_mailbox_count) * 100, 100)}%` }}
+                  style={{ width: `${Math.min((tenant.mailbox_count / tenant.target_mailbox_count) * 100, 100)}%` }}
                 />
               </div>
             </div>
@@ -400,7 +407,7 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
             ) : (
               <div className="bg-red-50 border border-red-200 rounded-lg p-4 space-y-3">
                 <p className="text-sm text-red-700">
-                  Are you sure? This will delete the tenant and all {tenant.mailboxes_created} associated mailboxes.
+                  Are you sure? This will delete the tenant and all {tenant.mailbox_count} associated mailboxes.
                 </p>
                 <div className="flex gap-3">
                   <button
