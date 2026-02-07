@@ -33,7 +33,7 @@ export default function TenantsPage() {
   const fetchTenants = useCallback(async () => {
     try {
       setError(null);
-      const data = await listTenants(0, 100, statusFilter || undefined);
+      const data = await listTenants(0, 500, statusFilter || undefined);
       setTenants(data);
     } catch (err) {
       console.error("Failed to fetch tenants:", err);

@@ -179,7 +179,7 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
     );
   }
 
-  const statusInfo = statusConfig[tenant.status];
+  const statusInfo = statusConfig[tenant.status] || { label: tenant.status, variant: "default" as const };
 
   return (
     <div className="space-y-6">
