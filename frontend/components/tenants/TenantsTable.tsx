@@ -129,7 +129,7 @@ export function TenantsTable({ tenants, selectedIds, onSelectionChange }: Tenant
         </thead>
         <tbody className="bg-white divide-y divide-gray-200">
           {tenants.map((tenant) => {
-            const statusInfo = statusConfig[tenant.status];
+            const statusInfo = statusConfig[tenant.status] || { label: tenant.status, variant: "default" as const };
             const isSelected = selectedIds.includes(tenant.id);
             return (
               <tr

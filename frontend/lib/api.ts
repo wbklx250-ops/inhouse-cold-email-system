@@ -186,7 +186,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export const listDomains = async (
   skip = 0,
-  limit = 100,
+  limit = 500,
   status?: DomainStatus
 ): Promise<Domain[]> => {
   return apiRequest<Domain[]>(`${API_BASE}/api/v1/domains/`, {
@@ -345,7 +345,7 @@ export interface TenantWithDomain extends Tenant {
 
 export const listTenants = async (
   skip = 0,
-  limit = 100,
+  limit = 500,
   status?: TenantStatus
 ): Promise<Tenant[]> => {
   return apiRequest<Tenant[]>(`${API_BASE}/api/v1/tenants/`, {
