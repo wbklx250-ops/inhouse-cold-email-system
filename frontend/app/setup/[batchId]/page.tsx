@@ -1340,7 +1340,6 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
 
       const data = await res.json();
       if (data.success) {
-        setShowAutoRunModal(false);
         setAutoRunPolling(true);
         // Fetch initial status
         const statusRes = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
