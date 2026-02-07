@@ -1215,8 +1215,6 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [loadingTenants, setLoadingTenants] = useState(false);
 
   // Auto-Run state (Auto-Complete Steps 4→7)
-  const [showAutoRunModal, setShowAutoRunModal] = useState(false);
-  const [autoRunPassword, setAutoRunPassword] = useState("#Sendemails1");
   const [autoRunDisplayName, setAutoRunDisplayName] = useState("");
   const [autoRunStarting, setAutoRunStarting] = useState(false);
   const [autoRunStatus, setAutoRunStatus] = useState<AutoRunStatus | null>(null);
@@ -1330,7 +1328,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          new_password: autoRunPassword,
+          new_password: "#Sendemails1",
           display_name: autoRunDisplayName.trim()
         })
       });
@@ -1698,8 +1696,8 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
         )}
 
         {/* Import Button */}
-        <button 
-          onClick={handleImport} 
+        <button
+          onClick={handleImport}
           disabled={!tenantCsv || !credentialsTxt || importing}
           className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
         >
@@ -1712,6 +1710,26 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
             "Import Tenants →"
           )}
         </button>
+
+        {/* Display Name for Mailboxes */}
+        <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6 space-y-4">
+          <h3 className="text-lg font-bold text-purple-900">Display Name for Mailboxes</h3>
+          <p className="text-sm text-purple-700">
+            Enter the display name to use for all mailboxes. This is required for auto-complete.
+          </p>
+          <div>
+            <input
+              type="text"
+              value={autoRunDisplayName}
+              onChange={(e) => setAutoRunDisplayName(e.target.value)}
+              placeholder="e.g., Ryan Chen"
+              className="w-full px-4 py-2 border rounded-lg"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Full name (first and last) used for all mailbox display names
+            </p>
+          </div>
+        </div>
 
         {/* Info */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
@@ -2079,101 +2097,49 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
       {/* Auto-Complete All Steps Button - Only show when not running */}
       {!autoRunPolling && (
         <div className="border-t pt-6 mt-6">
-          <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6">
+          <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6 space-y-4">
             <h3 className="text-lg font-bold text-purple-900 mb-2">🚀 Auto-Complete Remaining Steps</h3>
-            <p className="text-sm text-purple-700 mb-4">
-              Automatically run Steps 4 through 7 with auto-retry for failures (up to 4 retries per item).
-              This will run first-login, configure M365, create mailboxes, and prepare for sequencer.
+            <p className="text-sm text-purple-700">
+              Enter the display name for mailboxes, then click auto-complete to run Steps 4 through 7
+              with auto-retry for failures (up to 4 retries per item).
             </p>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Display Name for Mailboxes *
+              </label>
+              <input
+                type="text"
+                value={autoRunDisplayName}
+                onChange={(e) => setAutoRunDisplayName(e.target.value)}
+                placeholder="e.g., Ryan Chen"
+                className="w-full px-4 py-2 border rounded-lg"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Full name (first and last) used for all mailbox display names
+              </p>
+            </div>
+
+            {autoRunError && (
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3">
+                <p className="text-red-800 text-sm">{autoRunError}</p>
+              </div>
+            )}
+
             <button
-              onClick={() => setShowAutoRunModal(true)}
-              className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white text-lg font-bold rounded-lg hover:from-purple-700 hover:to-pink-700 transition-all shadow-lg"
+              onClick={handleStartAutoRun}
+              disabled={autoRunStarting || !autoRunDisplayName.includes(" ")}
+              className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white text-lg font-bold rounded-lg hover:from-purple-700 hover:to-pink-700 transition-all shadow-lg disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed"
             >
-              🤖 Start Auto-Complete (Steps 4→7)
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Auto-Run Configuration Modal */}
-      {showAutoRunModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
-            <h3 className="text-xl font-bold text-gray-900 mb-4">🤖 Configure Auto-Run</h3>
-
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  New Password for Tenants *
-                </label>
-                <input
-                  type="text"
-                  value={autoRunPassword}
-                  onChange={(e) => setAutoRunPassword(e.target.value)}
-                  placeholder="#Sendemails1"
-                  className="w-full px-4 py-2 border rounded-lg"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Password to set for all tenant admin accounts
-                </p>
-              </div>
-
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Display Name for Mailboxes *
-                </label>
-                <input
-                  type="text"
-                  value={autoRunDisplayName}
-                  onChange={(e) => setAutoRunDisplayName(e.target.value)}
-                  placeholder="e.g., Jack Zuvelek"
-                  className="w-full px-4 py-2 border rounded-lg"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Full name (first and last) used for all mailbox display names
-                </p>
-              </div>
-
-              <div className="bg-blue-50 border border-blue-200 rounded-lg p-3 text-sm">
-                <p className="text-blue-800">
-                  <strong>ℹ️ Info:</strong> Tenants and credentials have been imported. The auto-run
-                  will now process Steps 4→5→6→7 automatically with retry logic (up to 4 retries
-                  per failed tenant).
-                </p>
-              </div>
-
-              {autoRunError && (
-                <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                  <p className="text-red-800 text-sm">{autoRunError}</p>
-                </div>
+              {autoRunStarting ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="animate-spin">⏳</span>
+                  Starting...
+                </span>
+              ) : (
+                "🤖 Start Auto-Complete (Steps 4→7)"
               )}
-            </div>
-
-            <div className="flex gap-3 mt-6">
-              <button
-                onClick={() => {
-                  setShowAutoRunModal(false);
-                  setAutoRunError(null);
-                }}
-                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleStartAutoRun}
-                disabled={autoRunStarting || !autoRunDisplayName.includes(" ")}
-                className="flex-1 px-4 py-2 bg-purple-600 text-white font-bold rounded-lg hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-              >
-                {autoRunStarting ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="animate-spin">⏳</span>
-                    Starting...
-                  </span>
-                ) : (
-                  "🚀 Start Auto-Run"
-                )}
-              </button>
-            </div>
+            </button>
           </div>
         </div>
       )}
