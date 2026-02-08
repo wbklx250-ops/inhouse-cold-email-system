@@ -85,17 +85,22 @@ export const apiRequest = async <T>(
 // ============================================================================
 
 // Backend DomainStatus enum values
-export type DomainStatus = 
-  | "purchased" 
-  | "cf_zone_pending" 
-  | "cf_zone_active" 
-  | "ns_updating" 
-  | "ns_propagating" 
-  | "dns_configuring" 
-  | "pending_m365" 
-  | "pending_dkim" 
-  | "active" 
-  | "problem" 
+export type DomainStatus =
+  | "purchased"
+  | "cf_zone_pending"
+  | "cf_zone_active"
+  | "zone_created"
+  | "ns_updating"
+  | "ns_propagating"
+  | "ns_propagated"
+  | "dns_configuring"
+  | "tenant_linked"
+  | "pending_m365"
+  | "m365_verified"
+  | "pending_dkim"
+  | "active"
+  | "problem"
+  | "error"
   | "retired";
 
 export interface Domain {
@@ -181,7 +186,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
 export const listDomains = async (
   skip = 0,
-  limit = 100,
+  limit = 500,
   status?: DomainStatus
 ): Promise<Domain[]> => {
   return apiRequest<Domain[]>(`${API_BASE}/api/v1/domains/`, {
@@ -243,22 +248,29 @@ export const bulkDeleteDomains = async (ids: string[]): Promise<{ message: strin
 // ============================================================================
 
 // Must match backend TenantStatus enum exactly
-export type TenantStatus = 
-  | "new" 
-  | "imported" 
-  | "domain_linked" 
-  | "m365_connected" 
-  | "domain_verified" 
-  | "dns_configuring" 
-  | "dkim_configuring" 
-  | "dkim_enabled" 
-  | "mailboxes_creating" 
-  | "mailboxes_configuring" 
-  | "configuring" 
-  | "active" 
-  | "suspended" 
-  | "retired" 
-  | "error";
+export type TenantStatus =
+  | "new"
+  | "configuring"
+  | "active"
+  | "suspended"
+  | "retired"
+  | "error"
+  | "imported"
+  | "first_login_pending"
+  | "first_login_complete"
+  | "domain_linked"
+  | "domain_added"
+  | "m365_connected"
+  | "domain_verified"
+  | "dns_configuring"
+  | "dns_configured"
+  | "dkim_configuring"
+  | "pending_dkim"
+  | "dkim_enabled"
+  | "mailboxes_creating"
+  | "mailboxes_configuring"
+  | "mailboxes_created"
+  | "ready";
 
 export interface Tenant {
   id: string;
@@ -267,20 +279,40 @@ export interface Tenant {
   onmicrosoft_domain: string;
   provider: string;
   admin_email: string;
-  licensed_user_email: string;
   status: TenantStatus;
   target_mailbox_count: number;
-  mailboxes_created: number;
-  mailboxes_configured: number;
   domain_id: string | null;
-  // M365 fields
+  // Licensed user
+  licensed_user_upn: string | null;
   licensed_user_id: string | null;
-  provider_order_id: string | null;
+  licensed_user_created: boolean;
+  // M365 setup tracking
+  first_login_completed: boolean;
+  domain_added_to_m365: boolean;
+  domain_verified_in_m365: boolean;
+  // DNS tracking
+  mx_record_added: boolean;
+  spf_record_added: boolean;
   mx_value: string | null;
   spf_value: string | null;
+  // DKIM tracking
   dkim_selector1_cname: string | null;
   dkim_selector2_cname: string | null;
-  error_message: string | null;
+  dkim_cnames_added: boolean;
+  dkim_enabled: boolean;
+  // Mailbox tracking
+  mailbox_count: number;
+  mailboxes_generated: boolean;
+  mailboxes_created: boolean;
+  mailboxes_configured: number;
+  // Custom domain
+  custom_domain: string | null;
+  // Error tracking
+  setup_step: string | null;
+  setup_error: string | null;
+  provider_order_id: string | null;
+  // Batch relationship
+  batch_id: string | null;
   // Timestamps
   created_at: string;
   updated_at: string;
@@ -313,7 +345,7 @@ export interface TenantWithDomain extends Tenant {
 
 export const listTenants = async (
   skip = 0,
-  limit = 100,
+  limit = 500,
   status?: TenantStatus
 ): Promise<Tenant[]> => {
   return apiRequest<Tenant[]>(`${API_BASE}/api/v1/tenants/`, {

@@ -369,19 +369,19 @@ async def start_auto_run(
     db: AsyncSession = Depends(get_db)
 ):
     """
-    FEATURE 2: Auto-run steps 4-5-6-7 automatically from Step 3.
-    
+    Auto-run steps 4-5-6-7 automatically from Step 4 (after tenant/credential import).
+
     This endpoint:
-    1. Validates batch is at Step 3 or later
+    1. Validates tenants are imported in the batch
     2. Enables auto_progress_enabled flag
-    3. Chains through Steps 4, 5, 6, 7 automatically
+    3. Chains through Steps 4 (first-login), 5, 6, 7 automatically
     4. Auto-retries failed tenants up to 4 times before moving on
     5. Reports progress and final status
-    
+
     Required parameters:
     - new_password: Password to set during first login (Step 4)
     - display_name: Full name for mailboxes e.g. "Jack Zuvelek" (Step 6)
-    
+
     Progress tracking:
     - GET /batches/{batch_id}/auto-run/status for real-time progress
     """
@@ -427,10 +427,13 @@ async def start_auto_run(
         "batch_id": str(batch_id),
         "batch_name": batch.name,
         "started_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
         "current_step": 4,
         "current_step_name": "First Login",
+        "message": f"Starting auto-run for {tenant_count} tenants...",
+        "error": None,
         "tenant_count": tenant_count,
-        "steps": {
+        "progress": {
             "step4": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step5": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step6": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
@@ -478,41 +481,46 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         # === STEP 4: First Login ===
         auto_run_jobs[job_id]["current_step"] = 4
         auto_run_jobs[job_id]["current_step_name"] = "First Login"
-        auto_run_jobs[job_id]["steps"]["step4"]["status"] = "running"
-        
+        auto_run_jobs[job_id]["message"] = "Running first-login automation..."
+        auto_run_jobs[job_id]["progress"]["step4"]["status"] = "running"
+
         await _run_step4_with_retry(batch_id, new_password, job_id)
-        
-        auto_run_jobs[job_id]["steps"]["step4"]["status"] = "completed"
-        
+
+        auto_run_jobs[job_id]["progress"]["step4"]["status"] = "completed"
+
         # === STEP 5: Email Setup (Domain + DKIM) ===
         auto_run_jobs[job_id]["current_step"] = 5
         auto_run_jobs[job_id]["current_step_name"] = "Email Setup"
-        auto_run_jobs[job_id]["steps"]["step5"]["status"] = "running"
-        
+        auto_run_jobs[job_id]["message"] = "Adding domains to M365 and configuring DKIM..."
+        auto_run_jobs[job_id]["progress"]["step5"]["status"] = "running"
+
         await _run_step5_with_retry(batch_id, job_id)
-        
-        auto_run_jobs[job_id]["steps"]["step5"]["status"] = "completed"
-        
+
+        auto_run_jobs[job_id]["progress"]["step5"]["status"] = "completed"
+
         # === STEP 6: Mailbox Creation ===
         auto_run_jobs[job_id]["current_step"] = 6
         auto_run_jobs[job_id]["current_step_name"] = "Mailbox Creation"
-        auto_run_jobs[job_id]["steps"]["step6"]["status"] = "running"
-        
+        auto_run_jobs[job_id]["message"] = f"Creating mailboxes with display name '{display_name}'..."
+        auto_run_jobs[job_id]["progress"]["step6"]["status"] = "running"
+
         await _run_step6_with_retry(batch_id, display_name, job_id)
-        
-        auto_run_jobs[job_id]["steps"]["step6"]["status"] = "completed"
-        
+
+        auto_run_jobs[job_id]["progress"]["step6"]["status"] = "completed"
+
         # === STEP 7: SMTP Auth ===
         auto_run_jobs[job_id]["current_step"] = 7
         auto_run_jobs[job_id]["current_step_name"] = "SMTP Auth"
-        auto_run_jobs[job_id]["steps"]["step7"]["status"] = "running"
-        
+        auto_run_jobs[job_id]["message"] = "Enabling SMTP authentication..."
+        auto_run_jobs[job_id]["progress"]["step7"]["status"] = "running"
+
         await _run_step7_with_retry(batch_id, job_id)
-        
-        auto_run_jobs[job_id]["steps"]["step7"]["status"] = "completed"
-        
+
+        auto_run_jobs[job_id]["progress"]["step7"]["status"] = "completed"
+
         # === COMPLETE ===
         auto_run_jobs[job_id]["status"] = "completed"
+        auto_run_jobs[job_id]["message"] = "All steps completed successfully!"
         auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
         
         # Mark batch as completed
@@ -527,8 +535,9 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         logger.info(f"Auto-run COMPLETED for batch {batch_id}")
         
     except Exception as e:
-        auto_run_jobs[job_id]["status"] = "error"
+        auto_run_jobs[job_id]["status"] = "failed"
         auto_run_jobs[job_id]["error"] = str(e)
+        auto_run_jobs[job_id]["message"] = f"Auto-run failed: {str(e)}"
         auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
         logger.error(f"Auto-run FAILED for batch {batch_id}: {e}")
         import traceback
@@ -552,7 +561,7 @@ async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
             if not tenants:
                 break  # All done or max retries exceeded
             
-            auto_run_jobs[job_id]["steps"]["step4"]["total"] = len(tenants)
+            auto_run_jobs[job_id]["progress"]["step4"]["total"] = len(tenants)
             
             # Build tenant data
             tenant_data = [
@@ -577,7 +586,7 @@ async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
                                 t.password_changed = True
                             t.first_login_at = datetime.utcnow()
                             t.setup_error = None
-                            auto_run_jobs[job_id]["steps"]["step4"]["completed"] += 1
+                            auto_run_jobs[job_id]["progress"]["step4"]["completed"] += 1
                         else:
                             t.step4_retry_count += 1
                             t.setup_error = r["error"]
@@ -585,9 +594,9 @@ async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
                                 # Skip after max retries
                                 t.first_login_completed = True
                                 t.setup_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {r['error']}"
-                                auto_run_jobs[job_id]["steps"]["step4"]["skipped"] += 1
+                                auto_run_jobs[job_id]["progress"]["step4"]["skipped"] += 1
                             else:
-                                auto_run_jobs[job_id]["steps"]["step4"]["failed"] += 1
+                                auto_run_jobs[job_id]["progress"]["step4"]["failed"] += 1
                         await session.commit()
             
             # Brief pause before retry
@@ -623,7 +632,7 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
             if not tenants:
                 break
             
-            auto_run_jobs[job_id]["steps"]["step5"]["total"] = len(tenants)
+            auto_run_jobs[job_id]["progress"]["step5"]["total"] = len(tenants)
         
         # Run step 5 for batch
         def on_progress(tenant_id: str, step: str, status: str):
@@ -637,15 +646,15 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
                 tenant = await db.get(Tenant, UUID(r["tenant_id"]))
                 if tenant:
                     if r.get("success"):
-                        auto_run_jobs[job_id]["steps"]["step5"]["completed"] += 1
+                        auto_run_jobs[job_id]["progress"]["step5"]["completed"] += 1
                     else:
                         tenant.step5_retry_count += 1
                         if tenant.step5_retry_count > MAX_AUTO_RETRIES:
                             tenant.step5_complete = True  # Skip
                             tenant.setup_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries"
-                            auto_run_jobs[job_id]["steps"]["step5"]["skipped"] += 1
+                            auto_run_jobs[job_id]["progress"]["step5"]["skipped"] += 1
                         else:
-                            auto_run_jobs[job_id]["steps"]["step5"]["failed"] += 1
+                            auto_run_jobs[job_id]["progress"]["step5"]["failed"] += 1
                     await db.commit()
         
         if attempt < MAX_AUTO_RETRIES:
@@ -679,7 +688,7 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
             if not tenants:
                 break
             
-            auto_run_jobs[job_id]["steps"]["step6"]["total"] = len(tenants)
+            auto_run_jobs[job_id]["progress"]["step6"]["total"] = len(tenants)
             
             # Reset started flag for retry
             for tenant in tenants:
@@ -727,9 +736,9 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
                 if tenant.step6_retry_count > MAX_AUTO_RETRIES:
                     tenant.step6_complete = True  # Skip
                     tenant.step6_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {tenant.step6_error}"
-                    auto_run_jobs[job_id]["steps"]["step6"]["skipped"] += 1
+                    auto_run_jobs[job_id]["progress"]["step6"]["skipped"] += 1
                 else:
-                    auto_run_jobs[job_id]["steps"]["step6"]["failed"] += 1
+                    auto_run_jobs[job_id]["progress"]["step6"]["failed"] += 1
             
             # Count completed
             completed = await db.scalar(
@@ -739,7 +748,7 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
                     Tenant.step6_error.is_(None)
                 )
             ) or 0
-            auto_run_jobs[job_id]["steps"]["step6"]["completed"] = completed
+            auto_run_jobs[job_id]["progress"]["step6"]["completed"] = completed
             
             await db.commit()
         
@@ -774,7 +783,7 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
             if not tenants:
                 break
             
-            auto_run_jobs[job_id]["steps"]["step7"]["total"] = len(tenants)
+            auto_run_jobs[job_id]["progress"]["step7"]["total"] = len(tenants)
             
             tenant_ids = [t.id for t in tenants]
         
@@ -800,9 +809,9 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
                 if tenant.step7_retry_count > MAX_AUTO_RETRIES:
                     tenant.step7_complete = True  # Skip
                     tenant.step7_error = f"SKIPPED after {MAX_AUTO_RETRIES} retries: {tenant.step7_error}"
-                    auto_run_jobs[job_id]["steps"]["step7"]["skipped"] += 1
+                    auto_run_jobs[job_id]["progress"]["step7"]["skipped"] += 1
                 else:
-                    auto_run_jobs[job_id]["steps"]["step7"]["failed"] += 1
+                    auto_run_jobs[job_id]["progress"]["step7"]["failed"] += 1
             
             # Count completed
             completed = await db.scalar(
@@ -812,7 +821,7 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
                     Tenant.step7_error.is_(None)
                 )
             ) or 0
-            auto_run_jobs[job_id]["steps"]["step7"]["completed"] = completed
+            auto_run_jobs[job_id]["progress"]["step7"]["completed"] = completed
             
             await db.commit()
         
@@ -872,7 +881,8 @@ async def stop_auto_run(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     
     # Mark as stopped
     auto_run_jobs[job_id]["status"] = "stopped"
-    auto_run_jobs[job_id]["stopped_at"] = datetime.utcnow().isoformat()
+    auto_run_jobs[job_id]["message"] = "Auto-run was stopped by user. Progress has been preserved."
+    auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
     
     # Disable auto-progress on batch
     batch = await db.get(SetupBatch, batch_id)

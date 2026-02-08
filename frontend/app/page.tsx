@@ -142,7 +142,7 @@ export default function Dashboard() {
           )}
         </div>
 
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-8">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mt-8">
           <Link
             href="/domains"
             className="p-4 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-center"
@@ -160,15 +160,6 @@ export default function Dashboard() {
               <BuildingIcon />
             </div>
             <p className="font-medium">All Tenants</p>
-          </Link>
-          <Link
-            href="/mailboxes"
-            className="p-4 bg-white rounded-lg shadow hover:shadow-md transition-shadow text-center"
-          >
-            <div className="text-3xl mb-2">
-              <MailIcon />
-            </div>
-            <p className="font-medium">All Mailboxes</p>
           </Link>
         </div>
       </div>

@@ -33,7 +33,7 @@ export default function TenantsPage() {
   const fetchTenants = useCallback(async () => {
     try {
       setError(null);
-      const data = await listTenants(0, 100, statusFilter || undefined);
+      const data = await listTenants(0, 500, statusFilter || undefined);
       setTenants(data);
     } catch (err) {
       console.error("Failed to fetch tenants:", err);
@@ -96,7 +96,7 @@ export default function TenantsPage() {
     await fetchTenants();
   };
 
-  const totalMailboxes = tenants.reduce((sum, t) => sum + t.mailboxes_created, 0);
+  const totalMailboxes = tenants.reduce((sum, t) => sum + t.mailbox_count, 0);
   const configuredMailboxes = tenants.reduce((sum, t) => sum + t.mailboxes_configured, 0);
 
   if (loading) {
@@ -183,14 +183,22 @@ export default function TenantsPage() {
           <option value="">All Statuses</option>
           <option value="new">New</option>
           <option value="imported">Imported</option>
+          <option value="first_login_pending">First Login Pending</option>
+          <option value="first_login_complete">First Login Complete</option>
           <option value="domain_linked">Domain Linked</option>
+          <option value="domain_added">Domain Added</option>
           <option value="m365_connected">M365 Connected</option>
           <option value="domain_verified">Domain Verified</option>
           <option value="dns_configuring">DNS Configuring</option>
+          <option value="dns_configured">DNS Configured</option>
           <option value="dkim_configuring">DKIM Configuring</option>
+          <option value="pending_dkim">Pending DKIM</option>
           <option value="dkim_enabled">DKIM Enabled</option>
           <option value="mailboxes_creating">Creating Mailboxes</option>
           <option value="mailboxes_configuring">Configuring Mailboxes</option>
+          <option value="mailboxes_created">Mailboxes Created</option>
+          <option value="configuring">Configuring</option>
+          <option value="ready">Ready</option>
           <option value="active">Active</option>
           <option value="suspended">Suspended</option>
           <option value="retired">Retired</option>

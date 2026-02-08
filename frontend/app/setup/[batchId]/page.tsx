@@ -957,13 +957,6 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
   const [nsGroups, setNsGroups] = useState<NameserverGroup[]>([]);
   const [nsLoading, setNsLoading] = useState(true);
   
-  // Auto-Run state (Feature 2)
-  const [showAutoRunModal, setShowAutoRunModal] = useState(false);
-  const [autoRunPassword, setAutoRunPassword] = useState("#Sendemails1");
-  const [autoRunDisplayName, setAutoRunDisplayName] = useState("");
-  const [autoRunStarting, setAutoRunStarting] = useState(false);
-  const [autoRunStatus, setAutoRunStatus] = useState<AutoRunStatus | null>(null);
-  const [autoRunPolling, setAutoRunPolling] = useState(false);
 
   // Fetch nameserver groups on mount
   useEffect(() => {
@@ -984,95 +977,6 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
     fetchNsGroups();
   }, [batchId]);
 
-  // Poll auto-run status when running
-  useEffect(() => {
-    if (!autoRunPolling) return;
-    
-    const pollStatus = async () => {
-      try {
-        const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
-        if (res.ok) {
-          const data = await res.json();
-          setAutoRunStatus(data);
-          
-          // Stop polling if completed or failed
-          if (data.status === "completed" || data.status === "failed" || data.status === "stopped") {
-            setAutoRunPolling(false);
-            onComplete(); // Refresh main status
-          }
-        }
-      } catch (e) {
-        console.error("Failed to poll auto-run status:", e);
-      }
-    };
-    
-    pollStatus(); // Initial poll
-    const interval = setInterval(pollStatus, 3000); // Poll every 3 seconds
-    
-    return () => clearInterval(interval);
-  }, [autoRunPolling, batchId]);
-
-  // Start auto-run
-  const handleStartAutoRun = async () => {
-    if (!autoRunDisplayName.trim() || !autoRunDisplayName.includes(" ")) {
-      setError("Please enter a full name (first and last name) for mailbox display names");
-      return;
-    }
-    
-    setAutoRunStarting(true);
-    setError(null);
-    
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          new_password: autoRunPassword,
-          display_name: autoRunDisplayName.trim()
-        })
-      });
-      
-      if (!res.ok) {
-        const err = await res.json().catch(() => ({ detail: "Failed to start" }));
-        throw new Error(err.detail || err.message || "Failed to start auto-run");
-      }
-      
-      const data = await res.json();
-      if (data.success) {
-        setShowAutoRunModal(false);
-        setAutoRunPolling(true);
-        // Fetch initial status
-        const statusRes = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
-        if (statusRes.ok) {
-          setAutoRunStatus(await statusRes.json());
-        }
-      } else {
-        setError(data.message || "Failed to start auto-run");
-      }
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Failed to start auto-run");
-    } finally {
-      setAutoRunStarting(false);
-    }
-  };
-
-  // Stop auto-run
-  const handleStopAutoRun = async () => {
-    if (!confirm("Stop the auto-run process? Progress made so far will be preserved.")) return;
-    
-    try {
-      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/stop`, {
-        method: "POST"
-      });
-      
-      if (res.ok) {
-        setAutoRunPolling(false);
-        onComplete();
-      }
-    } catch (e) {
-      console.error("Failed to stop auto-run:", e);
-    }
-  };
 
   // Auto-check every 15 minutes
   useEffect(() => {
@@ -1352,191 +1256,6 @@ function Step3Propagation({ batchId, status, onComplete, onNext }: { batchId: st
         </p>
       </div>
 
-      {/* Auto-Run Progress Display */}
-      {autoRunStatus && autoRunStatus.status === "running" && (
-        <div className="bg-purple-50 border-2 border-purple-300 rounded-lg p-6 space-y-4">
-          <div className="flex justify-between items-center">
-            <h3 className="text-lg font-bold text-purple-900">🤖 Auto-Run in Progress</h3>
-            <button
-              onClick={handleStopAutoRun}
-              className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 text-sm font-medium"
-            >
-              ⏹ Stop
-            </button>
-          </div>
-          
-          <div className="text-purple-800">
-            <p className="font-medium">Currently on: Step {autoRunStatus.current_step} - {autoRunStatus.current_step_name}</p>
-            <p className="text-sm mt-1">{autoRunStatus.message}</p>
-          </div>
-
-          {/* Progress for each step */}
-          <div className="grid grid-cols-4 gap-3">
-            {[4, 5, 6, 7].map((step) => {
-              const stepKey = `step${step}` as keyof typeof autoRunStatus.progress;
-              const progress = autoRunStatus.progress[stepKey];
-              const total = progress.total || 0;
-              const done = progress.completed + progress.failed;
-              const percent = total > 0 ? Math.round((done / total) * 100) : 0;
-              const isCurrentStep = autoRunStatus.current_step === step;
-              
-              return (
-                <div 
-                  key={step}
-                  className={`p-3 rounded-lg ${
-                    isCurrentStep ? 'bg-purple-200 ring-2 ring-purple-400' : 'bg-purple-100'
-                  }`}
-                >
-                  <p className="text-xs text-purple-600 font-medium">Step {step}</p>
-                  <p className="text-lg font-bold text-purple-800">{percent}%</p>
-                  <div className="h-1.5 bg-purple-200 rounded-full mt-1 overflow-hidden">
-                    <div 
-                      className="h-full bg-purple-500 transition-all duration-500"
-                      style={{ width: `${percent}%` }}
-                    />
-                  </div>
-                  <p className="text-xs text-purple-600 mt-1">
-                    {progress.completed}✓ / {progress.failed}✗
-                  </p>
-                </div>
-              );
-            })}
-          </div>
-
-          {autoRunStatus.started_at && (
-            <p className="text-xs text-purple-600">
-              Started: {new Date(autoRunStatus.started_at).toLocaleTimeString()}
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Auto-Run Completed Message */}
-      {autoRunStatus && (autoRunStatus.status === "completed" || autoRunStatus.status === "failed" || autoRunStatus.status === "stopped") && (
-        <div className={`border rounded-lg p-4 ${
-          autoRunStatus.status === "completed" ? 'bg-green-50 border-green-200' : 
-          autoRunStatus.status === "stopped" ? 'bg-yellow-50 border-yellow-200' : 
-          'bg-red-50 border-red-200'
-        }`}>
-          <p className={`font-medium ${
-            autoRunStatus.status === "completed" ? 'text-green-800' : 
-            autoRunStatus.status === "stopped" ? 'text-yellow-800' : 
-            'text-red-800'
-          }`}>
-            {autoRunStatus.status === "completed" && '✅ Auto-run completed successfully!'}
-            {autoRunStatus.status === "stopped" && '⏹ Auto-run was stopped'}
-            {autoRunStatus.status === "failed" && `❌ Auto-run failed: ${autoRunStatus.error || 'Unknown error'}`}
-          </p>
-          <p className="text-sm text-gray-600 mt-1">{autoRunStatus.message}</p>
-          {autoRunStatus.completed_at && (
-            <p className="text-xs text-gray-500 mt-2">
-              Completed: {new Date(autoRunStatus.completed_at).toLocaleString()}
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Auto-Complete All Steps Button - Only show when not running */}
-      {!autoRunPolling && (
-        <div className="border-t pt-6 mt-6">
-          <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6">
-            <h3 className="text-lg font-bold text-purple-900 mb-2">🚀 Auto-Complete Remaining Steps</h3>
-            <p className="text-sm text-purple-700 mb-4">
-              Automatically run Steps 4 through 7 with auto-retry for failures (up to 4 retries per item).
-              This will import tenants, configure M365, create mailboxes, and prepare for sequencer.
-            </p>
-            <button
-              onClick={() => setShowAutoRunModal(true)}
-              className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white text-lg font-bold rounded-lg hover:from-purple-700 hover:to-pink-700 transition-all shadow-lg"
-            >
-              🤖 Start Auto-Complete (Steps 4→7)
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Auto-Run Configuration Modal */}
-      {showAutoRunModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg p-6 max-w-md w-full mx-4 shadow-xl">
-            <h3 className="text-xl font-bold text-gray-900 mb-4">🤖 Configure Auto-Run</h3>
-            
-            <div className="space-y-4">
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  New Password for Tenants *
-                </label>
-                <input
-                  type="text"
-                  value={autoRunPassword}
-                  onChange={(e) => setAutoRunPassword(e.target.value)}
-                  placeholder="#Sendemails1"
-                  className="w-full px-4 py-2 border rounded-lg"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Password to set for all tenant admin accounts
-                </p>
-              </div>
-              
-              <div>
-                <label className="block text-sm font-medium text-gray-700 mb-1">
-                  Display Name for Mailboxes *
-                </label>
-                <input
-                  type="text"
-                  value={autoRunDisplayName}
-                  onChange={(e) => setAutoRunDisplayName(e.target.value)}
-                  placeholder="e.g., Jack Zuvelek"
-                  className="w-full px-4 py-2 border rounded-lg"
-                />
-                <p className="text-xs text-gray-500 mt-1">
-                  Full name (first and last) used for all mailbox display names
-                </p>
-              </div>
-
-              <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-3 text-sm">
-                <p className="text-yellow-800">
-                  <strong>⚠️ Note:</strong> Make sure you've already imported tenants at Step 4 
-                  with their CSV files before starting auto-run. The auto-run will process 
-                  Steps 4→5→6→7 automatically with retry logic.
-                </p>
-              </div>
-
-              {error && (
-                <div className="bg-red-50 border border-red-200 rounded-lg p-3">
-                  <p className="text-red-800 text-sm">{error}</p>
-                </div>
-              )}
-            </div>
-
-            <div className="flex gap-3 mt-6">
-              <button
-                onClick={() => {
-                  setShowAutoRunModal(false);
-                  setError(null);
-                }}
-                className="flex-1 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleStartAutoRun}
-                disabled={autoRunStarting || !autoRunDisplayName.includes(" ")}
-                className="flex-1 px-4 py-2 bg-purple-600 text-white font-bold rounded-lg hover:bg-purple-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-              >
-                {autoRunStarting ? (
-                  <span className="flex items-center justify-center gap-2">
-                    <span className="animate-spin">⏳</span>
-                    Starting...
-                  </span>
-                ) : (
-                  "🚀 Start Auto-Run"
-                )}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -1594,6 +1313,13 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [step4Status, setStep4Status] = useState<Step4Status | null>(null);
   const [tenants, setTenants] = useState<TenantItem[]>([]);
   const [loadingTenants, setLoadingTenants] = useState(false);
+
+  // Auto-Run state (Auto-Complete Steps 4→7)
+  const [autoRunDisplayName, setAutoRunDisplayName] = useState("");
+  const [autoRunStarting, setAutoRunStarting] = useState(false);
+  const [autoRunStatus, setAutoRunStatus] = useState<AutoRunStatus | null>(null);
+  const [autoRunPolling, setAutoRunPolling] = useState(false);
+  const [autoRunError, setAutoRunError] = useState<string | null>(null);
 
   // Fetch step4 status on mount and when needed
   const fetchStep4Status = async () => {
@@ -1686,6 +1412,95 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
       setImportError(e instanceof Error ? e.message : "Preview failed");
     } finally {
       setPreviewing(false);
+    }
+  };
+
+  // Poll auto-run status when running
+  useEffect(() => {
+    if (!autoRunPolling) return;
+
+    const pollStatus = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
+        if (res.ok) {
+          const data = await res.json();
+          setAutoRunStatus(data);
+
+          // Stop polling if completed or failed
+          if (data.status === "completed" || data.status === "failed" || data.status === "stopped") {
+            setAutoRunPolling(false);
+            onComplete(); // Refresh main status
+          }
+        }
+      } catch (e) {
+        console.error("Failed to poll auto-run status:", e);
+      }
+    };
+
+    pollStatus(); // Initial poll
+    const interval = setInterval(pollStatus, 3000); // Poll every 3 seconds
+
+    return () => clearInterval(interval);
+  }, [autoRunPolling, batchId]);
+
+  // Start auto-run (Steps 4→7)
+  const handleStartAutoRun = async () => {
+    if (!autoRunDisplayName.trim() || !autoRunDisplayName.includes(" ")) {
+      setAutoRunError("Please enter a full name (first and last name) for mailbox display names");
+      return;
+    }
+
+    setAutoRunStarting(true);
+    setAutoRunError(null);
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          new_password: "#Sendemails1",
+          display_name: autoRunDisplayName.trim()
+        })
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Failed to start" }));
+        throw new Error(err.detail || err.message || "Failed to start auto-run");
+      }
+
+      const data = await res.json();
+      if (data.success) {
+        setAutoRunPolling(true);
+        // Fetch initial status
+        const statusRes = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/status`);
+        if (statusRes.ok) {
+          setAutoRunStatus(await statusRes.json());
+        }
+      } else {
+        setAutoRunError(data.message || "Failed to start auto-run");
+      }
+    } catch (e) {
+      setAutoRunError(e instanceof Error ? e.message : "Failed to start auto-run");
+    } finally {
+      setAutoRunStarting(false);
+    }
+  };
+
+  // Stop auto-run
+  const handleStopAutoRun = async () => {
+    if (!confirm("Stop the auto-run process? Progress made so far will be preserved.")) return;
+
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/auto-run/stop`, {
+        method: "POST"
+      });
+
+      if (res.ok) {
+        setAutoRunPolling(false);
+        onComplete();
+      }
+    } catch (e) {
+      console.error("Failed to stop auto-run:", e);
     }
   };
 
@@ -2051,8 +1866,11 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
           <div className="bg-green-50 border border-green-200 rounded-lg p-4">
             <p className="text-green-800 font-medium">✅ Import Successful!</p>
             <div className="mt-2 text-sm text-green-700">
-              <p>• Imported: {importResult.imported} tenants</p>
-              <p>• Skipped (duplicates): {importResult.skipped}</p>
+              <p>• Imported: {importResult.imported} tenants (of {importResult.domains_needing_tenants} needed)</p>
+              <p>• Skipped (duplicates): {importResult.skipped_duplicate}</p>
+              {importResult.skipped_not_needed > 0 && (
+                <p className="text-blue-600">• Skipped (not needed): {importResult.skipped_not_needed}</p>
+              )}
               {importResult.missing_password > 0 && (
                 <p className="text-orange-600">• Missing passwords: {importResult.missing_password}</p>
               )}
@@ -2108,6 +1926,26 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
             )}
           </button>
         )}
+
+        {/* Display Name for Mailboxes */}
+        <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6 space-y-4">
+          <h3 className="text-lg font-bold text-purple-900">Display Name for Mailboxes</h3>
+          <p className="text-sm text-purple-700">
+            Enter the display name to use for all mailboxes. This is required for auto-complete.
+          </p>
+          <div>
+            <input
+              type="text"
+              value={autoRunDisplayName}
+              onChange={(e) => setAutoRunDisplayName(e.target.value)}
+              placeholder="e.g., Ryan Chen"
+              className="w-full px-4 py-2 border rounded-lg"
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Full name (first and last) used for all mailbox display names
+            </p>
+          </div>
+        </div>
 
         {/* Info */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
@@ -2387,6 +2225,140 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
         <span>❌ Failed</span>
         <span>⏭️ Skipped</span>
       </div>
+
+      {/* Auto-Run Progress Display */}
+      {autoRunStatus && autoRunStatus.status === "running" && (
+        <div className="bg-purple-50 border-2 border-purple-300 rounded-lg p-6 space-y-4">
+          <div className="flex justify-between items-center">
+            <h3 className="text-lg font-bold text-purple-900">🤖 Auto-Run in Progress</h3>
+            <button
+              onClick={handleStopAutoRun}
+              className="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 text-sm font-medium"
+            >
+              ⏹ Stop
+            </button>
+          </div>
+
+          <div className="text-purple-800">
+            <p className="font-medium">Currently on: Step {autoRunStatus.current_step} - {autoRunStatus.current_step_name}</p>
+            <p className="text-sm mt-1">{autoRunStatus.message}</p>
+          </div>
+
+          {/* Progress for each step */}
+          <div className="grid grid-cols-4 gap-3">
+            {[4, 5, 6, 7].map((step) => {
+              const stepKey = `step${step}` as keyof typeof autoRunStatus.progress;
+              const stepProgress = autoRunStatus.progress[stepKey];
+              const total = stepProgress.total || 0;
+              const done = stepProgress.completed + stepProgress.failed;
+              const percent = total > 0 ? Math.round((done / total) * 100) : 0;
+              const isCurrentStep = autoRunStatus.current_step === step;
+
+              return (
+                <div
+                  key={step}
+                  className={`p-3 rounded-lg ${
+                    isCurrentStep ? 'bg-purple-200 ring-2 ring-purple-400' : 'bg-purple-100'
+                  }`}
+                >
+                  <p className="text-xs text-purple-600 font-medium">Step {step}</p>
+                  <p className="text-lg font-bold text-purple-800">{percent}%</p>
+                  <div className="h-1.5 bg-purple-200 rounded-full mt-1 overflow-hidden">
+                    <div
+                      className="h-full bg-purple-500 transition-all duration-500"
+                      style={{ width: `${percent}%` }}
+                    />
+                  </div>
+                  <p className="text-xs text-purple-600 mt-1">
+                    {stepProgress.completed}✓ / {stepProgress.failed}✗
+                  </p>
+                </div>
+              );
+            })}
+          </div>
+
+          {autoRunStatus.started_at && (
+            <p className="text-xs text-purple-600">
+              Started: {new Date(autoRunStatus.started_at).toLocaleTimeString()}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Auto-Run Completed Message */}
+      {autoRunStatus && (autoRunStatus.status === "completed" || autoRunStatus.status === "failed" || autoRunStatus.status === "stopped") && (
+        <div className={`border rounded-lg p-4 ${
+          autoRunStatus.status === "completed" ? 'bg-green-50 border-green-200' :
+          autoRunStatus.status === "stopped" ? 'bg-yellow-50 border-yellow-200' :
+          'bg-red-50 border-red-200'
+        }`}>
+          <p className={`font-medium ${
+            autoRunStatus.status === "completed" ? 'text-green-800' :
+            autoRunStatus.status === "stopped" ? 'text-yellow-800' :
+            'text-red-800'
+          }`}>
+            {autoRunStatus.status === "completed" && '✅ Auto-run completed successfully!'}
+            {autoRunStatus.status === "stopped" && '⏹ Auto-run was stopped'}
+            {autoRunStatus.status === "failed" && `❌ Auto-run failed: ${autoRunStatus.error || 'Unknown error'}`}
+          </p>
+          <p className="text-sm text-gray-600 mt-1">{autoRunStatus.message}</p>
+          {autoRunStatus.completed_at && (
+            <p className="text-xs text-gray-500 mt-2">
+              Completed: {new Date(autoRunStatus.completed_at).toLocaleString()}
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Auto-Complete All Steps Button - Only show when not running */}
+      {!autoRunPolling && (
+        <div className="border-t pt-6 mt-6">
+          <div className="bg-gradient-to-r from-purple-50 to-pink-50 border-2 border-purple-200 rounded-lg p-6 space-y-4">
+            <h3 className="text-lg font-bold text-purple-900 mb-2">🚀 Auto-Complete Remaining Steps</h3>
+            <p className="text-sm text-purple-700">
+              Enter the display name for mailboxes, then click auto-complete to run Steps 4 through 7
+              with auto-retry for failures (up to 4 retries per item).
+            </p>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Display Name for Mailboxes *
+              </label>
+              <input
+                type="text"
+                value={autoRunDisplayName}
+                onChange={(e) => setAutoRunDisplayName(e.target.value)}
+                placeholder="e.g., Ryan Chen"
+                className="w-full px-4 py-2 border rounded-lg"
+              />
+              <p className="text-xs text-gray-500 mt-1">
+                Full name (first and last) used for all mailbox display names
+              </p>
+            </div>
+
+            {autoRunError && (
+              <div className="bg-red-50 border border-red-200 rounded-lg p-3">
+                <p className="text-red-800 text-sm">{autoRunError}</p>
+              </div>
+            )}
+
+            <button
+              onClick={handleStartAutoRun}
+              disabled={autoRunStarting || !autoRunDisplayName.includes(" ")}
+              className="w-full py-4 bg-gradient-to-r from-purple-600 to-pink-600 text-white text-lg font-bold rounded-lg hover:from-purple-700 hover:to-pink-700 transition-all shadow-lg disabled:from-gray-400 disabled:to-gray-400 disabled:cursor-not-allowed"
+            >
+              {autoRunStarting ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="animate-spin">⏳</span>
+                  Starting...
+                </span>
+              ) : (
+                "🤖 Start Auto-Complete (Steps 4→7)"
+              )}
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Continue Button */}
       <div className="border-t pt-6">
