@@ -1435,6 +1435,82 @@ async def export_credentials(batch_id: UUID, db: AsyncSession = Depends(get_db))
 
 # ============== BATCH-SCOPED STEP ENDPOINTS ==============
 
+@router.post("/batches/{batch_id}/step1/preview-domains")
+async def preview_domains_import(
+    batch_id: UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Preview domains from master list - shows what's new vs. already in system.
+    
+    This filters out domains that already exist in ANY batch at ANY status.
+    Returns a breakdown of new vs. existing domains for user review before import.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    try:
+        content = await file.read()
+        decoded = content.decode('utf-8')
+        
+        # Parse all domains from CSV
+        parsed_domains = parse_domains_csv(decoded)
+        
+        new_domains = []
+        existing_domains = []
+        
+        for domain_data in parsed_domains:
+            # Check if domain exists anywhere in the system
+            existing = await db.execute(
+                select(Domain).where(Domain.name == domain_data.name)
+            )
+            existing_domain = existing.scalar_one_or_none()
+            
+            if existing_domain:
+                # Get batch info for existing domain
+                batch_info = None
+                if existing_domain.batch_id:
+                    batch_result = await db.execute(
+                        select(SetupBatch).where(SetupBatch.id == existing_domain.batch_id)
+                    )
+                    existing_batch = batch_result.scalar_one_or_none()
+                    if existing_batch:
+                        batch_info = {
+                            "batch_id": str(existing_batch.id),
+                            "batch_name": existing_batch.name,
+                            "current_step": existing_batch.current_step
+                        }
+                
+                existing_domains.append({
+                    "name": domain_data.name,
+                    "status": existing_domain.status.value,
+                    "batch": batch_info,
+                    "redirect_url": existing_domain.redirect_url
+                })
+            else:
+                new_domains.append({
+                    "name": domain_data.name,
+                    "redirect_url": domain_data.redirect_url,
+                    "registrar": domain_data.registrar
+                })
+        
+        return {
+            "success": True,
+            "total_in_file": len(parsed_domains),
+            "new_count": len(new_domains),
+            "existing_count": len(existing_domains),
+            "new_domains": new_domains,
+            "existing_domains": existing_domains,
+            "batch_id": str(batch_id),
+            "batch_name": batch.name
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse domains: {str(e)}")
+
+
 @router.post("/batches/{batch_id}/step1/import-domains", response_model=StepResult)
 async def batch_import_domains(
     batch_id: UUID,
@@ -1902,6 +1978,111 @@ async def batch_setup_redirects(batch_id: UUID, db: AsyncSession = Depends(get_d
 
 
 # ============== STEP 4 ENDPOINTS ==============
+
+@router.post("/batches/{batch_id}/step4/preview-tenants")
+async def preview_tenants_import(
+    batch_id: UUID,
+    tenant_csv: UploadFile = File(...),
+    credentials_txt: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Preview tenants from master list - shows what's new vs. already in system.
+    
+    This filters out tenants that already exist in ANY batch at ANY status
+    (checked by microsoft_tenant_id and onmicrosoft_domain).
+    Returns a breakdown for user review before import.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    
+    try:
+        csv_content = (await tenant_csv.read()).decode('utf-8-sig')
+        txt_content = (await credentials_txt.read()).decode('utf-8-sig')
+        
+        # Parse tenant data
+        tenant_list = tenant_import_service.parse_tenant_csv(csv_content)
+        credentials = tenant_import_service.parse_credentials_txt(txt_content)
+        merged, unmatched_tenants, unmatched_creds = tenant_import_service.merge_data(
+            tenant_list, credentials
+        )
+        
+        new_tenants = []
+        existing_tenants = []
+        
+        for tenant_data in merged:
+            # Check if tenant exists anywhere in the system
+            # Check by microsoft_tenant_id first
+            existing = None
+            if tenant_data.get("microsoft_tenant_id"):
+                result = await db.execute(
+                    select(Tenant).where(
+                        Tenant.microsoft_tenant_id == tenant_data["microsoft_tenant_id"]
+                    )
+                )
+                existing = result.scalar_one_or_none()
+            
+            # Also check by onmicrosoft_domain if not found
+            if not existing and tenant_data.get("onmicrosoft_domain"):
+                result = await db.execute(
+                    select(Tenant).where(
+                        Tenant.onmicrosoft_domain == tenant_data["onmicrosoft_domain"]
+                    )
+                )
+                existing = result.scalar_one_or_none()
+            
+            if existing:
+                # Get batch info for existing tenant
+                batch_info = None
+                if existing.batch_id:
+                    batch_result = await db.execute(
+                        select(SetupBatch).where(SetupBatch.id == existing.batch_id)
+                    )
+                    existing_batch = batch_result.scalar_one_or_none()
+                    if existing_batch:
+                        batch_info = {
+                            "batch_id": str(existing_batch.id),
+                            "batch_name": existing_batch.name,
+                            "current_step": existing_batch.current_step
+                        }
+                
+                existing_tenants.append({
+                    "name": tenant_data["name"],
+                    "onmicrosoft_domain": tenant_data["onmicrosoft_domain"],
+                    "microsoft_tenant_id": tenant_data["microsoft_tenant_id"],
+                    "status": existing.status.value,
+                    "batch": batch_info,
+                    "has_password": bool(tenant_data.get("admin_password"))
+                })
+            else:
+                new_tenants.append({
+                    "name": tenant_data["name"],
+                    "onmicrosoft_domain": tenant_data["onmicrosoft_domain"],
+                    "microsoft_tenant_id": tenant_data["microsoft_tenant_id"],
+                    "admin_email": tenant_data["admin_email"],
+                    "has_password": bool(tenant_data.get("admin_password")),
+                    "provider": tenant_data.get("provider", "Unknown")
+                })
+        
+        return {
+            "success": True,
+            "total_in_file": len(merged),
+            "new_count": len(new_tenants),
+            "existing_count": len(existing_tenants),
+            "new_tenants": new_tenants,
+            "existing_tenants": existing_tenants,
+            "unmatched_info": {
+                "tenants_without_credentials": len(unmatched_tenants),
+                "credentials_without_tenant": len(unmatched_creds)
+            },
+            "batch_id": str(batch_id),
+            "batch_name": batch.name
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse tenants: {str(e)}")
+
 
 @router.post("/batches/{batch_id}/step4/import-tenants")
 async def import_tenants(

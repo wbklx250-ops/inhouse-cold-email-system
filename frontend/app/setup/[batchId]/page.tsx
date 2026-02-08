@@ -408,9 +408,36 @@ function StepNavigation({ batchId, currentStep, onNavigate, onRerun }: StepNavig
 function Step1Domains({ batchId, status, onComplete }: { batchId: string; status: WizardStatus | null; onComplete: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [result, setResult] = useState<StepResult | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [previewResult, setPreviewResult] = useState<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handlePreview = async () => {
+    if (!file) return;
+    setPreviewing(true);
+    setError(null);
+    setPreviewResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step1/preview-domains`, {
+        method: "POST",
+        body: formData,
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Preview failed" }));
+        throw new Error(err.detail || "Preview failed");
+      }
+      const data = await res.json();
+      setPreviewResult(data);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Preview failed");
+    } finally {
+      setPreviewing(false);
+    }
+  };
 
   const handleImport = async () => {
     if (!file) return;
@@ -421,6 +448,7 @@ function Step1Domains({ batchId, status, onComplete }: { batchId: string; status
       formData.append("file", file);
       const res = await postStep(batchId, "/step1/import-domains", formData);
       setResult(res);
+      setPreviewResult(null);
       onComplete();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Import failed");
@@ -487,6 +515,60 @@ outbound-mail.co,https://example.com,porkbun`}</pre>
       </div>
 
       {error && <div className="bg-red-50 border border-red-200 rounded-lg p-4"><p className="text-red-800">{error}</p></div>}
+      
+      {/* Preview Results */}
+      {previewResult && (
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-3">
+          <div className="flex justify-between items-center">
+            <h3 className="font-bold text-blue-900">Preview Results</h3>
+            <button onClick={() => setPreviewResult(null)} className="text-blue-600 hover:text-blue-800 text-sm">✕ Close</button>
+          </div>
+          
+          <div className="grid grid-cols-2 gap-4">
+            <div className="bg-green-100 rounded-lg p-3 text-center">
+              <p className="text-2xl font-bold text-green-700">{previewResult.new_count}</p>
+              <p className="text-xs text-green-600">New Domains</p>
+            </div>
+            <div className="bg-gray-100 rounded-lg p-3 text-center">
+              <p className="text-2xl font-bold text-gray-700">{previewResult.existing_count}</p>
+              <p className="text-xs text-gray-600">Already Exist</p>
+            </div>
+          </div>
+
+          {previewResult.new_domains && previewResult.new_domains.length > 0 && (
+            <details className="text-sm">
+              <summary className="cursor-pointer text-green-700 font-medium">
+                Show {previewResult.new_count} new domain(s)
+              </summary>
+              <ul className="mt-2 ml-4 space-y-1 text-green-600">
+                {previewResult.new_domains.map((domain: string, i: number) => (
+                  <li key={i}>• {domain}</li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {previewResult.existing_domains && previewResult.existing_domains.length > 0 && (
+            <details className="text-sm">
+              <summary className="cursor-pointer text-gray-700 font-medium">
+                Show {previewResult.existing_count} existing domain(s)
+              </summary>
+              <ul className="mt-2 ml-4 space-y-1 text-gray-500 max-h-32 overflow-y-auto">
+                {previewResult.existing_domains.map((item: any, i: number) => (
+                  <li key={i} className="text-xs">
+                    • {item.domain} <span className="text-gray-400">(Batch: {item.batch_name}, Status: {item.status})</span>
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+
+          {previewResult.new_count === 0 && (
+            <p className="text-yellow-700 text-sm">⚠️ All domains already exist in the system. Nothing new to import.</p>
+          )}
+        </div>
+      )}
+
       {result && (
         <div className="bg-green-50 border border-green-200 rounded-lg p-4">
           <p className="text-green-800">✅ {result.message}</p>
@@ -498,10 +580,26 @@ outbound-mail.co,https://example.com,porkbun`}</pre>
         </div>
       )}
 
-      <button onClick={handleImport} disabled={!file || loading}
-        className="w-full py-4 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300">
-        {loading ? "Importing..." : "Import Domains →"}
-      </button>
+      {/* Action Buttons */}
+      {!previewResult ? (
+        <div className="grid grid-cols-2 gap-4">
+          <button onClick={handlePreview} disabled={!file || previewing}
+            className="py-4 bg-gray-600 text-white font-bold rounded-lg hover:bg-gray-700 disabled:bg-gray-300">
+            {previewing ? "Previewing..." : "Preview Domains"}
+          </button>
+          <button onClick={handleImport} disabled={!file || loading}
+            className="py-4 bg-blue-600 text-white font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300">
+            {loading ? "Importing..." : "Import Domains →"}
+          </button>
+        </div>
+      ) : (
+        <button 
+          onClick={handleImport} 
+          disabled={!file || loading || previewResult.new_count === 0}
+          className="w-full py-4 bg-green-600 text-white font-bold rounded-lg hover:bg-green-700 disabled:bg-gray-300">
+          {loading ? "Importing..." : `Import ${previewResult.new_count} New Domain(s) →`}
+        </button>
+      )}
     </div>
   );
 }
@@ -1473,8 +1571,10 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [tenantCsv, setTenantCsv] = useState<File | null>(null);
   const [credentialsTxt, setCredentialsTxt] = useState<File | null>(null);
   const [importing, setImporting] = useState(false);
+  const [previewing, setPreviewing] = useState(false);
   const [importResult, setImportResult] = useState<any>(null);
   const [importError, setImportError] = useState<string | null>(null);
+  const [previewResult, setPreviewResult] = useState<any>(null);
   const csvInputRef = useRef<HTMLInputElement>(null);
   const txtInputRef = useRef<HTMLInputElement>(null);
 
@@ -1559,6 +1659,36 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
     return () => clearInterval(interval);
   }, [automationStarted, batchId]);
 
+  // Preview tenants
+  const handlePreview = async () => {
+    if (!tenantCsv || !credentialsTxt) return;
+    setPreviewing(true);
+    setImportError(null);
+    setPreviewResult(null);
+    try {
+      const formData = new FormData();
+      formData.append("tenant_csv", tenantCsv);
+      formData.append("credentials_txt", credentialsTxt);
+      
+      const res = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step4/preview-tenants`, {
+        method: "POST",
+        body: formData,
+      });
+      
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: "Preview failed" }));
+        throw new Error(err.detail || "Preview failed");
+      }
+      
+      const data = await res.json();
+      setPreviewResult(data);
+    } catch (e) {
+      setImportError(e instanceof Error ? e.message : "Preview failed");
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
   // Import tenants
   const handleImport = async () => {
     if (!tenantCsv || !credentialsTxt) return;
@@ -1581,6 +1711,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
       
       const data = await res.json();
       setImportResult(data.details);
+      setPreviewResult(null);
       onComplete();
       fetchStep4Status();
       fetchTenants();
@@ -1862,6 +1993,59 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
           </div>
         )}
 
+        {/* Preview Results */}
+        {previewResult && (
+          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 space-y-3">
+            <div className="flex justify-between items-center">
+              <h3 className="font-bold text-blue-900">Preview Results</h3>
+              <button onClick={() => setPreviewResult(null)} className="text-blue-600 hover:text-blue-800 text-sm">✕ Close</button>
+            </div>
+            
+            <div className="grid grid-cols-2 gap-4">
+              <div className="bg-green-100 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-green-700">{previewResult.new_count}</p>
+                <p className="text-xs text-green-600">New Tenants</p>
+              </div>
+              <div className="bg-gray-100 rounded-lg p-3 text-center">
+                <p className="text-2xl font-bold text-gray-700">{previewResult.existing_count}</p>
+                <p className="text-xs text-gray-600">Already Exist</p>
+              </div>
+            </div>
+
+            {previewResult.new_tenants && previewResult.new_tenants.length > 0 && (
+              <details className="text-sm">
+                <summary className="cursor-pointer text-green-700 font-medium">
+                  Show {previewResult.new_count} new tenant(s)
+                </summary>
+                <ul className="mt-2 ml-4 space-y-1 text-green-600 max-h-32 overflow-y-auto">
+                  {previewResult.new_tenants.map((tenant: any, i: number) => (
+                    <li key={i} className="text-xs">• {tenant.name} ({tenant.onmicrosoft_domain})</li>
+                  ))}
+                </ul>
+              </details>
+            )}
+
+            {previewResult.existing_tenants && previewResult.existing_tenants.length > 0 && (
+              <details className="text-sm">
+                <summary className="cursor-pointer text-gray-700 font-medium">
+                  Show {previewResult.existing_count} existing tenant(s)
+                </summary>
+                <ul className="mt-2 ml-4 space-y-1 text-gray-500 max-h-32 overflow-y-auto">
+                  {previewResult.existing_tenants.map((item: any, i: number) => (
+                    <li key={i} className="text-xs">
+                      • {item.name} ({item.onmicrosoft_domain}) <span className="text-gray-400">(Batch: {item.batch_name}, Status: {item.status})</span>
+                    </li>
+                  ))}
+                </ul>
+              </details>
+            )}
+
+            {previewResult.new_count === 0 && (
+              <p className="text-yellow-700 text-sm">⚠️ All tenants already exist in the system. Nothing new to import.</p>
+            )}
+          </div>
+        )}
+
         {/* Import Results */}
         {importResult && (
           <div className="bg-green-50 border border-green-200 rounded-lg p-4">
@@ -1876,21 +2060,54 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
           </div>
         )}
 
-        {/* Import Button */}
-        <button 
-          onClick={handleImport} 
-          disabled={!tenantCsv || !credentialsTxt || importing}
-          className="w-full py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
-        >
-          {importing ? (
-            <span className="flex items-center justify-center gap-2">
-              <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
-              Importing...
-            </span>
-          ) : (
-            "Import Tenants →"
-          )}
-        </button>
+        {/* Action Buttons */}
+        {!previewResult ? (
+          <div className="grid grid-cols-2 gap-4">
+            <button 
+              onClick={handlePreview}
+              disabled={!tenantCsv || !credentialsTxt || previewing}
+              className="py-4 bg-gray-600 text-white text-lg font-bold rounded-lg hover:bg-gray-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+            >
+              {previewing ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                  Previewing...
+                </span>
+              ) : (
+                "Preview Tenants"
+              )}
+            </button>
+            <button 
+              onClick={handleImport} 
+              disabled={!tenantCsv || !credentialsTxt || importing}
+              className="py-4 bg-blue-600 text-white text-lg font-bold rounded-lg hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+            >
+              {importing ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                  Importing...
+                </span>
+              ) : (
+                "Import Tenants →"
+              )}
+            </button>
+          </div>
+        ) : (
+          <button 
+            onClick={handleImport}
+            disabled={!tenantCsv || !credentialsTxt || importing || previewResult.new_count === 0}
+            className="w-full py-4 bg-green-600 text-white text-lg font-bold rounded-lg hover:bg-green-700 disabled:bg-gray-300 disabled:cursor-not-allowed"
+          >
+            {importing ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin rounded-full h-5 w-5 border-b-2 border-white"></span>
+                Importing...
+              </span>
+            ) : (
+              `Import ${previewResult.new_count} New Tenant(s) →`
+            )}
+          </button>
+        )}
 
         {/* Info */}
         <div className="bg-blue-50 border border-blue-200 rounded-lg p-4 text-sm">
