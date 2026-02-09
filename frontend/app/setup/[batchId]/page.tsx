@@ -413,6 +413,13 @@ function Step1Domains({ batchId, status, onComplete }: { batchId: string; status
   const [error, setError] = useState<string | null>(null);
   const [previewResult, setPreviewResult] = useState<any>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const newDomains = Array.isArray(previewResult?.new_domains) ? previewResult.new_domains : [];
+  const existingDomains = Array.isArray(previewResult?.existing_domains) ? previewResult.existing_domains : [];
+
+  const getDomainName = (entry: any) => {
+    if (typeof entry === "string") return entry;
+    return entry?.name || entry?.domain || "Unknown domain";
+  };
 
   const handlePreview = async () => {
     if (!file) return;
@@ -535,28 +542,31 @@ outbound-mail.co,https://example.com,porkbun`}</pre>
             </div>
           </div>
 
-          {previewResult.new_domains && previewResult.new_domains.length > 0 && (
+          {newDomains.length > 0 && (
             <details className="text-sm">
               <summary className="cursor-pointer text-green-700 font-medium">
                 Show {previewResult.new_count} new domain(s)
               </summary>
               <ul className="mt-2 ml-4 space-y-1 text-green-600">
-                {previewResult.new_domains.map((domain: string, i: number) => (
-                  <li key={i}>• {domain}</li>
+                {newDomains.map((domain: any, i: number) => (
+                  <li key={i}>• {getDomainName(domain)}</li>
                 ))}
               </ul>
             </details>
           )}
 
-          {previewResult.existing_domains && previewResult.existing_domains.length > 0 && (
+          {existingDomains.length > 0 && (
             <details className="text-sm">
               <summary className="cursor-pointer text-gray-700 font-medium">
                 Show {previewResult.existing_count} existing domain(s)
               </summary>
               <ul className="mt-2 ml-4 space-y-1 text-gray-500 max-h-32 overflow-y-auto">
-                {previewResult.existing_domains.map((item: any, i: number) => (
+                {existingDomains.map((item: any, i: number) => (
                   <li key={i} className="text-xs">
-                    • {item.domain} <span className="text-gray-400">(Batch: {item.batch_name}, Status: {item.status})</span>
+                    • {getDomainName(item)}{" "}
+                    <span className="text-gray-400">
+                      (Batch: {item.batch_name || item.batch?.batch_name || "Unknown"}, Status: {item.status || "unknown"})
+                    </span>
                   </li>
                 ))}
               </ul>
@@ -1338,7 +1348,7 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const fetchTenants = async () => {
     try {
       setLoadingTenants(true);
-      const res = await fetch(`${API_BASE}/api/v1/tenants?batch_id=${batchId}`);
+      const res = await fetch(`${API_BASE}/api/v1/tenants/?batch_id=${batchId}`);
       if (res.ok) {
         const data = await res.json();
         setTenants(data);
