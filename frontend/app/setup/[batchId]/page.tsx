@@ -3033,7 +3033,7 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
 
   // Mark batch as complete manually and advance to Step 7
   const handleMarkBatchComplete = async () => {
-    if (!confirm("Continue to Sequencer Setup (Step 7)? This will enable SMTP Auth for all tenants.")) return;
+    if (!confirm("Continue to Sequencer Setup (Step 7)? This will disable Security Defaults and enable SMTP Auth for all tenants.")) return;
     
     setIsMarkingComplete(true);
     setError(null);

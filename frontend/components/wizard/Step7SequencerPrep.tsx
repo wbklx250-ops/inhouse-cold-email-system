@@ -7,6 +7,9 @@ interface TenantStep7Status {
   domain: string;
   step7_complete: boolean;
   smtp_auth_enabled: boolean;
+  security_defaults_disabled: boolean;
+  security_defaults_error: string | null;
+  security_defaults_disabled_at: string | null;
   error: string | null;
   completed_at: string | null;
 }
@@ -132,7 +135,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
 
   // Force complete a single tenant
   const forceCompleteTenant = async (tenantId: string) => {
-    if (!confirm("Force-complete Step 7 for this tenant? This marks SMTP Auth as enabled.")) return;
+    if (!confirm("Force-complete Step 7 for this tenant? Use only if Security Defaults are already disabled and SMTP Auth is enabled. This updates the database and skips automation.")) return;
     
     setForceCompletingTenant(tenantId);
     setError(null);
@@ -156,7 +159,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
 
   // Force complete ALL pending tenants
   const forceCompleteAll = async () => {
-    if (!confirm("Force-complete Step 7 for ALL pending tenants? This marks all tenants as having SMTP Auth enabled and completes the batch.")) return;
+    if (!confirm("Force-complete Step 7 for ALL pending tenants? Use only if Security Defaults are already disabled and SMTP Auth is enabled for each tenant. This updates the database and completes the batch.")) return;
     
     setForceCompletingAll(true);
     setError(null);
@@ -186,18 +189,56 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
   const allComplete =
     status && status.eligible > 0 && status.complete === status.eligible;
 
+  const getStatusBadge = (t: TenantStep7Status) => {
+    if (t.step7_complete) {
+      return {
+        label: "Done",
+        className:
+          "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800",
+      };
+    }
+
+    const errorText = t.error || t.security_defaults_error;
+    if (errorText) {
+      const lower = errorText.toLowerCase();
+      let stage = "";
+      if (lower.includes("security defaults")) stage = "Security Defaults";
+      if (lower.includes("smtp auth")) stage = "SMTP Auth";
+      const label = stage ? `Failed (${stage})` : "Failed";
+      return {
+        label,
+        className:
+          "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800",
+      };
+    }
+
+    if (t.security_defaults_disabled && !t.smtp_auth_enabled) {
+      return {
+        label: "Partial",
+        className:
+          "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800",
+      };
+    }
+
+    return {
+      label: "Pending",
+      className:
+        "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600",
+    };
+  };
+
   return (
     <div className="space-y-6">
       {/* Header */}
       <div>
         <h2 className="text-xl font-semibold text-gray-900">
-          Step 7: Enable SMTP Auth for Sequencer Upload
+          Step 7: Disable Security Defaults + Enable SMTP Auth
         </h2>
         <p className="mt-1 text-sm text-gray-500">
-          Enables SMTP Authentication at the organization level in each tenant
-          so mailboxes can be connected to{" "}
-          <strong>PlusVibe</strong>, <strong>Instantly</strong>, or other
-          email sequencers.
+          Disables Security Defaults in Entra ID, then enables SMTP
+          Authentication at the organization level so mailboxes can be
+          connected to <strong>PlusVibe</strong>, <strong>Instantly</strong>,
+          or other email sequencers.
         </p>
       </div>
 
@@ -205,9 +246,16 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          Logs into each tenant's Exchange Admin Center and unchecks
-          "Turn off SMTP AUTH protocol" under Settings &rarr; Mail flow. This
-          is one toggle per tenant and takes about 30 seconds each.
+          1) Disables Security Defaults in Entra ID (required for SMTP Auth to
+          stay enabled).
+        </p>
+        <p className="mt-1">
+          2) Logs into each tenant's Exchange Admin Center and unchecks
+          "Turn off SMTP AUTH protocol" under Settings &rarr; Mail flow.
+        </p>
+        <p className="mt-2 text-blue-600">
+          This can take a few minutes per tenant on Railway or low-resource
+          hosts.
         </p>
         <p className="mt-2 text-blue-600">
           <strong>Note:</strong> Microsoft may take up to 1 hour to fully sync
@@ -291,12 +339,12 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                Enabling SMTP Auth...
+                Running Step 7...
               </span>
             ) : status?.complete && status.complete > 0 ? (
               "Continue Processing"
             ) : (
-              "Enable SMTP Auth"
+              "Run Step 7"
             )}
           </button>
         )}
@@ -358,7 +406,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       {/* Force Complete Info */}
       {status && status.pending + status.failed > 0 && !isRunning && (
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800">
-          <p><strong>💡 Manual Override:</strong> If you've already enabled SMTP Auth manually in the Exchange Admin Center, use "Force Complete" to update the database without re-running automation.</p>
+          <p><strong>💡 Manual Override:</strong> If you've already disabled Security Defaults and enabled SMTP Auth manually, use "Force Complete" to update the database without re-running automation.</p>
         </div>
       )}
 
@@ -376,8 +424,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
             Setup Complete!
           </p>
           <p className="mt-1 text-sm text-green-600">
-            All tenants have SMTP Auth enabled. Your mailboxes are ready
-            to upload to PlusVibe, Instantly, or any other sequencer.
+            All tenants have Security Defaults disabled and SMTP Auth enabled.
+            Your mailboxes are ready to upload to PlusVibe, Instantly, or any
+            other sequencer.
           </p>
           <div className="mt-3 rounded border border-green-300 bg-white p-3 text-xs font-mono text-gray-700 space-y-1">
             <p><strong>SMTP Host:</strong> smtp.office365.com &nbsp;|&nbsp; <strong>Port:</strong> 587</p>
@@ -406,6 +455,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                   SMTP Auth
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                  Security Defaults
+                </th>
+                <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                   Status
                 </th>
                 <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase">
@@ -430,22 +482,24 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                     )}
                   </td>
                   <td className="px-4 py-3 text-center">
-                    {t.step7_complete ? (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-800">
-                        Done
-                      </span>
-                    ) : t.error ? (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
-                        Failed
-                      </span>
+                    {t.security_defaults_disabled ? (
+                      <span className="text-green-500 text-lg">&#10003;</span>
                     ) : (
-                      <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-600">
-                        Pending
-                      </span>
+                      <span className="text-gray-300">&mdash;</span>
                     )}
                   </td>
+                  <td className="px-4 py-3 text-center">
+                    {(() => {
+                      const badge = getStatusBadge(t);
+                      return (
+                        <span className={badge.className}>
+                          {badge.label}
+                        </span>
+                      );
+                    })()}
+                  </td>
                   <td className="px-4 py-3 text-sm text-red-500 max-w-xs truncate">
-                    {t.error || "\u2014"}
+                    {t.error || t.security_defaults_error || "\u2014"}
                   </td>
                   <td className="px-4 py-3 text-right">
                     {!t.step7_complete && (

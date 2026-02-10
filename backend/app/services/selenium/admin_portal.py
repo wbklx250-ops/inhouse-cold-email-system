@@ -1336,7 +1336,7 @@ async def enable_org_smtp_auth(
         worker = BrowserWorker(worker_id=f"step7-{uuid.uuid4()}", headless=True)
         driver = worker._create_driver()
         driver.implicitly_wait(10)
-        driver.set_page_load_timeout(60)
+        driver.set_page_load_timeout(120)
 
         # === LOGIN TO M365 (reuse existing login flow) ===
         logger.info(f"[{domain}] Step 7: Logging into M365 Admin Portal...")
@@ -1357,7 +1357,7 @@ async def enable_org_smtp_auth(
         # This shows a list with: List view preference, Mail flow, Hybrid setup
         logger.info(f"[{domain}] Step 7: Opening Exchange Admin Center Settings...")
         driver.get("https://admin.cloud.microsoft.com/exchange#/settings")
-        wait_for_page_load(driver, timeout=30)
+        wait_for_page_load(driver, timeout=60)
         time.sleep(8)  # Extra time for Settings page to fully load
         _save_screenshot(driver, domain, "step7_settings_page")
         

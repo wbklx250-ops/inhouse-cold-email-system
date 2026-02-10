@@ -17,6 +17,7 @@ from uuid import UUID
 import csv
 import io
 import logging
+import os
 
 from app.db.session import get_db_session as get_db, async_engine, get_db_session_with_retry, RetryableSession, SessionLocal, async_session_factory
 from app.services.tenant_import import tenant_import_service
@@ -354,6 +355,13 @@ auto_run_jobs = {}
 # Maximum retries per tenant per step
 MAX_AUTO_RETRIES = 4
 
+# Step 7 tuning (Railway-friendly defaults)
+STEP7_MAX_PARALLEL = int(os.getenv("STEP7_MAX_PARALLEL", "1"))
+STEP7_MAX_ATTEMPTS = int(os.getenv("STEP7_MAX_ATTEMPTS", "6"))
+STEP7_RETRY_BASE_DELAY_SECONDS = int(os.getenv("STEP7_RETRY_BASE_DELAY_SECONDS", "30"))
+STEP7_RETRY_MAX_DELAY_SECONDS = int(os.getenv("STEP7_RETRY_MAX_DELAY_SECONDS", "300"))
+STEP7_RETRY_BACKOFF_MULTIPLIER = float(os.getenv("STEP7_RETRY_BACKOFF_MULTIPLIER", "2.0"))
+
 
 class AutoRunRequest(BaseModel):
     """Schema for auto-run request."""
@@ -458,7 +466,7 @@ async def start_auto_run(
         "message": f"Auto-run started for batch '{batch.name}'",
         "job_id": job_id,
         "tenant_count": tenant_count,
-        "steps_to_run": ["Step 4: First Login", "Step 5: Email Setup", "Step 6: Mailboxes", "Step 7: SMTP Auth"],
+        "steps_to_run": ["Step 4: First Login", "Step 5: Email Setup", "Step 6: Mailboxes", "Step 7: Security Defaults + SMTP Auth"],
         "note": "Use GET /batches/{batch_id}/auto-run/status to track progress"
     }
 
@@ -788,7 +796,12 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
             tenant_ids = [t.id for t in tenants]
         
         # Run step 7
-        await _run_step7_batch(batch_id, tenant_ids)
+        await _run_step7_batch(
+            batch_id,
+            tenant_ids,
+            max_attempts=1,
+            increment_retry_count=False,
+        )
         
         # Wait for completion
         await asyncio.sleep(len(tenant_ids) * 30 + 60)  # ~30s per tenant + buffer
@@ -1142,7 +1155,7 @@ async def rerun_step(
             result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for mailbox creation. Use 'Start Mailbox Creation' button."
     
     elif step_number == 7:
-        # Step 7: SMTP Auth - reset tenants
+        # Step 7: Security Defaults + SMTP Auth - reset tenants
         if force:
             # FORCE: Reset ALL tenants with step6 complete (even those with step7 complete)
             all_tenants = await db.execute(
@@ -4211,7 +4224,7 @@ async def batch_create_mailboxes(batch_id: UUID, db: AsyncSession = Depends(get_
 
 
 # =============================================================================
-# STEP 7: SEQUENCER PREPARATION (ORG-LEVEL SMTP AUTH)
+# STEP 7: SEQUENCER PREPARATION (SECURITY DEFAULTS + SMTP AUTH)
 # =============================================================================
 
 
@@ -4221,10 +4234,9 @@ async def start_step7(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Start Step 7: Enable org-level SMTP Auth via Exchange Admin Center Selenium.
+    Start Step 7: Disable Security Defaults (Entra) then enable org-level SMTP Auth.
 
     Prerequisites: Step 6 must be complete for the tenant.
-    One toggle per tenant  fast.
     """
     batch_result = await db.execute(
         select(SetupBatch).where(SetupBatch.id == batch_id)
@@ -4252,7 +4264,7 @@ async def start_step7(
     if not to_process:
         return {
             "success": True,
-            "message": "All tenants already have SMTP Auth enabled.",
+            "message": "All tenants already have Security Defaults disabled and SMTP Auth enabled.",
             "total": len(eligible),
             "already_complete": len(eligible),
         }
@@ -4269,51 +4281,144 @@ async def start_step7(
     }
 
 
-async def _run_step7_batch(batch_id: UUID, tenant_ids: list):
+async def _run_step7_batch(
+    batch_id: UUID,
+    tenant_ids: list,
+    max_attempts: int = STEP7_MAX_ATTEMPTS,
+    increment_retry_count: bool = True,
+):
     """
-    Background task: Enable SMTP Auth for each tenant.
+    Background task: Disable Security Defaults, then enable SMTP Auth for each tenant.
 
-    Uses 2 parallel browsers max (same as Step 5).
-    Each tenant is just one toggle  very fast (~30s each).
+    Uses limited parallelism (configurable via STEP7_MAX_PARALLEL).
+    Designed for Railway/low-resource environments with generous retries.
 
     IMPORTANT: This task marks the BATCH as complete when all tenants finish.
     """
     import asyncio
     from app.db.session import async_session_factory
+    from app.services.step8_security_defaults import SecurityDefaultsDisabler, TenantCredentials
 
-    MAX_PARALLEL = 2
+    def _compute_retry_delay(attempt: int) -> int:
+        delay = int(STEP7_RETRY_BASE_DELAY_SECONDS * (STEP7_RETRY_BACKOFF_MULTIPLIER ** (attempt - 1)))
+        return min(delay, STEP7_RETRY_MAX_DELAY_SECONDS)
+
+    MAX_PARALLEL = max(1, STEP7_MAX_PARALLEL)
 
     async def process_tenant(tenant_id: UUID):
-        """Process one tenant  login to EAC, toggle SMTP AUTH, done."""
-        async with async_session_factory() as db:
-            result = await db.execute(select(Tenant).where(Tenant.id == tenant_id))
-            tenant = result.scalar_one_or_none()
-            if not tenant:
+        """Process one tenant - disable Security Defaults, then enable SMTP AUTH."""
+        for attempt in range(1, max_attempts + 1):
+            # ===== Fetch tenant snapshot + increment retry count =====
+            async with async_session_factory() as db:
+                tenant = await db.get(Tenant, tenant_id)
+                if not tenant:
+                    return
+
+                domain = tenant.custom_domain or tenant.name
+                admin_email = tenant.admin_email
+                admin_password = tenant.admin_password
+                totp_secret = tenant.totp_secret
+                security_defaults_disabled = tenant.security_defaults_disabled
+
+                if increment_retry_count:
+                    tenant.step7_retry_count += 1
+                tenant.step7_error = None
+                await db.commit()
+
+                if not admin_email or not admin_password or not totp_secret:
+                    tenant.step7_complete = False
+                    tenant.step7_smtp_auth_enabled = False
+                    tenant.step7_error = (
+                        "Missing admin credentials or TOTP secret "
+                        "(admin_email/admin_password/totp_secret)"
+                    )
+                    await db.commit()
+                    logger.warning(f"[{domain}] Step 7 failed: missing credentials/TOTP")
+                    return
+
+            failed_stage = None
+            try:
+                # ===== Step 7a: Disable Security Defaults (if needed) =====
+                if not security_defaults_disabled:
+                    logger.info(f"[{domain}] Step 7: Disabling Security Defaults (attempt {attempt}/{max_attempts})")
+                    worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
+                    disabler = SecurityDefaultsDisabler(headless=True, worker_id=worker_id)
+                    creds = TenantCredentials(
+                        tenant_id=str(tenant_id),
+                        domain=domain,
+                        admin_email=admin_email,
+                        admin_password=admin_password,
+                        totp_secret=totp_secret,
+                    )
+                    sd_result = disabler.disable_for_tenant(creds)
+                    if not sd_result.get("success"):
+                        failed_stage = "security_defaults"
+                        raise RuntimeError(sd_result.get("error") or "Security Defaults disable failed")
+
+                    async with async_session_factory() as db:
+                        tenant = await db.get(Tenant, tenant_id)
+                        if tenant:
+                            tenant.security_defaults_disabled = True
+                            tenant.security_defaults_error = None
+                            tenant.security_defaults_disabled_at = datetime.utcnow()
+                            await db.commit()
+
+                    security_defaults_disabled = True
+                    logger.info(f"[{domain}] Step 7: Security Defaults disabled")
+
+                # ===== Step 7b: Enable SMTP Auth =====
+                logger.info(f"[{domain}] Step 7: Enabling SMTP Auth (attempt {attempt}/{max_attempts})")
+                smtp_result = await enable_org_smtp_auth(
+                    admin_email=admin_email,
+                    admin_password=admin_password,
+                    totp_secret=totp_secret,
+                    domain=domain,
+                )
+
+                if not smtp_result.get("success"):
+                    failed_stage = "smtp_auth"
+                    raise RuntimeError(smtp_result.get("error") or "SMTP Auth enable failed")
+
+                async with async_session_factory() as db:
+                    tenant = await db.get(Tenant, tenant_id)
+                    if tenant:
+                        tenant.step7_smtp_auth_enabled = smtp_result.get("smtp_auth_enabled", False)
+                        tenant.step7_error = None
+                        tenant.step7_complete = True
+                        tenant.step7_completed_at = datetime.utcnow()
+                        await db.commit()
+
+                logger.info(f"[{domain}] Step 7 COMPLETE - Security Defaults disabled + SMTP Auth enabled")
                 return
 
-            domain = tenant.custom_domain or tenant.name
-            logger.info(f"[{domain}] Step 7: Starting SMTP Auth enable...")
+            except Exception as e:
+                stage_label = "Step 7"
+                if failed_stage == "security_defaults":
+                    stage_label = "Security Defaults"
+                elif failed_stage == "smtp_auth":
+                    stage_label = "SMTP Auth"
 
-            automation_result = await enable_org_smtp_auth(
-                admin_email=tenant.admin_email,
-                admin_password=tenant.admin_password,
-                totp_secret=tenant.totp_secret,
-                domain=domain,
-            )
+                error_msg = f"{stage_label} failed: {e}"
+                logger.warning(f"[{domain}] Step 7 attempt {attempt}/{max_attempts} failed: {error_msg}")
 
-            tenant.step7_smtp_auth_enabled = automation_result.get("smtp_auth_enabled", False)
-            tenant.step7_error = automation_result.get("error")
+                async with async_session_factory() as db:
+                    tenant = await db.get(Tenant, tenant_id)
+                    if tenant:
+                        tenant.step7_complete = False
+                        tenant.step7_smtp_auth_enabled = False
+                        tenant.step7_error = error_msg
+                        if failed_stage == "security_defaults":
+                            tenant.security_defaults_disabled = False
+                            tenant.security_defaults_error = error_msg
+                        await db.commit()
 
-            if automation_result.get("success"):
-                tenant.step7_complete = True
-                tenant.step7_completed_at = datetime.utcnow()
-                logger.info(f"[{domain}] Step 7 COMPLETE  SMTP Auth enabled")
-            else:
-                tenant.step7_complete = False
-                logger.warning(f"[{domain}] Step 7 FAILED: {automation_result.get('error')}")
-
-            await db.commit()
-            logger.info(f"[{domain}] Step 7 database updated immediately")
+                if attempt < max_attempts:
+                    delay = _compute_retry_delay(attempt)
+                    logger.info(f"[{domain}] Step 7 retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"[{domain}] Step 7 FAILED after {max_attempts} attempts")
+                    return
 
     semaphore = asyncio.Semaphore(MAX_PARALLEL)
 
@@ -4347,7 +4452,7 @@ async def _run_step7_batch(batch_id: UUID, tenant_ids: list):
                 batch.completed_at = datetime.utcnow()
                 await db.commit()
                 logger.info(
-                    f"Batch {batch_id} marked COMPLETE  all tenants have SMTP Auth enabled"
+                    f"Batch {batch_id} marked COMPLETE  all tenants have Security Defaults disabled and SMTP Auth enabled"
                 )
         else:
             complete_count = sum(1 for t in eligible if getattr(t, "step7_complete", False))
@@ -4389,6 +4494,11 @@ async def get_step7_status(
                 "domain": t.custom_domain or t.name,
                 "step7_complete": getattr(t, "step7_complete", False) or False,
                 "smtp_auth_enabled": getattr(t, "step7_smtp_auth_enabled", False) or False,
+                "security_defaults_disabled": getattr(t, "security_defaults_disabled", False) or False,
+                "security_defaults_error": getattr(t, "security_defaults_error", None),
+                "security_defaults_disabled_at": t.security_defaults_disabled_at.isoformat()
+                if getattr(t, "security_defaults_disabled_at", None)
+                else None,
                 "error": getattr(t, "step7_error", None),
                 "completed_at": t.step7_completed_at.isoformat()
                 if getattr(t, "step7_completed_at", None)
