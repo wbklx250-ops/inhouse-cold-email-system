@@ -34,7 +34,8 @@ from app.services.mailbox_scripts import mailbox_scripts
 from app.services.orchestrator import process_batch, SetupConfig
 from app.services.m365_setup import run_step5_for_batch, run_step5_for_tenant, Step5Result
 from app.services.selenium.parallel_processor import run_parallel_step5, DomainTask
-from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress, enable_org_smtp_auth
+from app.services.selenium.admin_portal import get_all_progress as get_live_progress, clear_all_progress
+from app.services.smtp_auth_fix import enable_smtp_auth_with_powershell, find_powershell_exe
 from app.services.azure_step6 import (
     run_step6_for_batch as run_azure_step6_for_batch,
     run_step6_for_tenant as run_azure_step6_for_tenant,
@@ -146,9 +147,21 @@ class BatchWizardStatus(BaseModel):
     mailboxes_pending: int
     mailboxes_ready: int
     step7: dict
+    sequencer_app_key: Optional[str] = None
+    sequencer_app_name: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class SequencerSelectionRequest(BaseModel):
+    """Batch-level sequencer selection."""
+    sequencer_app_key: str
+
+
+class Step7StartRequest(BaseModel):
+    """Optional overrides for Step 7 start."""
+    sequencer_app_key: Optional[str] = None
 
 
 # ============== BATCH MANAGEMENT ==============
@@ -347,6 +360,34 @@ async def unmark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_d
     }
 
 
+@router.post("/batches/{batch_id}/sequencer")
+async def set_batch_sequencer(
+    batch_id: UUID,
+    request: SequencerSelectionRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set the sequencer app for this batch (used in Step 7 consent)."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    try:
+        sequencer_config, changed = await _apply_sequencer_selection(
+            db,
+            batch,
+            request.sequencer_app_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "success": True,
+        "changed": changed,
+        "sequencer_app_key": sequencer_config["key"],
+        "sequencer_app_name": sequencer_config["name"],
+    }
+
+
 # ============== FEATURE 2: AUTO-RUN (Steps 4-5-6-7 automatically) ==============
 
 # Store auto-run job progress
@@ -367,6 +408,46 @@ class AutoRunRequest(BaseModel):
     """Schema for auto-run request."""
     new_password: str  # Password for first login (Step 4)
     display_name: str  # Full name for mailboxes e.g. "Jack Zuvelek"
+    sequencer_app_key: Optional[str] = None
+
+
+async def _apply_sequencer_selection(
+    db: AsyncSession,
+    batch: SetupBatch,
+    requested_key: Optional[str],
+) -> tuple[dict, bool]:
+    from app.services.app_consent import get_sequencer_config
+
+    if requested_key is None:
+        sequencer_config = get_sequencer_config(getattr(batch, "sequencer_app_key", None))
+    else:
+        sequencer_config = get_sequencer_config(requested_key, strict=True)
+
+    selected_key = sequencer_config["key"]
+    changed = batch.sequencer_app_key != selected_key
+    needs_commit = batch.sequencer_app_key is None or changed
+
+    if needs_commit:
+        batch.sequencer_app_key = selected_key
+
+        if changed:
+            result = await db.execute(
+                select(Tenant).where(Tenant.batch_id == batch.id)
+            )
+            tenants = result.scalars().all()
+
+            for tenant in tenants:
+                if tenant.step7_app_consent_granted:
+                    tenant.step7_app_consent_granted = False
+                    tenant.step7_app_consent_granted_at = None
+                    tenant.step7_app_consent_error = None
+                if tenant.step7_complete:
+                    tenant.step7_complete = False
+                    tenant.step7_completed_at = None
+
+        await db.commit()
+
+    return sequencer_config, changed
 
 
 @router.post("/batches/{batch_id}/auto-run")
@@ -424,6 +505,15 @@ async def start_auto_run(
             status_code=400,
             detail="No tenants in batch. Import tenants first (Step 4 import)."
         )
+
+    try:
+        sequencer_config, _ = await _apply_sequencer_selection(
+            db,
+            batch,
+            request.sequencer_app_key,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     
     # Enable auto-progress flag
     batch.auto_progress_enabled = True
@@ -441,6 +531,8 @@ async def start_auto_run(
         "message": f"Starting auto-run for {tenant_count} tenants...",
         "error": None,
         "tenant_count": tenant_count,
+        "sequencer_app_key": sequencer_config["key"],
+        "sequencer_app_name": sequencer_config["name"],
         "progress": {
             "step4": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
             "step5": {"status": "pending", "total": 0, "completed": 0, "failed": 0, "skipped": 0},
@@ -466,7 +558,12 @@ async def start_auto_run(
         "message": f"Auto-run started for batch '{batch.name}'",
         "job_id": job_id,
         "tenant_count": tenant_count,
-        "steps_to_run": ["Step 4: First Login", "Step 5: Email Setup", "Step 6: Mailboxes", "Step 7: Security Defaults + SMTP Auth"],
+        "steps_to_run": [
+            "Step 4: First Login",
+            "Step 5: Email Setup",
+            "Step 6: Mailboxes",
+            f"Step 7: Security Defaults + SMTP Auth + {sequencer_config['name']} Consent",
+        ],
         "note": "Use GET /batches/{batch_id}/auto-run/status to track progress"
     }
 
@@ -486,6 +583,7 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
     job_id = str(batch_id)
     
     try:
+        sequencer_name = auto_run_jobs[job_id].get("sequencer_app_name", "Sequencer")
         # === STEP 4: First Login ===
         auto_run_jobs[job_id]["current_step"] = 4
         auto_run_jobs[job_id]["current_step_name"] = "First Login"
@@ -518,8 +616,8 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
 
         # === STEP 7: SMTP Auth ===
         auto_run_jobs[job_id]["current_step"] = 7
-        auto_run_jobs[job_id]["current_step_name"] = "SMTP Auth"
-        auto_run_jobs[job_id]["message"] = "Enabling SMTP authentication..."
+        auto_run_jobs[job_id]["current_step_name"] = f"SMTP Auth + {sequencer_name} Consent"
+        auto_run_jobs[job_id]["message"] = f"Enabling SMTP authentication and granting {sequencer_name} consent..."
         auto_run_jobs[job_id]["progress"]["step7"]["status"] = "running"
 
         await _run_step7_with_retry(batch_id, job_id)
@@ -1156,6 +1254,8 @@ async def rerun_step(
     
     elif step_number == 7:
         # Step 7: Security Defaults + SMTP Auth - reset tenants
+        from app.services.app_consent import get_sequencer_config
+        sequencer_name = get_sequencer_config(getattr(batch, "sequencer_app_key", None))["name"]
         if force:
             # FORCE: Reset ALL tenants with step6 complete (even those with step7 complete)
             all_tenants = await db.execute(
@@ -1170,12 +1270,15 @@ async def rerun_step(
                 tenant.step7_complete = False
                 tenant.step7_completed_at = None
                 tenant.step7_smtp_auth_enabled = False
+                tenant.step7_app_consent_granted = False
+                tenant.step7_app_consent_granted_at = None
+                tenant.step7_app_consent_error = None
                 tenant.step7_error = None
             
             await db.commit()
             
             result["reset_count"] = len(tenants_to_reset)
-            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for SMTP Auth. All Step 7 flags cleared. Use 'Start Step 7' button."
+            result["message"] = f"FORCE RESET: Reset ALL {len(tenants_to_reset)} tenant(s) for SMTP Auth + {sequencer_name} consent. All Step 7 flags cleared. Use 'Start Step 7' button."
             logger.warning(f"FORCE RERUN Step 7: Reset {len(tenants_to_reset)} tenants including completed ones")
         else:
             # Normal: Only reset incomplete tenants
@@ -1190,11 +1293,12 @@ async def rerun_step(
             
             for tenant in tenants_to_reset:
                 tenant.step7_error = None
+                tenant.step7_app_consent_error = None
             
             await db.commit()
             
             result["reset_count"] = len(tenants_to_reset)
-            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth. Use 'Start Step 7' button."
+            result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth + {sequencer_name} consent. Use 'Start Step 7' button."
     
     # Update batch to target step
     batch.current_step = step_number
@@ -1324,6 +1428,9 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
     step_name = step_names.get(batch.current_step, "Unknown")
     if batch.status == BatchStatus.COMPLETED:
         step_name = "Complete"
+
+    from app.services.app_consent import get_sequencer_config
+    sequencer_config = get_sequencer_config(getattr(batch, "sequencer_app_key", None))
     
     return BatchWizardStatus(
         batch_id=batch.id,
@@ -1345,6 +1452,8 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         mailboxes_total=mailboxes_total,
         mailboxes_pending=mailboxes_pending,
         mailboxes_ready=mailboxes_ready,
+        sequencer_app_key=sequencer_config["key"],
+        sequencer_app_name=sequencer_config["name"],
         step7={
             "complete": step7_complete_count,
             "failed": step7_failed_count,
@@ -4231,10 +4340,11 @@ async def batch_create_mailboxes(batch_id: UUID, db: AsyncSession = Depends(get_
 @router.post("/batches/{batch_id}/step7/start")
 async def start_step7(
     batch_id: UUID,
+    request: Optional[Step7StartRequest] = None,
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Start Step 7: Disable Security Defaults (Entra) then enable org-level SMTP Auth.
+    Start Step 7: Disable Security Defaults (Entra), enable org-level SMTP Auth, then grant sequencer consent.
 
     Prerequisites: Step 6 must be complete for the tenant.
     """
@@ -4244,6 +4354,17 @@ async def start_step7(
     batch = batch_result.scalar_one_or_none()
     if not batch:
         raise HTTPException(404, "Batch not found")
+
+    try:
+        sequencer_config, _ = await _apply_sequencer_selection(
+            db,
+            batch,
+            request.sequencer_app_key if request else None,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    sequencer_name = sequencer_config["name"]
 
     result = await db.execute(
         select(Tenant).where(
@@ -4264,9 +4385,11 @@ async def start_step7(
     if not to_process:
         return {
             "success": True,
-            "message": "All tenants already have Security Defaults disabled and SMTP Auth enabled.",
+            "message": f"All tenants already have Security Defaults disabled, SMTP Auth enabled, and {sequencer_name} consent granted.",
             "total": len(eligible),
             "already_complete": len(eligible),
+            "sequencer_app_key": sequencer_config["key"],
+            "sequencer_app_name": sequencer_name,
         }
 
     import asyncio
@@ -4278,6 +4401,8 @@ async def start_step7(
         "total": len(eligible),
         "processing": len(to_process),
         "already_complete": len(eligible) - len(to_process),
+        "sequencer_app_key": sequencer_config["key"],
+        "sequencer_app_name": sequencer_name,
     }
 
 
@@ -4297,16 +4422,39 @@ async def _run_step7_batch(
     """
     import asyncio
     from app.db.session import async_session_factory
-    from app.services.step8_security_defaults import SecurityDefaultsDisabler, TenantCredentials
+    from app.services.step8_security_defaults import SecurityDefaultsDisabler, TenantCredentials as SDTenantCredentials
+    from app.services.app_consent import (
+        AppConsentGranter,
+        TenantCredentials as ConsentTenantCredentials,
+        get_sequencer_config,
+    )
 
     def _compute_retry_delay(attempt: int) -> int:
         delay = int(STEP7_RETRY_BASE_DELAY_SECONDS * (STEP7_RETRY_BACKOFF_MULTIPLIER ** (attempt - 1)))
         return min(delay, STEP7_RETRY_MAX_DELAY_SECONDS)
 
+    ps_exe = await asyncio.to_thread(find_powershell_exe)
+    ps_exe_state = {"exe": ps_exe}
+    ps_exe_lock = asyncio.Lock()
+
+    async with async_session_factory() as db:
+        batch = await db.get(SetupBatch, batch_id)
+        if not batch:
+            logger.error(f"Step 7 batch {batch_id} not found")
+            return
+        sequencer_config = get_sequencer_config(getattr(batch, "sequencer_app_key", None))
+
+    sequencer_name = sequencer_config["name"]
+    sequencer_client_id = sequencer_config.get("client_id")
+    sequencer_patch_scopes = bool(sequencer_config.get("patch_scopes", True))
+
+    if not ps_exe:
+        logger.warning("Step 7: PowerShell not found (pwsh/powershell). SMTP Auth PowerShell flow will fail.")
+
     MAX_PARALLEL = max(1, STEP7_MAX_PARALLEL)
 
     async def process_tenant(tenant_id: UUID):
-        """Process one tenant - disable Security Defaults, then enable SMTP AUTH."""
+        """Process one tenant - PowerShell SMTP Auth first, MFA fallback disables Security Defaults then retries."""
         for attempt in range(1, max_attempts + 1):
             # ===== Fetch tenant snapshot + increment retry count =====
             async with async_session_factory() as db:
@@ -4319,77 +4467,203 @@ async def _run_step7_batch(
                 admin_password = tenant.admin_password
                 totp_secret = tenant.totp_secret
                 security_defaults_disabled = tenant.security_defaults_disabled
+                app_consent_granted = getattr(tenant, "step7_app_consent_granted", False)
 
                 if increment_retry_count:
                     tenant.step7_retry_count += 1
                 tenant.step7_error = None
+                if hasattr(tenant, "step7_app_consent_error"):
+                    tenant.step7_app_consent_error = None
                 await db.commit()
 
-                if not admin_email or not admin_password or not totp_secret:
+                if not admin_email or not admin_password:
                     tenant.step7_complete = False
                     tenant.step7_smtp_auth_enabled = False
                     tenant.step7_error = (
-                        "Missing admin credentials or TOTP secret "
-                        "(admin_email/admin_password/totp_secret)"
+                        "Missing admin credentials "
+                        "(admin_email/admin_password)"
                     )
                     await db.commit()
-                    logger.warning(f"[{domain}] Step 7 failed: missing credentials/TOTP")
+                    logger.warning(f"[{domain}] Step 7 failed: missing credentials")
+                    return
+
+                if not ps_exe_state.get("exe"):
+                    tenant.step7_complete = False
+                    tenant.step7_smtp_auth_enabled = False
+                    tenant.step7_error = "PowerShell not available (pwsh/powershell not found)"
+                    await db.commit()
+                    logger.warning(f"[{domain}] Step 7 failed: PowerShell not available")
                     return
 
             failed_stage = None
+            no_retry = False
             try:
-                # ===== Step 7a: Disable Security Defaults (if needed) =====
-                if not security_defaults_disabled:
-                    logger.info(f"[{domain}] Step 7: Disabling Security Defaults (attempt {attempt}/{max_attempts})")
-                    worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
-                    disabler = SecurityDefaultsDisabler(headless=True, worker_id=worker_id)
-                    creds = TenantCredentials(
-                        tenant_id=str(tenant_id),
-                        domain=domain,
-                        admin_email=admin_email,
-                        admin_password=admin_password,
-                        totp_secret=totp_secret,
-                    )
-                    sd_result = disabler.disable_for_tenant(creds)
-                    if not sd_result.get("success"):
-                        failed_stage = "security_defaults"
-                        raise RuntimeError(sd_result.get("error") or "Security Defaults disable failed")
+                # ===== Step 7a: PowerShell SMTP Auth (fast path) =====
+                logger.info(f"[{domain}] Step 7: Enabling SMTP Auth via PowerShell (attempt {attempt}/{max_attempts})")
+                ps_result = await enable_smtp_auth_with_powershell(
+                    admin_email=admin_email,
+                    admin_password=admin_password,
+                    ps_exe_state=ps_exe_state,
+                    ps_exe_lock=ps_exe_lock,
+                    verify_only=False,
+                )
+
+                if ps_result.get("success"):
+                    async with async_session_factory() as db:
+                        tenant = await db.get(Tenant, tenant_id)
+                        if tenant:
+                            tenant.step7_smtp_auth_enabled = ps_result.get("smtp_auth_enabled", False)
+                            tenant.step7_error = None
+                            if not tenant.security_defaults_disabled:
+                                tenant.security_defaults_disabled = True
+                                tenant.security_defaults_error = None
+                                tenant.security_defaults_disabled_at = (
+                                    tenant.security_defaults_disabled_at or datetime.utcnow()
+                                )
+                            await db.commit()
+
+                    if not app_consent_granted:
+                        if not sequencer_client_id:
+                            failed_stage = "app_consent"
+                            raise RuntimeError(f"{sequencer_name} client ID not configured")
+                        worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
+                        consent_creds = ConsentTenantCredentials(
+                            tenant_id=str(tenant_id),
+                            domain=domain,
+                            admin_email=admin_email,
+                            admin_password=admin_password,
+                            totp_secret=totp_secret or "",
+                        )
+                        consent_granter = AppConsentGranter(headless=True, worker_id=worker_id)
+                        consent_result = await asyncio.to_thread(
+                            consent_granter.grant_consent_for_tenant,
+                            consent_creds,
+                            sequencer_client_id,
+                            sequencer_name,
+                            sequencer_patch_scopes,
+                        )
+                        if not consent_result.get("success"):
+                            failed_stage = "app_consent"
+                            raise RuntimeError(consent_result.get("error") or "App consent failed")
 
                     async with async_session_factory() as db:
                         tenant = await db.get(Tenant, tenant_id)
                         if tenant:
-                            tenant.security_defaults_disabled = True
-                            tenant.security_defaults_error = None
-                            tenant.security_defaults_disabled_at = datetime.utcnow()
+                            tenant.step7_app_consent_granted = True
+                            tenant.step7_app_consent_error = None
+                            tenant.step7_app_consent_granted_at = (
+                                tenant.step7_app_consent_granted_at or datetime.utcnow()
+                            )
+                            tenant.step7_complete = True
+                            tenant.step7_completed_at = datetime.utcnow()
                             await db.commit()
 
-                    security_defaults_disabled = True
-                    logger.info(f"[{domain}] Step 7: Security Defaults disabled")
+                    logger.info(
+                        f"[{domain}] Step 7 COMPLETE - SMTP Auth enabled via PowerShell + {sequencer_name} consent"
+                    )
+                    return
 
-                # ===== Step 7b: Enable SMTP Auth =====
-                logger.info(f"[{domain}] Step 7: Enabling SMTP Auth (attempt {attempt}/{max_attempts})")
-                smtp_result = await enable_org_smtp_auth(
-                    admin_email=admin_email,
-                    admin_password=admin_password,
-                    totp_secret=totp_secret,
-                    domain=domain,
-                )
+                if ps_result.get("mfa_blocked"):
+                    # ===== Step 7b: MFA blocked, disable Security Defaults then retry =====
+                    if not totp_secret:
+                        failed_stage = "security_defaults"
+                        no_retry = True
+                        raise RuntimeError("MFA blocked and no TOTP secret available")
 
-                if not smtp_result.get("success"):
-                    failed_stage = "smtp_auth"
-                    raise RuntimeError(smtp_result.get("error") or "SMTP Auth enable failed")
+                    if not security_defaults_disabled:
+                        logger.info(f"[{domain}] Step 7: Disabling Security Defaults (attempt {attempt}/{max_attempts})")
+                        worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
+                        disabler = SecurityDefaultsDisabler(headless=True, worker_id=worker_id)
+                        creds = SDTenantCredentials(
+                            tenant_id=str(tenant_id),
+                            domain=domain,
+                            admin_email=admin_email,
+                            admin_password=admin_password,
+                            totp_secret=totp_secret,
+                        )
+                        sd_result = disabler.disable_for_tenant(creds)
+                        if not sd_result.get("success"):
+                            failed_stage = "security_defaults"
+                            raise RuntimeError(sd_result.get("error") or "Security Defaults disable failed")
 
-                async with async_session_factory() as db:
-                    tenant = await db.get(Tenant, tenant_id)
-                    if tenant:
-                        tenant.step7_smtp_auth_enabled = smtp_result.get("smtp_auth_enabled", False)
-                        tenant.step7_error = None
-                        tenant.step7_complete = True
-                        tenant.step7_completed_at = datetime.utcnow()
-                        await db.commit()
+                        async with async_session_factory() as db:
+                            tenant = await db.get(Tenant, tenant_id)
+                            if tenant:
+                                tenant.security_defaults_disabled = True
+                                tenant.security_defaults_error = None
+                                tenant.security_defaults_disabled_at = datetime.utcnow()
+                                await db.commit()
 
-                logger.info(f"[{domain}] Step 7 COMPLETE - Security Defaults disabled + SMTP Auth enabled")
-                return
+                        security_defaults_disabled = True
+                        logger.info(f"[{domain}] Step 7: Security Defaults disabled")
+
+                    logger.info(f"[{domain}] Step 7: Retrying SMTP Auth via PowerShell after Security Defaults disable")
+                    ps_retry = await enable_smtp_auth_with_powershell(
+                        admin_email=admin_email,
+                        admin_password=admin_password,
+                        ps_exe_state=ps_exe_state,
+                        ps_exe_lock=ps_exe_lock,
+                        verify_only=False,
+                    )
+
+                    if not ps_retry.get("success"):
+                        failed_stage = "smtp_auth"
+                        raise RuntimeError(ps_retry.get("error") or "SMTP Auth enable failed after Security Defaults")
+
+                    async with async_session_factory() as db:
+                        tenant = await db.get(Tenant, tenant_id)
+                        if tenant:
+                            tenant.step7_smtp_auth_enabled = ps_retry.get("smtp_auth_enabled", False)
+                            tenant.step7_error = None
+                            if not tenant.security_defaults_disabled:
+                                tenant.security_defaults_disabled = True
+                                tenant.security_defaults_error = None
+                                tenant.security_defaults_disabled_at = tenant.security_defaults_disabled_at or datetime.utcnow()
+                            await db.commit()
+
+                    if not app_consent_granted:
+                        if not sequencer_client_id:
+                            failed_stage = "app_consent"
+                            raise RuntimeError(f"{sequencer_name} client ID not configured")
+                        worker_id = int(str(tenant_id).replace("-", "")[:6], 16) % 10000
+                        consent_creds = ConsentTenantCredentials(
+                            tenant_id=str(tenant_id),
+                            domain=domain,
+                            admin_email=admin_email,
+                            admin_password=admin_password,
+                            totp_secret=totp_secret or "",
+                        )
+                        consent_granter = AppConsentGranter(headless=True, worker_id=worker_id)
+                        consent_result = await asyncio.to_thread(
+                            consent_granter.grant_consent_for_tenant,
+                            consent_creds,
+                            sequencer_client_id,
+                            sequencer_name,
+                            sequencer_patch_scopes,
+                        )
+                        if not consent_result.get("success"):
+                            failed_stage = "app_consent"
+                            raise RuntimeError(consent_result.get("error") or "App consent failed")
+
+                    async with async_session_factory() as db:
+                        tenant = await db.get(Tenant, tenant_id)
+                        if tenant:
+                            tenant.step7_app_consent_granted = True
+                            tenant.step7_app_consent_error = None
+                            tenant.step7_app_consent_granted_at = (
+                                tenant.step7_app_consent_granted_at or datetime.utcnow()
+                            )
+                            tenant.step7_complete = True
+                            tenant.step7_completed_at = datetime.utcnow()
+                            await db.commit()
+
+                    logger.info(
+                        f"[{domain}] Step 7 COMPLETE - Security Defaults disabled + SMTP Auth enabled + {sequencer_name} consent"
+                    )
+                    return
+
+                failed_stage = "smtp_auth"
+                raise RuntimeError(ps_result.get("error") or "SMTP Auth enable failed")
 
             except Exception as e:
                 stage_label = "Step 7"
@@ -4397,6 +4671,8 @@ async def _run_step7_batch(
                     stage_label = "Security Defaults"
                 elif failed_stage == "smtp_auth":
                     stage_label = "SMTP Auth"
+                elif failed_stage == "app_consent":
+                    stage_label = "App Consent"
 
                 error_msg = f"{stage_label} failed: {e}"
                 logger.warning(f"[{domain}] Step 7 attempt {attempt}/{max_attempts} failed: {error_msg}")
@@ -4405,12 +4681,21 @@ async def _run_step7_batch(
                     tenant = await db.get(Tenant, tenant_id)
                     if tenant:
                         tenant.step7_complete = False
-                        tenant.step7_smtp_auth_enabled = False
                         tenant.step7_error = error_msg
+                        if failed_stage in (None, "smtp_auth", "security_defaults"):
+                            tenant.step7_smtp_auth_enabled = False
+                        if failed_stage == "app_consent":
+                            tenant.step7_app_consent_granted = False
+                            tenant.step7_app_consent_granted_at = None
+                            tenant.step7_app_consent_error = error_msg
                         if failed_stage == "security_defaults":
                             tenant.security_defaults_disabled = False
                             tenant.security_defaults_error = error_msg
                         await db.commit()
+
+                if no_retry:
+                    logger.error(f"[{domain}] Step 7 FAILED (non-retryable): {error_msg}")
+                    return
 
                 if attempt < max_attempts:
                     delay = _compute_retry_delay(attempt)
@@ -4452,7 +4737,7 @@ async def _run_step7_batch(
                 batch.completed_at = datetime.utcnow()
                 await db.commit()
                 logger.info(
-                    f"Batch {batch_id} marked COMPLETE  all tenants have Security Defaults disabled and SMTP Auth enabled"
+                    f"Batch {batch_id} marked COMPLETE - all tenants have Security Defaults disabled, SMTP Auth enabled, and {sequencer_name} consent granted"
                 )
         else:
             complete_count = sum(1 for t in eligible if getattr(t, "step7_complete", False))
@@ -4468,6 +4753,13 @@ async def get_step7_status(
     db: AsyncSession = Depends(get_db),
 ):
     """Get Step 7 progress for all tenants in batch."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    from app.services.app_consent import get_sequencer_config
+    sequencer_config = get_sequencer_config(getattr(batch, "sequencer_app_key", None))
+
     result = await db.execute(
         select(Tenant).where(Tenant.batch_id == batch_id)
     )
@@ -4494,6 +4786,11 @@ async def get_step7_status(
                 "domain": t.custom_domain or t.name,
                 "step7_complete": getattr(t, "step7_complete", False) or False,
                 "smtp_auth_enabled": getattr(t, "step7_smtp_auth_enabled", False) or False,
+                "app_consent_granted": getattr(t, "step7_app_consent_granted", False) or False,
+                "app_consent_error": getattr(t, "step7_app_consent_error", None),
+                "app_consent_granted_at": t.step7_app_consent_granted_at.isoformat()
+                if getattr(t, "step7_app_consent_granted_at", None)
+                else None,
                 "security_defaults_disabled": getattr(t, "security_defaults_disabled", False) or False,
                 "security_defaults_error": getattr(t, "security_defaults_error", None),
                 "security_defaults_disabled_at": t.security_defaults_disabled_at.isoformat()
@@ -4506,11 +4803,7 @@ async def get_step7_status(
             }
         )
 
-    batch_result = await db.execute(
-        select(SetupBatch).where(SetupBatch.id == batch_id)
-    )
-    batch = batch_result.scalar_one_or_none()
-    batch_complete = batch.status == BatchStatus.COMPLETED if batch else False
+    batch_complete = batch.status == BatchStatus.COMPLETED
 
     return {
         "batch_complete": batch_complete,
@@ -4518,6 +4811,8 @@ async def get_step7_status(
         "complete": len(complete),
         "failed": len(failed),
         "pending": len(pending),
+        "sequencer_app_key": sequencer_config["key"],
+        "sequencer_app_name": sequencer_config["name"],
         "tenants": tenant_details,
     }
 
@@ -4544,6 +4839,7 @@ async def retry_step7_failed(
     tenant_ids = []
     for t in failed_tenants:
         t.step7_error = None
+        t.step7_app_consent_error = None
         tenant_ids.append(t.id)
     await db.commit()
 
@@ -4580,6 +4876,9 @@ async def rerun_step7_all(
         tenant.step7_complete = False
         tenant.step7_error = None
         tenant.step7_smtp_auth_enabled = False
+        tenant.step7_app_consent_granted = False
+        tenant.step7_app_consent_granted_at = None
+        tenant.step7_app_consent_error = None
 
     await db.commit()
 
@@ -4604,6 +4903,7 @@ async def force_complete_step7_for_tenant(
     
     Use this when:
     - SMTP Auth was enabled manually in the admin center
+    - Sequencer consent was granted manually
     - Automation succeeded but DB wasn't updated
     - Need to mark as complete to proceed
     """
@@ -4620,6 +4920,9 @@ async def force_complete_step7_for_tenant(
     tenant.step7_complete = True
     tenant.step7_completed_at = datetime.utcnow()
     tenant.step7_smtp_auth_enabled = True
+    tenant.step7_app_consent_granted = True
+    tenant.step7_app_consent_granted_at = datetime.utcnow()
+    tenant.step7_app_consent_error = None
     tenant.step7_error = None
 
     await db.commit()
@@ -4679,6 +4982,9 @@ async def force_complete_step7_for_all(
             tenant.step7_complete = True
             tenant.step7_completed_at = datetime.utcnow()
             tenant.step7_smtp_auth_enabled = True
+            tenant.step7_app_consent_granted = True
+            tenant.step7_app_consent_granted_at = datetime.utcnow()
+            tenant.step7_app_consent_error = None
             tenant.step7_error = None
             updated_count += 1
 
@@ -4714,7 +5020,7 @@ async def batch_export_credentials(batch_id: UUID, db: AsyncSession = Depends(ge
     writer.writerow(["DisplayName", "EmailAddress", "Password"])
     
     for mb in mailboxes:
-        writer.writerow([mb.display_name, mb.email, mb.password])
+        writer.writerow([mb.display_name, mb.email, mb.password or "#Sendemails1"])  # Safety fallback
     
     output.seek(0)
     
@@ -5351,7 +5657,7 @@ async def wizard_export_credentials(db: AsyncSession = Depends(get_db)):
     writer.writerow(["DisplayName", "EmailAddress", "Password"])
     
     for mb in mailboxes:
-        writer.writerow([mb.display_name, mb.email, mb.password])
+        writer.writerow([mb.display_name, mb.email, mb.password or "#Sendemails1"])  # Safety fallback
     
     output.seek(0)
     

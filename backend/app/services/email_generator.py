@@ -8,6 +8,9 @@ NO numbers, NO random suffixes - strictly name-based patterns only.
 import secrets
 from typing import List, Dict
 
+# Standard mailbox password used across all mailboxes
+MAILBOX_PASSWORD = "#Sendemails1"
+
 
 def generate_email_variations(
     first_name: str,
@@ -158,14 +161,8 @@ def generate_emails_for_domain(
     for variation in variations:
         email = variation["email"]
         local_part = email.split("@")[0]
-        password = generate_password()
-
-        while (
-            local_part in password.lower()
-            or first.lower() in password.lower()
-            or last.lower() in password.lower()
-        ):
-            password = generate_password()
+        # Use standard mailbox password for all mailboxes
+        password = MAILBOX_PASSWORD
 
         emails.append(
             {

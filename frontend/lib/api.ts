@@ -962,6 +962,7 @@ export const unmarkBatchUploaded = async (batchId: string): Promise<{ message: s
 export interface AutoRunRequest {
   new_password: string;
   display_name: string;
+  sequencer_app_key?: string;
 }
 
 export interface AutoRunStatus {

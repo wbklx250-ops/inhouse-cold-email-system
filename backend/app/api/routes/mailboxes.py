@@ -419,7 +419,7 @@ async def export_credentials(
     output = StringIO()
     output.write("DisplayName,EmailAddress,Password\n")
     for mb in mailboxes:
-        output.write(f"{mb.display_name},{mb.email},{mb.password}\n")
+        output.write(f"{mb.display_name},{mb.email},{mb.password or '#Sendemails1'}\n")
     
     output.seek(0)
     return StreamingResponse(
@@ -448,7 +448,7 @@ async def export_mailbox_credentials(
     output = StringIO()
     output.write("email,password\n")
     for mailbox in mailboxes:
-        output.write(f"{mailbox.email},{mailbox.password}\n")
+        output.write(f"{mailbox.email},{mailbox.password or '#Sendemails1'}\n")
 
     output.seek(0)
     return StreamingResponse(

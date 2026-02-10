@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 # Configuration
 MAX_PARALLEL_TENANTS = 2
 LICENSED_USER_PASSWORD = "#Sendemails1"
+MAILBOX_PASSWORD = "#Sendemails1"  # Standard password for all mailboxes
 SCREENSHOT_DIR = "C:/temp/screenshots/step6"
 
 # Progress tracking (in-memory for real-time UI updates)
@@ -525,10 +526,11 @@ class Step6Orchestrator:
 
         # Build list of users with UPNs and passwords
         # Note: After UPN fix, emails should be using custom domain
+        # All mailboxes use the standard mailbox password
         users = [
             {
                 "upn": mb["email"],  # After UPN fix, use custom domain email
-                "password": mb["password"],
+                "password": MAILBOX_PASSWORD,  # Use standard password
             }
             for mb in mailbox_data
         ]

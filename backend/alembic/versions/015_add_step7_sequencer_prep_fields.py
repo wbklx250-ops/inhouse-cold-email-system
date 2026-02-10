@@ -1,6 +1,6 @@
 """add_step7_sequencer_prep_fields
 
-Revision ID: 015_add_step7_sequencer_prep_fields
+Revision ID: 015_add_step7_sequencer_prep_fie
 Revises: 014_add_step5_complete
 Create Date: 2026-02-02 02:22:00.000000
 
@@ -11,7 +11,7 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = "015_add_step7_sequencer_prep_fields"
+revision = "015_add_step7_sequencer_prep_fie"
 down_revision = "014_add_step5_complete"
 branch_labels = None
 depends_on = None

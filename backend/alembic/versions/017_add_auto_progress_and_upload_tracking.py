@@ -1,6 +1,6 @@
 """Add auto-progress and upload tracking fields.
 
-Revision ID: 017
+Revision ID: 017_auto_progress_upload
 Revises: 016_add_step8_security_defaults_fields
 Create Date: 2026-02-06
 
@@ -13,8 +13,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision = '017_add_auto_progress_and_upload_tracking'
-down_revision = '016_add_step8_security_defaults_fields'
+revision = '017_auto_progress_upload'
+down_revision = '016'
 branch_labels = None
 depends_on = None
 

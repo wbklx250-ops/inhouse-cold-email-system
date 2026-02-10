@@ -42,14 +42,15 @@ RUN curl -sSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor 
     && apt-get install -y --no-install-recommends powershell \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PowerShell modules for Exchange Online
+# Install PowerShell modules for Exchange Online (pinned for stability)
 RUN pwsh -Command "Set-PSRepository -Name PSGallery -InstallationPolicy Trusted" \
-    && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -Force -Scope AllUsers -AcceptLicense"
+    && pwsh -Command "Install-Module -Name ExchangeOnlineManagement -RequiredVersion 3.1.0 -Force -Scope AllUsers -AcceptLicense -AllowClobber"
 
 # Set environment paths
 ENV CHROME_PATH=/usr/bin/chromium
 ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
 ENV PWSH_PATH=/usr/bin/pwsh
+ENV EXO_REQUIRED_VERSION=3.1.0
 
 WORKDIR /app
 

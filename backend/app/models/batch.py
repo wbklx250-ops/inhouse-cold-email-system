@@ -58,6 +58,7 @@ class SetupBatch(TimestampUUIDMixin, Base):
     persona_first_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # Default persona for mailboxes
     persona_last_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     mailboxes_per_tenant: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
+    sequencer_app_key: Mapped[str] = mapped_column(String(50), nullable=False, default="instantly")
     
     # Completion tracking
     completed_steps: Mapped[Optional[List[int]]] = mapped_column(JSONB, nullable=True, default=list)  # e.g., [1, 2, 3]

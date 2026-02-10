@@ -7,6 +7,9 @@ interface TenantStep7Status {
   domain: string;
   step7_complete: boolean;
   smtp_auth_enabled: boolean;
+  app_consent_granted: boolean;
+  app_consent_error: string | null;
+  app_consent_granted_at: string | null;
   security_defaults_disabled: boolean;
   security_defaults_error: string | null;
   security_defaults_disabled_at: string | null;
@@ -20,6 +23,8 @@ interface Step7Status {
   complete: number;
   failed: number;
   pending: number;
+  sequencer_app_key?: string;
+  sequencer_app_name?: string;
   tenants: TenantStep7Status[];
 }
 
@@ -34,10 +39,18 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
   const [isRunning, setIsRunning] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [sequencerKey, setSequencerKey] = useState("instantly");
+  const [sequencerTouched, setSequencerTouched] = useState(false);
+  const [sequencerSaving, setSequencerSaving] = useState(false);
   const [forceCompletingTenant, setForceCompletingTenant] = useState<string | null>(null);
   const [forceCompletingAll, setForceCompletingAll] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+  const sequencerOptions = [
+    { key: "instantly", label: "Instantly.ai" },
+    { key: "plusvibe", label: "PlusVibe" },
+    { key: "smartlead", label: "Smartlead.ai" },
+  ];
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -47,6 +60,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       if (res.ok) {
         const data: Step7Status = await res.json();
         setStatus(data);
+        if (!sequencerTouched && data.sequencer_app_key) {
+          setSequencerKey(data.sequencer_app_key);
+        }
 
         // Auto-stop polling when all done
         if (data.eligible > 0 && data.complete === data.eligible) {
@@ -63,7 +79,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
     } finally {
       setLoading(false);
     }
-  }, [batchId, API_BASE, onComplete, suppressAutoComplete]);
+  }, [batchId, API_BASE, onComplete, suppressAutoComplete, sequencerTouched]);
 
   useEffect(() => {
     fetchStatus();
@@ -133,9 +149,36 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
     }
   };
 
+  const updateSequencer = async (nextKey: string) => {
+    if (!nextKey) return;
+    setError(null);
+    setSequencerTouched(true);
+    setSequencerKey(nextKey);
+    setSequencerSaving(true);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/wizard/batches/${batchId}/sequencer`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ sequencer_app_key: nextKey }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.detail || data.message || "Failed to update sequencer");
+      }
+      await fetchStatus();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to update sequencer");
+    } finally {
+      setSequencerSaving(false);
+    }
+  };
+
   // Force complete a single tenant
   const forceCompleteTenant = async (tenantId: string) => {
-    if (!confirm("Force-complete Step 7 for this tenant? Use only if Security Defaults are already disabled and SMTP Auth is enabled. This updates the database and skips automation.")) return;
+    if (!confirm(`Force-complete Step 7 for this tenant? Use only if Security Defaults are already disabled, SMTP Auth is enabled, and ${appName} consent is granted. This updates the database and skips automation.`)) return;
     
     setForceCompletingTenant(tenantId);
     setError(null);
@@ -159,7 +202,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
 
   // Force complete ALL pending tenants
   const forceCompleteAll = async () => {
-    if (!confirm("Force-complete Step 7 for ALL pending tenants? Use only if Security Defaults are already disabled and SMTP Auth is enabled for each tenant. This updates the database and completes the batch.")) return;
+    if (!confirm(`Force-complete Step 7 for ALL pending tenants? Use only if Security Defaults are already disabled, SMTP Auth is enabled, and ${appName} consent is granted for each tenant. This updates the database and completes the batch.`)) return;
     
     setForceCompletingAll(true);
     setError(null);
@@ -186,6 +229,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
     return <div className="p-6 text-gray-500">Loading Step 7 status...</div>;
   }
 
+  const selectedSequencer = sequencerOptions.find((opt) => opt.key === sequencerKey);
+  const appName = status?.sequencer_app_name || selectedSequencer?.label || "Sequencer";
+
   const allComplete =
     status && status.eligible > 0 && status.complete === status.eligible;
 
@@ -198,12 +244,13 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       };
     }
 
-    const errorText = t.error || t.security_defaults_error;
+    const errorText = t.error || t.security_defaults_error || t.app_consent_error;
     if (errorText) {
       const lower = errorText.toLowerCase();
       let stage = "";
       if (lower.includes("security defaults")) stage = "Security Defaults";
       if (lower.includes("smtp auth")) stage = "SMTP Auth";
+      if (lower.includes("consent")) stage = "App Consent";
       const label = stage ? `Failed (${stage})` : "Failed";
       return {
         label,
@@ -212,9 +259,17 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       };
     }
 
+    if (t.security_defaults_disabled && t.smtp_auth_enabled && !t.app_consent_granted) {
+      return {
+        label: "Pending (Consent)",
+        className:
+          "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800",
+      };
+    }
+
     if (t.security_defaults_disabled && !t.smtp_auth_enabled) {
       return {
-        label: "Partial",
+        label: "Partial (SMTP)",
         className:
           "inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-blue-100 text-blue-800",
       };
@@ -232,26 +287,61 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       {/* Header */}
       <div>
         <h2 className="text-xl font-semibold text-gray-900">
-          Step 7: Disable Security Defaults + Enable SMTP Auth
+          Step 7: Security Defaults + SMTP Auth + {appName} Consent
         </h2>
         <p className="mt-1 text-sm text-gray-500">
           Disables Security Defaults in Entra ID, then enables SMTP
-          Authentication at the organization level so mailboxes can be
-          connected to <strong>PlusVibe</strong>, <strong>Instantly</strong>,
-          or other email sequencers.
+          Authentication at the organization level and grants {appName}
+          admin consent so mailboxes can be connected to
+          <strong> {appName}</strong> or other email sequencers.
         </p>
+      </div>
+
+      {/* Sequencer selection */}
+      <div className="rounded-lg border bg-white p-4">
+        <label className="block text-sm font-medium text-gray-700">
+          Sequencer for Step 7 Consent
+        </label>
+        <div className="mt-2 flex flex-wrap gap-3 items-center">
+          <select
+            value={sequencerKey}
+            onChange={(e) => updateSequencer(e.target.value)}
+            disabled={isRunning || sequencerSaving}
+            className="min-w-[220px] px-3 py-2 border rounded-lg bg-white"
+          >
+            {sequencerOptions.map((opt) => (
+              <option key={opt.key} value={opt.key}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+          {sequencerSaving && (
+            <span className="text-xs text-gray-500">Saving...</span>
+          )}
+        </div>
+        <p className="mt-2 text-xs text-gray-500">
+          Changing the sequencer resets consent status for this batch.
+        </p>
+        {sequencerKey === "plusvibe" && (
+          <p className="mt-1 text-xs text-gray-500">
+            PlusVibe uses Exchange Online scopes, so Graph scope patching is skipped.
+          </p>
+        )}
       </div>
 
       {/* Info banner */}
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          1) Disables Security Defaults in Entra ID (required for SMTP Auth to
-          stay enabled).
+          1) Tries Exchange Online PowerShell to enable SMTP Auth and verify
+          the setting.
         </p>
         <p className="mt-1">
-          2) Logs into each tenant's Exchange Admin Center and unchecks
-          "Turn off SMTP AUTH protocol" under Settings &rarr; Mail flow.
+          2) If MFA blocks PowerShell, it disables Security Defaults in Entra
+          ID, then retries PowerShell.
+        </p>
+        <p className="mt-1">
+          3) Grants {appName} admin consent so OAuth connections succeed.
         </p>
         <p className="mt-2 text-blue-600">
           This can take a few minutes per tenant on Railway or low-resource
@@ -406,7 +496,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
       {/* Force Complete Info */}
       {status && status.pending + status.failed > 0 && !isRunning && (
         <div className="rounded-lg border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-800">
-          <p><strong>💡 Manual Override:</strong> If you've already disabled Security Defaults and enabled SMTP Auth manually, use "Force Complete" to update the database without re-running automation.</p>
+          <p><strong>💡 Manual Override:</strong> If you've already disabled Security Defaults, enabled SMTP Auth, and granted {appName} consent manually, use "Force Complete" to update the database without re-running automation.</p>
         </div>
       )}
 
@@ -424,9 +514,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
             Setup Complete!
           </p>
           <p className="mt-1 text-sm text-green-600">
-            All tenants have Security Defaults disabled and SMTP Auth enabled.
-            Your mailboxes are ready to upload to PlusVibe, Instantly, or any
-            other sequencer.
+            All tenants have Security Defaults disabled, SMTP Auth enabled,
+            and {appName} consent granted. Your mailboxes are ready to upload to
+            {appName} or any other sequencer.
           </p>
           <div className="mt-3 rounded border border-green-300 bg-white p-3 text-xs font-mono text-gray-700 space-y-1">
             <p><strong>SMTP Host:</strong> smtp.office365.com &nbsp;|&nbsp; <strong>Port:</strong> 587</p>
@@ -453,6 +543,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                   SMTP Auth
+                </th>
+                <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
+                  {appName} Consent
                 </th>
                 <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase">
                   Security Defaults
@@ -482,6 +575,13 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                     )}
                   </td>
                   <td className="px-4 py-3 text-center">
+                    {t.app_consent_granted ? (
+                      <span className="text-green-500 text-lg">&#10003;</span>
+                    ) : (
+                      <span className="text-gray-300">&mdash;</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-center">
                     {t.security_defaults_disabled ? (
                       <span className="text-green-500 text-lg">&#10003;</span>
                     ) : (
@@ -499,7 +599,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
                     })()}
                   </td>
                   <td className="px-4 py-3 text-sm text-red-500 max-w-xs truncate">
-                    {t.error || t.security_defaults_error || "\u2014"}
+                    {t.error || t.security_defaults_error || t.app_consent_error || "\u2014"}
                   </td>
                   <td className="px-4 py-3 text-right">
                     {!t.step7_complete && (

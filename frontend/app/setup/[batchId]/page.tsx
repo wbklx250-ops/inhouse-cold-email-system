@@ -11,6 +11,8 @@ interface WizardStatus {
   step_name: string;
   can_proceed: boolean;
   status: string;
+  sequencer_app_key?: string;
+  sequencer_app_name?: string;
   domains_total: number;
   zones_created: number;
   zones_pending: number;
@@ -1330,6 +1332,13 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
   const [autoRunStatus, setAutoRunStatus] = useState<AutoRunStatus | null>(null);
   const [autoRunPolling, setAutoRunPolling] = useState(false);
   const [autoRunError, setAutoRunError] = useState<string | null>(null);
+  const [autoRunSequencer, setAutoRunSequencer] = useState("instantly");
+
+  const sequencerOptions = [
+    { key: "instantly", label: "Instantly.ai" },
+    { key: "plusvibe", label: "PlusVibe" },
+    { key: "smartlead", label: "Smartlead.ai" },
+  ];
 
   // Fetch step4 status on mount and when needed
   const fetchStep4Status = async () => {
@@ -1366,6 +1375,12 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
       fetchTenants();
     }
   }, [batchId, status?.tenants_total]);
+
+  useEffect(() => {
+    if (status?.sequencer_app_key) {
+      setAutoRunSequencer(status.sequencer_app_key);
+    }
+  }, [status?.sequencer_app_key]);
 
   // Poll progress during automation
   useEffect(() => {
@@ -1469,7 +1484,8 @@ function Step4Tenants({ batchId, status, onComplete }: { batchId: string; status
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           new_password: "#Sendemails1",
-          display_name: autoRunDisplayName.trim()
+          display_name: autoRunDisplayName.trim(),
+          sequencer_app_key: autoRunSequencer,
         })
       });
 
@@ -2346,6 +2362,26 @@ admin@example.onmicrosoft.com\tTempP@ss123!`;
               </p>
             </div>
 
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Sequencer for Step 7 *
+              </label>
+              <select
+                value={autoRunSequencer}
+                onChange={(e) => setAutoRunSequencer(e.target.value)}
+                className="w-full px-4 py-2 border rounded-lg bg-white"
+              >
+                {sequencerOptions.map((opt) => (
+                  <option key={opt.key} value={opt.key}>
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <p className="text-xs text-gray-500 mt-1">
+                This determines which app receives admin consent in Step 7.
+              </p>
+            </div>
+
             {autoRunError && (
               <div className="bg-red-50 border border-red-200 rounded-lg p-3">
                 <p className="text-red-800 text-sm">{autoRunError}</p>
@@ -2924,6 +2960,7 @@ interface Step6DetailedStatus {
 }
 
 function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: string; status: WizardStatus | null; onComplete: () => void; onNext: () => void }) {
+  const sequencerName = status?.sequencer_app_name || "Sequencer";
   const [step6Status, setStep6Status] = useState<Step6DetailedStatus | null>(null);
   const [displayName, setDisplayName] = useState("");
   const [isLoading, setIsLoading] = useState(true);
@@ -3033,7 +3070,7 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
 
   // Mark batch as complete manually and advance to Step 7
   const handleMarkBatchComplete = async () => {
-    if (!confirm("Continue to Sequencer Setup (Step 7)? This will disable Security Defaults and enable SMTP Auth for all tenants.")) return;
+    if (!confirm(`Continue to Sequencer Setup (Step 7)? This will disable Security Defaults, enable SMTP Auth, and grant ${sequencerName} consent for all tenants.`)) return;
     
     setIsMarkingComplete(true);
     setError(null);

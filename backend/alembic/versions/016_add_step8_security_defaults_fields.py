@@ -12,7 +12,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = "016"  # Shortened to fit VARCHAR(32)
-down_revision = ("015_add_step7_sequencer_prep_fields", "013")  # Merge both branches
+down_revision = ("015_add_step7_sequencer_prep_fie", "013")  # Merge both branches
 branch_labels = None
 depends_on = None
 
