@@ -4446,7 +4446,8 @@ async def _run_step7_batch(
 
     sequencer_name = sequencer_config["name"]
     sequencer_client_id = sequencer_config.get("client_id")
-    sequencer_patch_scopes = bool(sequencer_config.get("patch_scopes", True))
+    # Consent popup is sufficient; do not patch scopes after consent.
+    sequencer_patch_scopes = False
 
     if not ps_exe:
         logger.warning("Step 7: PowerShell not found (pwsh/powershell). SMTP Auth PowerShell flow will fail.")

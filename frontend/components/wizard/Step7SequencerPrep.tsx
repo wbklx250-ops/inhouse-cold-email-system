@@ -322,11 +322,9 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
         <p className="mt-2 text-xs text-gray-500">
           Changing the sequencer resets consent status for this batch.
         </p>
-        {sequencerKey === "plusvibe" && (
-          <p className="mt-1 text-xs text-gray-500">
-            PlusVibe uses Exchange Online scopes, so Graph scope patching is skipped.
-          </p>
-        )}
+        <p className="mt-1 text-xs text-gray-500">
+          Consent is granted via the popup only; scope patching is disabled.
+        </p>
       </div>
 
       {/* Info banner */}

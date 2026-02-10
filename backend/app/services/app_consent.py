@@ -36,7 +36,7 @@ KNOWN_APPS = {
     "smartlead": {
         "name": "Smartlead.ai",
         "client_id": "5913b6f2-da52-4f3a-b81c-56a99e05e243",
-        "patch_scopes": True,
+        "patch_scopes": False,
     },
     "plusvibe": {
         "name": "PlusVibe",
@@ -46,7 +46,7 @@ KNOWN_APPS = {
     "instantly": {
         "name": "Instantly.ai",
         "client_id": "65ad96b6-fbeb-40b5-b404-2a415d074c97",
-        "patch_scopes": True,
+        "patch_scopes": False,
     },
 }
 
