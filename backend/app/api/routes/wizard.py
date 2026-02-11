@@ -53,6 +53,9 @@ active_jobs = {}
 # Store active Step 4 automation jobs (per batch)
 step4_jobs = {}
 
+# Store Step 8 (Instantly Upload) job progress
+step8_jobs = {}
+
 
 # ============== SCHEMAS ==============
 
@@ -1017,8 +1020,8 @@ async def advance_batch_step(batch_id: UUID, db: AsyncSession = Depends(get_db))
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     
-    # Advance to next step (max step is 7 - Sequencer Prep)
-    if batch.current_step < 7:
+    # Advance to next step (max step is 8 - Instantly Upload)
+    if batch.current_step < 8:
         batch.current_step = batch.current_step + 1
         await db.commit()
     
@@ -1042,8 +1045,8 @@ async def set_batch_step(
         raise HTTPException(status_code=404, detail="Batch not found")
     
     step = request.step
-    if step < 1 or step > 7:
-        raise HTTPException(status_code=400, detail="Step must be between 1 and 7")
+    if step < 1 or step > 8:
+        raise HTTPException(status_code=400, detail="Step must be between 1 and 8")
     
     old_step = batch.current_step
     batch.current_step = step
@@ -1088,8 +1091,8 @@ async def rerun_step(
     if not batch:
         raise HTTPException(status_code=404, detail="Batch not found")
     
-    if step_number < 1 or step_number > 7:
-        raise HTTPException(status_code=400, detail="Step must be between 1 and 7")
+    if step_number < 1 or step_number > 8:
+        raise HTTPException(status_code=400, detail="Step must be between 1 and 8")
     
     result = {"success": True, "step": step_number, "message": "", "reset_count": 0, "force": force}
     
@@ -1300,6 +1303,38 @@ async def rerun_step(
             result["reset_count"] = len(tenants_to_reset)
             result["message"] = f"Reset {len(tenants_to_reset)} tenant(s) for SMTP Auth + {sequencer_name} consent. Use 'Start Step 7' button."
     
+    elif step_number == 8:
+        # Step 8: Instantly Upload - reset mailboxes
+        if force:
+            # FORCE: Reset ALL mailboxes (even those already uploaded)
+            all_mailboxes = await db.execute(
+                select(Mailbox).where(Mailbox.batch_id == batch_id)
+            )
+            mailboxes_to_reset = all_mailboxes.scalars().all()
+            for mailbox in mailboxes_to_reset:
+                mailbox.instantly_uploaded = False
+                mailbox.instantly_uploaded_at = None
+                mailbox.instantly_upload_error = None
+            result["reset_count"] = len(mailboxes_to_reset)
+            result["message"] = f"FORCE RESET: Reset ALL {len(mailboxes_to_reset)} mailbox(es) for Instantly upload. Use 'Start Upload' button."
+            logger.warning(f"FORCE RERUN Step 8: Reset {len(mailboxes_to_reset)} mailboxes including uploaded ones")
+        else:
+            # Normal: Only reset failed mailboxes
+            failed_mailboxes = await db.execute(
+                select(Mailbox).where(
+                    Mailbox.batch_id == batch_id,
+                    Mailbox.instantly_uploaded == False,
+                    Mailbox.instantly_upload_error.isnot(None)
+                )
+            )
+            mailboxes_to_reset = failed_mailboxes.scalars().all()
+            for mailbox in mailboxes_to_reset:
+                mailbox.instantly_upload_error = None
+            result["reset_count"] = len(mailboxes_to_reset)
+            result["message"] = f"Reset {len(mailboxes_to_reset)} failed mailbox(es) for Instantly upload retry. Use 'Retry Failed' button."
+        
+        await db.commit()
+    
     # Update batch to target step
     batch.current_step = step_number
     await db.commit()
@@ -1424,6 +1459,7 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         5: "Email Setup",
         6: "Create Mailboxes",
         7: "Sequencer Prep",
+        8: "Instantly Upload",
     }
     step_name = step_names.get(batch.current_step, "Unknown")
     if batch.status == BatchStatus.COMPLETED:
