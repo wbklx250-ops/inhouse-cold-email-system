@@ -95,5 +95,18 @@ class Mailbox(TimestampUUIDMixin, Base):
         ),
         nullable=False,
     )
+    
+    # Sequencer upload tracking (Instantly.ai)
+    instantly_uploaded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    instantly_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    instantly_upload_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Sequencer upload tracking (Smartlead.ai)
+    smartlead_uploaded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    smartlead_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    smartlead_upload_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
+    # Initial password for mailbox (used by uploaders)
+    initial_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 
     tenant: Mapped[Tenant] = relationship("Tenant", back_populates="mailboxes")

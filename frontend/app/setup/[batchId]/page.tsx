@@ -3,7 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Step7SequencerPrep from "@/components/wizard/Step7SequencerPrep";
-import Step8InstantlyUpload from "@/components/wizard/Step8InstantlyUpload";
+import Step8SequencerUpload from "@/components/wizard/Step8SequencerUpload";
 
 interface WizardStatus {
   batch_id: string;
@@ -231,7 +231,7 @@ export default function BatchWizard() {
             />
           )}
           {activeStep === 8 && (
-            <Step8InstantlyUpload
+            <Step8SequencerUpload
               batchId={batchId}
               onComplete={() => { setActiveStep(9); }}
             />

@@ -6277,3 +6277,234 @@ async def get_upload_status(job_id: str):
         }
     
     return step8_jobs[job_id]
+
+
+# =============================================================================
+# SMARTLEAD UPLOAD ENDPOINTS (Step 8 - Alternative to Instantly)
+# =============================================================================
+
+class SmartleadStartRequest(BaseModel):
+    """Request for starting Smartlead upload."""
+    api_key: str
+    oauth_url: str
+    num_workers: int = 3  # 1-5 parallel browsers
+    headless: bool = True
+    skip_uploaded: bool = True
+    configure_settings: bool = True
+    max_email_per_day: int = 6
+    time_to_wait_in_mins: int = 60
+    total_warmup_per_day: int = 40
+    daily_rampup: int = 1
+    reply_rate_percentage: int = 79
+
+
+@router.get("/batches/{batch_id}/step8/smartlead/status")
+async def get_step8_smartlead_status(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get Step 8 (Smartlead Upload) status for batch."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Count mailboxes
+    mailboxes_total = await db.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    ) or 0
+    
+    mailboxes_uploaded = await db.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.smartlead_uploaded == True
+        )
+    ) or 0
+    
+    mailboxes_failed = await db.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.smartlead_uploaded == False,
+            Mailbox.smartlead_upload_error.isnot(None)
+        )
+    ) or 0
+    
+    mailboxes_pending = mailboxes_total - mailboxes_uploaded - mailboxes_failed
+    
+    # Get job status if running
+    job_id = f"smartlead_{batch_id}"
+    job_status = step8_jobs.get(job_id, {})
+    
+    return {
+        "batch_id": str(batch_id),
+        "batch_name": batch.name,
+        "sequencer": "smartlead",
+        "summary": {
+            "total": mailboxes_total,
+            "uploaded": mailboxes_uploaded,
+            "failed": mailboxes_failed,
+            "pending": mailboxes_pending,
+        },
+        "job": job_status if job_status else None,
+    }
+
+
+@router.post("/batches/{batch_id}/step8/smartlead/start")
+async def start_step8_smartlead_upload(
+    batch_id: UUID,
+    request: SmartleadStartRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Start Step 8: Upload mailboxes to Smartlead via OAuth."""
+    # Validate num_workers
+    if request.num_workers < 1 or request.num_workers > 5:
+        raise HTTPException(400, "num_workers must be between 1 and 5")
+    
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Check if upload already in progress
+    job_id = f"smartlead_{batch_id}"
+    if job_id in step8_jobs and step8_jobs[job_id].get("status") == "running":
+        return {
+            "success": False,
+            "message": "Smartlead upload already in progress for this batch",
+            "job_id": job_id,
+            "started_at": step8_jobs[job_id].get("started_at")
+        }
+    
+    # Count eligible mailboxes
+    mailboxes_query = select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    if request.skip_uploaded:
+        mailboxes_query = mailboxes_query.where(Mailbox.smartlead_uploaded == False)
+    
+    eligible_count = await db.scalar(mailboxes_query) or 0
+    
+    if eligible_count == 0:
+        return {
+            "success": False,
+            "message": "No mailboxes to upload (all already uploaded or none exist)",
+            "eligible_count": 0
+        }
+    
+    # Initialize job tracking
+    step8_jobs[job_id] = {
+        "status": "running",
+        "sequencer": "smartlead",
+        "batch_id": str(batch_id),
+        "batch_name": batch.name,
+        "started_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "total": eligible_count,
+        "uploaded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "settings_configured": 0,
+        "warmup_configured": 0,
+        "current_mailbox": None,
+        "error": None,
+        "num_workers": request.num_workers,
+        "headless": request.headless,
+        "errors": []
+    }
+    
+    # Run in background
+    async def run_upload():
+        try:
+            from app.services.smartlead import run_smartlead_upload_for_batch
+            
+            summary = await run_smartlead_upload_for_batch(
+                batch_id=str(batch_id),
+                api_key=request.api_key,
+                oauth_url=request.oauth_url,
+                num_workers=request.num_workers,
+                headless=request.headless,
+                skip_uploaded=request.skip_uploaded,
+                configure_settings=request.configure_settings,
+                sending_settings={
+                    "max_per_day": request.max_email_per_day,
+                    "wait_mins": request.time_to_wait_in_mins,
+                    "tracking_url": ""
+                },
+                warmup_settings={
+                    "per_day": request.total_warmup_per_day,
+                    "rampup": request.daily_rampup,
+                    "reply_rate": request.reply_rate_percentage
+                }
+            )
+            
+            step8_jobs[job_id]["status"] = "completed"
+            step8_jobs[job_id]["uploaded"] = summary["uploaded"]
+            step8_jobs[job_id]["failed"] = summary["failed"]
+            step8_jobs[job_id]["skipped"] = summary.get("skipped", 0)
+            step8_jobs[job_id]["settings_configured"] = summary.get("settings_configured", 0)
+            step8_jobs[job_id]["warmup_configured"] = summary.get("warmup_configured", 0)
+            step8_jobs[job_id]["errors"] = summary.get("errors", [])
+            step8_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            
+            logger.info(f"Smartlead Step 8 upload completed for batch {batch_id}: {summary['uploaded']}/{summary['total']} uploaded")
+            
+        except Exception as e:
+            step8_jobs[job_id]["status"] = "failed"
+            step8_jobs[job_id]["error"] = str(e)
+            step8_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            logger.error(f"Smartlead Step 8 upload failed for batch {batch_id}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+    
+    background_tasks.add_task(run_upload)
+    
+    logger.info(f"Smartlead Step 8 upload started for batch {batch_id}: {eligible_count} mailboxes, {request.num_workers} workers")
+    
+    return {
+        "success": True,
+        "message": f"Started Smartlead upload for {eligible_count} mailbox(es)",
+        "job_id": job_id,
+        "eligible_count": eligible_count,
+        "num_workers": request.num_workers,
+        "headless": request.headless,
+        "skip_uploaded": request.skip_uploaded,
+        "estimated_minutes": round(eligible_count / request.num_workers * 0.5)  # ~30s per mailbox
+    }
+
+
+@router.post("/batches/{batch_id}/step8/smartlead/retry-failed")
+async def retry_step8_smartlead_failed(
+    batch_id: UUID,
+    request: SmartleadStartRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry Smartlead Step 8 upload for failed mailboxes only."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+    
+    # Find failed mailboxes
+    failed_result = await db.execute(
+        select(Mailbox).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.smartlead_uploaded == False,
+            Mailbox.smartlead_upload_error.isnot(None)
+        )
+    )
+    failed_mailboxes = failed_result.scalars().all()
+    
+    if not failed_mailboxes:
+        return {
+            "success": False,
+            "message": "No failed mailboxes to retry",
+            "failed_count": 0
+        }
+    
+    # Clear errors
+    for mailbox in failed_mailboxes:
+        mailbox.smartlead_upload_error = None
+    await db.commit()
+    
+    logger.info(f"Retrying Smartlead Step 8 for {len(failed_mailboxes)} failed mailboxes in batch {batch_id}")
+    
+    # Use same start logic but with skip_uploaded=True to only process these
+    request.skip_uploaded = True
+    return await start_step8_smartlead_upload(batch_id, request, background_tasks, db)
