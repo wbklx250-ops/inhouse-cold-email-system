@@ -15,6 +15,7 @@ const navigation: NavItem[] = [
   { name: "Dashboard", href: "/", icon: "📊" },
   { name: "Domains", href: "/domains", icon: "🌐" },
   { name: "Tenants", href: "/tenants", icon: "🏢" },
+  { name: "Instantly Uploader", href: "/instantly", icon: "⚡" },
 ];
 
 interface SidebarProps {
