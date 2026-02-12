@@ -3,6 +3,7 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Step7SequencerPrep from "@/components/wizard/Step7SequencerPrep";
+import Step8InstantlyUpload from "@/components/wizard/Step8InstantlyUpload";
 
 interface WizardStatus {
   batch_id: string;
@@ -152,7 +153,7 @@ export default function BatchWizard() {
           </button>
           <h1 className="text-2xl font-bold text-gray-900">{status?.batch_name}</h1>
           <p className="text-gray-600 mt-1">
-            Step {activeStep > 7 ? 7 : activeStep} of 7 • {status?.status === "completed" ? "Completed" : "In Progress"}
+            Step {activeStep > 8 ? 8 : activeStep} of 8 • {status?.status === "completed" ? "Completed" : "In Progress"}
           </p>
         </div>
       </div>
@@ -230,6 +231,12 @@ export default function BatchWizard() {
             />
           )}
           {activeStep === 8 && (
+            <Step8InstantlyUpload
+              batchId={batchId}
+              onComplete={() => { setActiveStep(9); }}
+            />
+          )}
+          {activeStep === 9 && (
             <StepComplete 
               batchId={batchId} 
               status={status} 
