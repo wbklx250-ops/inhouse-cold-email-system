@@ -48,6 +48,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [instantlyEmail, setInstantlyEmail] = useState("");
   const [instantlyPassword, setInstantlyPassword] = useState("");
+  const [instantlyApiKey, setInstantlyApiKey] = useState("");
   
   // Smartlead configuration state
   const [smartleadApiKey, setSmartleadApiKey] = useState("");
@@ -185,6 +186,11 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         } else {
           payload.instantly_email = email;
           payload.instantly_password = password;
+        }
+
+        // Add API key if provided (for verification)
+        if (instantlyApiKey) {
+          payload.instantly_api_key = instantlyApiKey;
         }
 
         const res = await fetch(
@@ -512,6 +518,25 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
                 </div>
               </div>
             )}
+          </div>
+
+          {/* Instantly API Key (Optional but recommended for verification) */}
+          <div className="pt-4 border-t">
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              Instantly API Key <span className="text-gray-500 font-normal">(Optional - for upload verification)</span>
+            </label>
+            <input
+              type="text"
+              value={instantlyApiKey}
+              onChange={(e) => setInstantlyApiKey(e.target.value)}
+              placeholder="sk_..."
+              className="w-full px-3 py-2 border rounded-lg font-mono text-sm"
+              disabled={isRunning}
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              Get your API key from Instantly → Settings → API & Webhooks → API Key. 
+              This enables real-time verification that accounts were successfully added (recommended).
+            </p>
           </div>
         </div>
       )}

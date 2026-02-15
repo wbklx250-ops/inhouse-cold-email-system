@@ -3,7 +3,8 @@ Instantly.ai Uploader Service
 Automates uploading mailboxes to Instantly.ai via Selenium OAuth flow
 
 Enhanced with robust selector fallbacks, account existence checking,
-session clearing, and improved OAuth flow handling.
+session clearing, improved OAuth flow handling, API verification,
+crash recovery, and preventive browser restarts.
 """
 import asyncio
 import logging
@@ -14,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import List, Dict, Optional, Any
 
+import requests as http_requests
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -22,7 +24,8 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import (
     TimeoutException, WebDriverException, NoSuchElementException,
-    ElementClickInterceptedException, NoSuchWindowException
+    ElementClickInterceptedException, NoSuchWindowException,
+    InvalidSessionIdException
 )
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,57 +38,243 @@ from app.db.session import async_session_factory
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Instantly API Client
+# ---------------------------------------------------------------------------
+
+class InstantlyAPI:
+    """Thin wrapper around Instantly API V2 for account verification."""
+
+    BASE = "https://api.instantly.ai/api/v2"
+
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.session = http_requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        })
+        # Cache of known accounts (populated on first load)
+        self._known_emails: set = set()
+        self._cache_loaded = False
+
+    def test_connection(self) -> bool:
+        """Test if API key works."""
+        try:
+            r = self.session.get(f"{self.BASE}/accounts", params={"limit": 1}, timeout=10)
+            return r.status_code == 200
+        except Exception:
+            return False
+
+    def load_all_accounts(self) -> set:
+        """Fetch ALL account emails from Instantly (paginated).
+        Returns a set of lowercase email addresses."""
+        emails = set()
+        starting_after = None
+
+        while True:
+            params = {"limit": 100}
+            if starting_after:
+                params["starting_after"] = starting_after
+
+            try:
+                r = self.session.get(f"{self.BASE}/accounts", params=params, timeout=15)
+                if r.status_code != 200:
+                    break
+                data = r.json()
+                items = data.get("items", [])
+                if not items:
+                    break
+
+                for item in items:
+                    email = item.get("email", "").strip().lower()
+                    if email:
+                        emails.add(email)
+
+                next_after = data.get("next_starting_after")
+                if not next_after or next_after == starting_after:
+                    break
+                starting_after = next_after
+            except Exception:
+                break
+
+        self._known_emails = emails
+        self._cache_loaded = True
+        return emails
+
+    def account_exists(self, email: str) -> bool:
+        """Check if a specific account exists in Instantly.
+        Uses cache first, then does a targeted search if not cached."""
+        email_lower = email.strip().lower()
+
+        # Check cache
+        if self._cache_loaded and email_lower in self._known_emails:
+            return True
+
+        # Targeted search via API
+        try:
+            r = self.session.get(
+                f"{self.BASE}/accounts/{email}",
+                timeout=10,
+            )
+            if r.status_code == 200:
+                self._known_emails.add(email_lower)
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def verify_account(self, email: str, max_wait=15, poll_interval=3) -> bool:
+        """Wait and poll for account to appear in Instantly after OAuth.
+        Returns True if confirmed, False if not found after max_wait seconds."""
+        email_lower = email.strip().lower()
+
+        elapsed = 0
+        while elapsed < max_wait:
+            try:
+                r = self.session.get(
+                    f"{self.BASE}/accounts/{email}",
+                    timeout=10,
+                )
+                if r.status_code == 200:
+                    self._known_emails.add(email_lower)
+                    return True
+            except Exception:
+                pass
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        return False
+
+
 class InstantlyUploader:
     """Handles Selenium automation for uploading mailboxes to Instantly.ai"""
+    
+    RESTART_EVERY_N = 30  # Preventive browser restart after N accounts
     
     def __init__(
         self,
         instantly_email: str,
         instantly_password: str,
+        api: Optional[InstantlyAPI] = None,
         headless: bool = True,
         worker_id: int = 0
     ):
         self.instantly_email = instantly_email
         self.instantly_password = instantly_password
+        self.api = api
         self.headless = headless
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
         self.wait: Optional[WebDriverWait] = None
+        self._accounts_since_restart = 0
         
-    def setup_driver(self):
+    def setup_driver(self) -> bool:
         """Initialize Chrome WebDriver with appropriate options"""
-        chrome_options = Options()
-        chrome_options.add_argument("--disable-popup-blocking")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
-        chrome_options.add_experimental_option('useAutomationExtension', False)
+        try:
+            chrome_options = Options()
+            chrome_options.add_argument("--disable-popup-blocking")
+            chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+            chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+            chrome_options.add_experimental_option('useAutomationExtension', False)
+            
+            # Add options to improve stability
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--disable-background-timer-throttling")
+            chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+            chrome_options.add_argument("--disable-renderer-backgrounding")
+            chrome_options.add_argument("--window-size=1920,1080")
+            
+            # For parallel processing, offset window positions
+            if self.worker_id and isinstance(self.worker_id, int):
+                offset = self.worker_id * 50
+                chrome_options.add_argument(f"--window-position={offset},{offset}")
+            
+            if self.headless:
+                chrome_options.add_argument("--headless=new")
+            
+            self.driver = webdriver.Chrome(options=chrome_options)
+            self.driver.execute_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            self.driver.set_page_load_timeout(60)
+            self.wait = WebDriverWait(self.driver, 30)
+            self._accounts_since_restart = 0
+            
+            logger.info(f"[Worker {self.worker_id}] Chrome driver initialized (headless={self.headless})")
+            return True
+        except Exception as e:
+            logger.error(f"[Worker {self.worker_id}] Chrome setup failed: {e}")
+            return False
+    
+    def is_driver_alive(self) -> bool:
+        """Check if browser driver is still responsive"""
+        try:
+            _ = self.driver.current_url
+            return True
+        except (InvalidSessionIdException, WebDriverException):
+            return False
+        except Exception:
+            return False
+    
+    def restart_browser(self) -> bool:
+        """Restart browser and re-login to Instantly"""
+        logger.info(f"[Worker {self.worker_id}] Restarting browser...")
+        try:
+            self.driver.quit()
+        except Exception:
+            pass
+        self.driver = None
         
-        # Add options to improve stability
-        chrome_options.add_argument("--disable-extensions")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-gpu")
-        chrome_options.add_argument("--disable-background-timer-throttling")
-        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
-        chrome_options.add_argument("--disable-renderer-backgrounding")
-        chrome_options.add_argument("--window-size=1920,1080")
+        if not self.setup_driver():
+            return False
+        if not self.login_to_instantly():
+            return False
         
-        # For parallel processing, offset window positions
-        if self.worker_id and isinstance(self.worker_id, int):
-            offset = self.worker_id * 50
-            chrome_options.add_argument(f"--window-position={offset},{offset}")
-        
-        if self.headless:
-            chrome_options.add_argument("--headless=new")
-        
-        self.driver = webdriver.Chrome(options=chrome_options)
-        self.driver.execute_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-        )
-        self.driver.set_page_load_timeout(60)
-        self.wait = WebDriverWait(self.driver, 30)
-        
-        logger.info(f"[Worker {self.worker_id}] Chrome driver initialized (headless={self.headless})")
+        logger.info(f"[Worker {self.worker_id}] Browser restarted successfully")
+        return True
+    
+    def clear_microsoft_cookies(self):
+        """Clear ONLY Microsoft cookies, preserving Instantly session"""
+        try:
+            cookies = self.driver.get_cookies()
+            ms_domains = [
+                "login.microsoftonline.com", "login.live.com", "microsoft.com",
+                "microsoftonline.com", "office.com", "outlook.com", "live.com",
+            ]
+            deleted = 0
+            for cookie in cookies:
+                domain = cookie.get("domain", "").lstrip(".")
+                if any(ms in domain for ms in ms_domains):
+                    try:
+                        self.driver.delete_cookie(cookie["name"])
+                        deleted += 1
+                    except Exception:
+                        pass
+            if deleted > 0:
+                logger.info(f"[Worker {self.worker_id}] Cleared {deleted} Microsoft cookies")
+        except Exception:
+            pass
+
+        # Close leftover popups
+        try:
+            windows = self.driver.window_handles
+            if len(windows) > 1:
+                main = windows[0]
+                for w in windows[1:]:
+                    try:
+                        self.driver.switch_to.window(w)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                self.driver.switch_to.window(main)
+        except Exception:
+            pass
         
     def random_delay(self, min_sec: float = 1.0, max_sec: float = 3.0):
         """Add random delay to mimic human behavior"""
@@ -506,6 +695,17 @@ class InstantlyUploader:
             
             self.random_delay(2, 3)
             
+            # Check for "account doesn't exist" error
+            try:
+                err = self.driver.find_element(
+                    By.XPATH, "//*[contains(text(), \"doesn't exist\") or contains(text(), 'account doesn')]"
+                )
+                if err:
+                    self._close_popups_safe()
+                    return {"success": False, "error": "Account doesn't exist in Microsoft"}
+            except NoSuchElementException:
+                pass
+            
             # Step 2: Enter password with multiple selector fallbacks
             logger.info(f"[Worker {self.worker_id}] Entering password...")
             
@@ -554,6 +754,17 @@ class InstantlyUploader:
                 logger.info(f"[Worker {self.worker_id}] Password entered, clicked Sign in")
             
             self.random_delay(3, 5)
+            
+            # Check for wrong password or blocked sign-in
+            try:
+                err = self.driver.find_element(
+                    By.XPATH, "//*[contains(text(), 'password is incorrect') or contains(text(), 'sign-in was blocked')]"
+                )
+                if err:
+                    self._close_popups_safe()
+                    return {"success": False, "error": "Wrong password or sign-in blocked"}
+            except NoSuchElementException:
+                pass
             
             # Step 3: Handle "Stay signed in?" prompt - Click "No"
             logger.info(f"[Worker {self.worker_id}] Checking for 'Stay signed in?' prompt...")
@@ -711,6 +922,24 @@ class InstantlyUploader:
             except:
                 pass
             return {"success": False, "error": error_msg}
+    
+    def _close_popups_safe(self):
+        """Safely close popup windows and return to main window"""
+        try:
+            windows = self.driver.window_handles
+            if len(windows) > 1:
+                main = windows[0]
+                for w in windows[1:]:
+                    try:
+                        self.driver.switch_to.window(w)
+                        self.driver.close()
+                    except Exception:
+                        pass
+                self.driver.switch_to.window(main)
+            elif windows:
+                self.driver.switch_to.window(windows[0])
+        except Exception:
+            pass
             
     def cleanup(self):
         """Clean up WebDriver resources"""
@@ -737,21 +966,53 @@ def process_mailbox_sync(
         max_retries: Maximum retry attempts
         
     Returns:
-        Dict with 'mailbox_id', 'success', 'error', 'retries'
+        Dict with 'mailbox_id', 'success', 'error', 'retries', 'verified'
     """
     mailbox_id = mailbox_data["id"]
     email = mailbox_data["email"]
     password = mailbox_data["password"]
     
+    # Pre-check: Skip if account already exists (API) 
+    if uploader.api and uploader.api.account_exists(email):
+        logger.info(f"[Worker {uploader.worker_id}] ⊘ {email} — already in Instantly (API), skipping")
+        return {
+            "mailbox_id": mailbox_id,
+            "success": True,
+            "error": None,
+            "retries": 0,
+            "verified": True,
+            "skipped": True
+        }
+    
+    # Try OAuth upload with retries
     for attempt in range(max_retries + 1):
         try:
             result = uploader.add_microsoft_account(email, password, mailbox_id)
             if result["success"]:
+                # Verify via API if available
+                verified = True
+                if uploader.api:
+                    logger.info(f"[Worker {uploader.worker_id}] OAuth done for {email} — verifying via API...")
+                    verified = uploader.api.verify_account(email, max_wait=15, poll_interval=3)
+                    
+                    if verified:
+                        logger.info(f"[Worker {uploader.worker_id}] ✓ {email} — API CONFIRMED")
+                    else:
+                        logger.warning(f"[Worker {uploader.worker_id}] ⚠ {email} — OAuth passed but NOT found in API")
+                        return {
+                            "mailbox_id": mailbox_id,
+                            "success": False,
+                            "error": "OAuth completed but account not found in Instantly API",
+                            "retries": attempt,
+                            "verified": False
+                        }
+                
                 return {
                     "mailbox_id": mailbox_id,
                     "success": True,
                     "error": None,
-                    "retries": attempt
+                    "retries": attempt,
+                    "verified": verified
                 }
             else:
                 if attempt < max_retries:
@@ -763,7 +1024,8 @@ def process_mailbox_sync(
                         "mailbox_id": mailbox_id,
                         "success": False,
                         "error": result["error"],
-                        "retries": attempt
+                        "retries": attempt,
+                        "verified": False
                     }
         except Exception as e:
             error_msg = f"Exception during upload: {str(e)}"
@@ -775,7 +1037,8 @@ def process_mailbox_sync(
                     "mailbox_id": mailbox_id,
                     "success": False,
                     "error": error_msg,
-                    "retries": attempt
+                    "retries": attempt,
+                    "verified": False
                 }
 
 
@@ -783,6 +1046,7 @@ async def run_instantly_upload_for_batch(
     batch_id: str,
     instantly_email: str,
     instantly_password: str,
+    instantly_api_key: Optional[str] = None,
     num_workers: int = 3,
     headless: bool = True,
     skip_uploaded: bool = True
@@ -795,6 +1059,7 @@ async def run_instantly_upload_for_batch(
         batch_id: SetupBatch UUID
         instantly_email: Instantly.ai account email
         instantly_password: Instantly.ai account password
+        instantly_api_key: Instantly.ai API key for verification (optional)
         num_workers: Number of parallel browser workers (1-5)
         headless: Run browsers in headless mode
         skip_uploaded: Skip mailboxes already uploaded
@@ -803,6 +1068,19 @@ async def run_instantly_upload_for_batch(
         Dict with summary: total, uploaded, failed, skipped, errors
     """
     logger.info(f"Starting Instantly upload for batch {batch_id} with {num_workers} workers")
+    
+    # Initialize API client if key provided
+    api = None
+    if instantly_api_key:
+        api = InstantlyAPI(instantly_api_key)
+        if api.test_connection():
+            logger.info(f"Instantly API connected - verification enabled")
+            # Pre-load all existing accounts for faster checking
+            existing = api.load_all_accounts()
+            logger.info(f"Loaded {len(existing)} existing accounts from Instantly")
+        else:
+            logger.warning(f"Instantly API test failed - proceeding without verification")
+            api = None
     
     # Fetch mailboxes from database
     async with async_session_factory() as session:
@@ -855,6 +1133,7 @@ async def run_instantly_upload_for_batch(
             uploader = InstantlyUploader(
                 instantly_email=instantly_email,
                 instantly_password=instantly_password,
+                api=api,  # Pass API client for verification
                 headless=headless,
                 worker_id=i
             )

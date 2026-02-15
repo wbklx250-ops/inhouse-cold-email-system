@@ -5714,6 +5714,7 @@ class Step8StartRequest(BaseModel):
     """Request for starting Step 8 upload."""
     instantly_email: str
     instantly_password: str
+    instantly_api_key: Optional[str] = None  # API key for verification (optional)
     num_workers: int = 3  # 1-5 parallel browsers
     headless: bool = True  # Headless mode for Railway
     skip_uploaded: bool = True  # Skip already-uploaded mailboxes
@@ -5887,6 +5888,7 @@ async def start_step8_upload(
                 batch_id=batch_id,
                 instantly_email=request.instantly_email,
                 instantly_password=request.instantly_password,
+                instantly_api_key=request.instantly_api_key,  # For API verification
                 num_workers=request.num_workers,
                 headless=request.headless,
                 skip_uploaded=request.skip_uploaded
