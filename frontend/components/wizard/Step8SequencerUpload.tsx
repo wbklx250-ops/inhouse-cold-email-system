@@ -25,6 +25,7 @@ interface InstantlyAccount {
   id: string;
   label: string;
   email: string;
+  has_api_key: boolean;
   is_default: boolean;
   created_at: string;
 }
@@ -61,8 +62,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   const [replyRate, setReplyRate] = useState(79);
   
   // Shared configuration
-  const [numWorkers, setNumWorkers] = useState(3);
-  const [headless, setHeadless] = useState(true);
+  const [numWorkers, setNumWorkers] = useState(2);
   const [skipUploaded, setSkipUploaded] = useState(true);
 
   // Account management state
@@ -70,6 +70,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   const [newAccountLabel, setNewAccountLabel] = useState("");
   const [newAccountEmail, setNewAccountEmail] = useState("");
   const [newAccountPassword, setNewAccountPassword] = useState("");
+  const [newAccountApiKey, setNewAccountApiKey] = useState("");
   const [savingAccount, setSavingAccount] = useState(false);
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -130,6 +131,16 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
     }
   }, [API_BASE, selectedAccountId]);
 
+  // Load Smartlead creds from localStorage on mount
+  useEffect(() => {
+    try {
+      const savedApiKey = localStorage.getItem("smartlead_api_key");
+      const savedOAuthUrl = localStorage.getItem("smartlead_oauth_url");
+      if (savedApiKey) setSmartleadApiKey(savedApiKey);
+      if (savedOAuthUrl) setSmartleadOAuthUrl(savedOAuthUrl);
+    } catch (_) {}
+  }, []);
+
   useEffect(() => {
     fetchStatus();
     if (sequencer === "instantly") {
@@ -177,7 +188,6 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       try {
         const payload: any = {
           num_workers: numWorkers,
-          headless: headless,
           skip_uploaded: skipUploaded,
         };
 
@@ -219,11 +229,16 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
 
       setIsRunning(true);
       try {
+        // Save Smartlead creds to localStorage for persistence
+        try {
+          localStorage.setItem("smartlead_api_key", smartleadApiKey);
+          localStorage.setItem("smartlead_oauth_url", smartleadOAuthUrl);
+        } catch (_) {}
+
         const payload = {
           api_key: smartleadApiKey,
           oauth_url: smartleadOAuthUrl,
           num_workers: numWorkers,
-          headless: headless,
           skip_uploaded: skipUploaded,
           configure_settings: configureSettings,
           max_email_per_day: maxEmailPerDay,
@@ -289,6 +304,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
           label: newAccountLabel,
           email: newAccountEmail,
           password: newAccountPassword,
+          api_key: newAccountApiKey || undefined,
           is_default: accounts.length === 0,
         }),
       });
@@ -301,6 +317,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         setNewAccountLabel("");
         setNewAccountEmail("");
         setNewAccountPassword("");
+        setNewAccountApiKey("");
       } else {
         setError(data.message || "Failed to save account");
       }
@@ -464,6 +481,18 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
                         className="w-full px-3 py-2 border rounded-lg"
                       />
                     </div>
+                    <div>
+                      <label className="block text-xs font-medium text-gray-700 mb-1">
+                        API Key <span className="text-gray-400 font-normal">(optional, for verification)</span>
+                      </label>
+                      <input
+                        type="text"
+                        value={newAccountApiKey}
+                        onChange={(e) => setNewAccountApiKey(e.target.value)}
+                        placeholder="sk_..."
+                        className="w-full px-3 py-2 border rounded-lg font-mono text-sm"
+                      />
+                    </div>
                     <button
                       onClick={saveNewAccount}
                       disabled={savingAccount}
@@ -474,13 +503,30 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
                   </div>
                 )}
 
+                {/* Selected account API key indicator */}
+                {selectedAccountId && (() => {
+                  const sel = accounts.find(a => a.id === selectedAccountId);
+                  return sel?.has_api_key ? (
+                    <p className="text-xs text-green-600 mt-1">
+                      ✓ Saved API key will be used for upload verification
+                    </p>
+                  ) : null;
+                })()}
+
                 {/* Saved accounts list with delete option */}
                 {accounts.length > 0 && !showAddAccount && (
                   <div className="mt-3 space-y-2">
                     <p className="text-xs font-medium text-gray-700">Saved Accounts:</p>
                     {accounts.map((acc) => (
                       <div key={acc.id} className="flex items-center justify-between text-sm p-2 bg-gray-50 rounded">
-                        <span>{acc.label} - {acc.email}</span>
+                        <div className="flex items-center gap-2">
+                          <span>{acc.label} - {acc.email}</span>
+                          {acc.has_api_key && (
+                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                              🔑 API Key
+                            </span>
+                          )}
+                        </div>
                         <button
                           onClick={() => deleteAccount(acc.id)}
                           className="text-red-600 hover:text-red-700 text-xs"
@@ -668,27 +714,16 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
           <input
             type="range"
             min="1"
-            max="5"
+            max="3"
             value={numWorkers}
             onChange={(e) => setNumWorkers(parseInt(e.target.value))}
             disabled={isRunning}
             className="w-full"
           />
           <p className="text-xs text-gray-500 mt-1">
-            Higher values = faster, but may cause rate limiting
+            Each worker uses ~200MB RAM. 2 recommended for Railway, 3 max.
           </p>
         </div>
-
-        <label className="flex items-center">
-          <input
-            type="checkbox"
-            checked={headless}
-            onChange={(e) => setHeadless(e.target.checked)}
-            disabled={isRunning}
-            className="mr-2"
-          />
-          <span className="text-sm text-gray-700">Run in headless mode (no browser UI)</span>
-        </label>
 
         <label className="flex items-center">
           <input

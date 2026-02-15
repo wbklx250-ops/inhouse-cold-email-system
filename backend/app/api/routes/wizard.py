@@ -5716,8 +5716,7 @@ class Step8StartRequest(BaseModel):
     instantly_email: Optional[str] = None
     instantly_password: Optional[str] = None
     instantly_api_key: Optional[str] = None  # API key for verification (optional)
-    num_workers: int = 3  # 1-5 parallel browsers
-    headless: bool = True  # Headless mode for Railway
+    num_workers: int = 2  # 1-3 parallel browsers (2 recommended for Railway)
     skip_uploaded: bool = True  # Skip already-uploaded mailboxes
 
 
@@ -5744,8 +5743,8 @@ class MultiUploadRequest(BaseModel):
     batch_ids: List[UUID]
     instantly_email: str
     instantly_password: str
-    num_workers: int = 3
-    headless: bool = True
+    instantly_api_key: Optional[str] = None
+    num_workers: int = 2
     skip_uploaded: bool = True
 
 
@@ -5849,6 +5848,11 @@ async def start_step8_upload(
         instantly_email = account.email
         instantly_password = account.password
         
+        # Auto-use saved API key if not explicitly provided
+        if not request.instantly_api_key and account.api_key:
+            request.instantly_api_key = account.api_key
+            logger.info(f"Using saved API key from account: {account.label}")
+        
         # Update last_used_at
         account.last_used_at = datetime.utcnow()
         await db.commit()
@@ -5904,7 +5908,6 @@ async def start_step8_upload(
         "current_mailbox": None,
         "error": None,
         "num_workers": request.num_workers,
-        "headless": request.headless,
         "errors": []
     }
     
@@ -5919,7 +5922,6 @@ async def start_step8_upload(
                 instantly_password=instantly_password,
                 instantly_api_key=request.instantly_api_key,  # For API verification
                 num_workers=request.num_workers,
-                headless=request.headless,
                 skip_uploaded=request.skip_uploaded
             )
             
@@ -5950,7 +5952,6 @@ async def start_step8_upload(
         "job_id": job_id,
         "eligible_count": eligible_count,
         "num_workers": request.num_workers,
-        "headless": request.headless,
         "skip_uploaded": request.skip_uploaded,
         "estimated_minutes": round(eligible_count / request.num_workers * 0.5)  # ~30s per mailbox
     }
@@ -6266,8 +6267,8 @@ async def upload_multiple_batches(
                     batch_id=batch_id,
                     instantly_email=request.instantly_email,
                     instantly_password=request.instantly_password,
+                    instantly_api_key=request.instantly_api_key,
                     num_workers=request.num_workers,
-                    headless=request.headless,
                     skip_uploaded=request.skip_uploaded
                 )
                 
@@ -6318,8 +6319,7 @@ class SmartleadStartRequest(BaseModel):
     """Request for starting Smartlead upload."""
     api_key: str
     oauth_url: str
-    num_workers: int = 3  # 1-5 parallel browsers
-    headless: bool = True
+    num_workers: int = 2  # 1-3 parallel browsers
     skip_uploaded: bool = True
     configure_settings: bool = True
     max_email_per_day: int = 6
@@ -6436,7 +6436,6 @@ async def start_step8_smartlead_upload(
         "current_mailbox": None,
         "error": None,
         "num_workers": request.num_workers,
-        "headless": request.headless,
         "errors": []
     }
     
@@ -6450,7 +6449,6 @@ async def start_step8_smartlead_upload(
                 api_key=request.api_key,
                 oauth_url=request.oauth_url,
                 num_workers=request.num_workers,
-                headless=request.headless,
                 skip_uploaded=request.skip_uploaded,
                 configure_settings=request.configure_settings,
                 sending_settings={
@@ -6494,7 +6492,6 @@ async def start_step8_smartlead_upload(
         "job_id": job_id,
         "eligible_count": eligible_count,
         "num_workers": request.num_workers,
-        "headless": request.headless,
         "skip_uploaded": request.skip_uploaded,
         "estimated_minutes": round(eligible_count / request.num_workers * 0.5)  # ~30s per mailbox
     }

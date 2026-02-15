@@ -159,13 +159,11 @@ class InstantlyUploader:
         instantly_email: str,
         instantly_password: str,
         api: Optional[InstantlyAPI] = None,
-        headless: bool = True,
         worker_id: int = 0
     ):
         self.instantly_email = instantly_email
         self.instantly_password = instantly_password
         self.api = api
-        self.headless = headless
         self.worker_id = worker_id
         self.driver: Optional[webdriver.Chrome] = None
         self.wait: Optional[WebDriverWait] = None
@@ -195,8 +193,8 @@ class InstantlyUploader:
                 offset = self.worker_id * 50
                 chrome_options.add_argument(f"--window-position={offset},{offset}")
             
-            if self.headless:
-                chrome_options.add_argument("--headless=new")
+            # Always run headless (deployed to Railway)
+            chrome_options.add_argument("--headless=new")
             
             self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.execute_script(
@@ -206,7 +204,7 @@ class InstantlyUploader:
             self.wait = WebDriverWait(self.driver, 30)
             self._accounts_since_restart = 0
             
-            logger.info(f"[Worker {self.worker_id}] Chrome driver initialized (headless={self.headless})")
+            logger.info(f"[Worker {self.worker_id}] Chrome driver initialized (headless=True)")
             return True
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] Chrome setup failed: {e}")
@@ -1047,26 +1045,31 @@ async def run_instantly_upload_for_batch(
     instantly_email: str,
     instantly_password: str,
     instantly_api_key: Optional[str] = None,
-    num_workers: int = 3,
-    headless: bool = True,
-    skip_uploaded: bool = True
+    num_workers: int = 2,
+    skip_uploaded: bool = True,
+    batch_retry_rounds: int = 3
 ) -> Dict[str, Any]:
     """
     Main async function to upload all mailboxes in a batch to Instantly.ai
-    Uses parallel browser workers for faster processing
+    Uses parallel browser workers for faster processing.
+    
+    After the main upload pass, automatically retries failed mailboxes
+    up to batch_retry_rounds times to handle transient failures.
     
     Args:
         batch_id: SetupBatch UUID
         instantly_email: Instantly.ai account email
         instantly_password: Instantly.ai account password
         instantly_api_key: Instantly.ai API key for verification (optional)
-        num_workers: Number of parallel browser workers (1-5)
-        headless: Run browsers in headless mode
+        num_workers: Number of parallel browser workers (1-3, default 2)
         skip_uploaded: Skip mailboxes already uploaded
+        batch_retry_rounds: Number of retry rounds for failed uploads (default 3)
         
     Returns:
         Dict with summary: total, uploaded, failed, skipped, errors
     """
+    # Cap workers at 3 for Railway stability
+    num_workers = min(num_workers, 3)
     logger.info(f"Starting Instantly upload for batch {batch_id} with {num_workers} workers")
     
     # Initialize API client if key provided
@@ -1121,94 +1124,159 @@ async def run_instantly_upload_for_batch(
     
     logger.info(f"Found {len(mailbox_list)} mailboxes to upload")
     
-    # Run parallel upload using ThreadPoolExecutor
-    uploaded_count = 0
-    failed_count = 0
-    errors = []
-    
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
-        # Create one uploader per worker
-        uploaders = []
-        for i in range(num_workers):
-            uploader = InstantlyUploader(
-                instantly_email=instantly_email,
-                instantly_password=instantly_password,
-                api=api,  # Pass API client for verification
-                headless=headless,
-                worker_id=i
-            )
-            uploader.setup_driver()
-            
-            # Login to Instantly
-            if not uploader.login_to_instantly():
-                logger.error(f"Worker {i} failed to login, skipping")
-                uploader.cleanup()
-                continue
-                
-            uploaders.append(uploader)
-        
-        if not uploaders:
-            return {
-                "error": "All workers failed to login to Instantly",
-                "total": len(mailbox_list),
-                "uploaded": 0,
-                "failed": len(mailbox_list),
-                "skipped": 0,
-                "errors": ["All workers failed to login"]
-            }
-        
-        try:
-            # Submit tasks to executor
-            futures = []
-            for i, mailbox_data in enumerate(mailbox_list):
-                uploader = uploaders[i % len(uploaders)]
-                future = executor.submit(process_mailbox_sync, uploader, mailbox_data)
-                futures.append(future)
-            
-            # Process results as they complete
-            for future in as_completed(futures):
-                result = future.result()
-                
-                # Update database
-                async with async_session_factory() as session:
-                    if result["success"]:
-                        await session.execute(
-                            update(Mailbox)
-                            .where(Mailbox.id == result["mailbox_id"])
-                            .values(
-                                instantly_uploaded=True,
-                                instantly_uploaded_at=datetime.utcnow(),
-                                instantly_upload_error=None
+    # ---------- helper: single upload pass over a list of mailbox dicts ----------
+    async def _run_upload_pass(
+        mb_list: List[Dict[str, Any]],
+        pass_label: str = "main",
+    ) -> Dict[str, Any]:
+        """Run one full upload pass. Returns {uploaded, failed, errors, failed_mailboxes}."""
+        uploaded = 0
+        failed = 0
+        errs: List[str] = []
+        failed_mbs: List[Dict[str, Any]] = []
+
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Create one uploader per worker
+            uploaders: List[InstantlyUploader] = []
+            for i in range(num_workers):
+                upl = InstantlyUploader(
+                    instantly_email=instantly_email,
+                    instantly_password=instantly_password,
+                    api=api,
+                    worker_id=i,
+                )
+                if not upl.setup_driver():
+                    logger.error(f"[{pass_label}] Worker {i} driver setup failed, skipping")
+                    upl.cleanup()
+                    continue
+
+                if not upl.login_to_instantly():
+                    logger.error(f"[{pass_label}] Worker {i} failed to login, skipping")
+                    upl.cleanup()
+                    continue
+
+                uploaders.append(upl)
+
+            if not uploaders:
+                return {
+                    "uploaded": 0,
+                    "failed": len(mb_list),
+                    "errors": ["All workers failed to login"],
+                    "failed_mailboxes": mb_list,
+                }
+
+            try:
+                futures = []
+                future_to_mb: Dict[Any, Dict[str, Any]] = {}
+                for idx, mb_data in enumerate(mb_list):
+                    upl = uploaders[idx % len(uploaders)]
+                    fut = executor.submit(process_mailbox_sync, upl, mb_data)
+                    futures.append(fut)
+                    future_to_mb[fut] = mb_data
+
+                for fut in as_completed(futures):
+                    result = fut.result()
+                    mb_data = future_to_mb[fut]
+
+                    async with async_session_factory() as session:
+                        if result["success"]:
+                            await session.execute(
+                                update(Mailbox)
+                                .where(Mailbox.id == result["mailbox_id"])
+                                .values(
+                                    instantly_uploaded=True,
+                                    instantly_uploaded_at=datetime.utcnow(),
+                                    instantly_upload_error=None,
+                                )
                             )
-                        )
-                        uploaded_count += 1
-                    else:
-                        await session.execute(
-                            update(Mailbox)
-                            .where(Mailbox.id == result["mailbox_id"])
-                            .values(
-                                instantly_uploaded=False,
-                                instantly_upload_error=result["error"]
+                            uploaded += 1
+                        else:
+                            await session.execute(
+                                update(Mailbox)
+                                .where(Mailbox.id == result["mailbox_id"])
+                                .values(
+                                    instantly_uploaded=False,
+                                    instantly_upload_error=result["error"],
+                                )
                             )
-                        )
-                        failed_count += 1
-                        errors.append(result["error"])
-                    
-                    await session.commit()
-                
-                logger.info(f"Progress: {uploaded_count + failed_count}/{len(mailbox_list)} processed")
-        
-        finally:
-            # Cleanup all uploaders
-            for uploader in uploaders:
-                uploader.cleanup()
-    
-    logger.info(f"Instantly upload complete: {uploaded_count} uploaded, {failed_count} failed")
-    
+                            failed += 1
+                            errs.append(result["error"])
+                            failed_mbs.append(mb_data)
+
+                        await session.commit()
+
+                    logger.info(
+                        f"[{pass_label}] Progress: {uploaded + failed}/{len(mb_list)} processed"
+                    )
+            finally:
+                for upl in uploaders:
+                    upl.cleanup()
+
+        return {
+            "uploaded": uploaded,
+            "failed": failed,
+            "errors": errs,
+            "failed_mailboxes": failed_mbs,
+        }
+
+    # ---------- Main upload pass ----------
+    logger.info(f"=== Main upload pass: {len(mailbox_list)} mailboxes ===")
+    pass_result = await _run_upload_pass(mailbox_list, pass_label="main")
+
+    total_uploaded = pass_result["uploaded"]
+    total_failed = pass_result["failed"]
+    all_errors = list(pass_result["errors"])
+    remaining_failed = list(pass_result["failed_mailboxes"])
+
+    # ---------- Batch retry rounds for failed uploads ----------
+    for retry_round in range(1, batch_retry_rounds + 1):
+        if not remaining_failed:
+            break
+
+        logger.info(
+            f"=== Retry round {retry_round}/{batch_retry_rounds}: "
+            f"{len(remaining_failed)} failed mailboxes ==="
+        )
+
+        # Brief pause between rounds to let things settle
+        await asyncio.sleep(5)
+
+        # Clear upload errors in DB so they can be retried cleanly
+        async with async_session_factory() as session:
+            for mb_data in remaining_failed:
+                await session.execute(
+                    update(Mailbox)
+                    .where(Mailbox.id == mb_data["id"])
+                    .values(
+                        instantly_uploaded=False,
+                        instantly_upload_error=None,
+                    )
+                )
+            await session.commit()
+
+        retry_result = await _run_upload_pass(
+            remaining_failed, pass_label=f"retry-{retry_round}"
+        )
+
+        total_uploaded += retry_result["uploaded"]
+        # Update failed count (replace, don't add — these are the same mailboxes)
+        total_failed = retry_result["failed"]
+        remaining_failed = list(retry_result["failed_mailboxes"])
+        all_errors = list(retry_result["errors"])  # keep only latest errors
+
+        if retry_result["failed"] == 0:
+            logger.info(f"All failures resolved in retry round {retry_round}!")
+            break
+
+    logger.info(
+        f"Instantly upload complete: {total_uploaded} uploaded, {total_failed} failed "
+        f"(after {batch_retry_rounds} retry round(s))"
+    )
+
     return {
         "total": len(mailbox_list),
-        "uploaded": uploaded_count,
-        "failed": failed_count,
+        "uploaded": total_uploaded,
+        "failed": total_failed,
         "skipped": 0,
-        "errors": errors[:10]  # Limit to first 10 errors
+        "errors": all_errors[:10],  # Limit to first 10 errors
     }
