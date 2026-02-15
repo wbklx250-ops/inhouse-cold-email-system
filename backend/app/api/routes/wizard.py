@@ -5712,8 +5712,9 @@ async def wizard_export_credentials(db: AsyncSession = Depends(get_db)):
 
 class Step8StartRequest(BaseModel):
     """Request for starting Step 8 upload."""
-    instantly_email: str
-    instantly_password: str
+    account_id: Optional[str] = None  # Use saved account
+    instantly_email: Optional[str] = None
+    instantly_password: Optional[str] = None
     instantly_api_key: Optional[str] = None  # API key for verification (optional)
     num_workers: int = 3  # 1-5 parallel browsers
     headless: bool = True  # Headless mode for Railway
@@ -5833,6 +5834,34 @@ async def start_step8_upload(
     if not batch:
         raise HTTPException(404, "Batch not found")
     
+    # Handle saved account vs manual credentials
+    instantly_email = None
+    instantly_password = None
+    
+    if request.account_id:
+        # Use saved account
+        from app.models.instantly_account import InstantlyAccount
+        
+        account = await db.get(InstantlyAccount, UUID(request.account_id))
+        if not account:
+            raise HTTPException(404, "Saved account not found")
+        
+        instantly_email = account.email
+        instantly_password = account.password
+        
+        # Update last_used_at
+        account.last_used_at = datetime.utcnow()
+        await db.commit()
+        
+        logger.info(f"Using saved Instantly account: {account.label} ({account.email})")
+    else:
+        # Use manual credentials
+        if not request.instantly_email or not request.instantly_password:
+            raise HTTPException(400, "Either account_id or instantly_email/instantly_password must be provided")
+        
+        instantly_email = request.instantly_email
+        instantly_password = request.instantly_password
+    
     # Check if upload already in progress
     job_id = str(batch_id)
     if job_id in step8_jobs and step8_jobs[job_id].get("status") == "running":
@@ -5858,7 +5887,7 @@ async def start_step8_upload(
         }
     
     # Save Instantly credentials to batch
-    batch.instantly_email = request.instantly_email
+    batch.instantly_email = instantly_email
     await db.commit()
     
     # Initialize job tracking
@@ -5886,8 +5915,8 @@ async def start_step8_upload(
             
             summary = await run_instantly_upload_for_batch(
                 batch_id=batch_id,
-                instantly_email=request.instantly_email,
-                instantly_password=request.instantly_password,
+                instantly_email=instantly_email,
+                instantly_password=instantly_password,
                 instantly_api_key=request.instantly_api_key,  # For API verification
                 num_workers=request.num_workers,
                 headless=request.headless,
