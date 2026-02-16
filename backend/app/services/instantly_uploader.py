@@ -303,7 +303,7 @@ class InstantlyUploader:
         """
         try:
             logger.info(f"[Worker {self.worker_id}] Navigating to Instantly.ai login...")
-            self.driver.get("https://app.instantly.ai/app/login")
+            self.driver.get("https://app.instantly.ai/auth/login")
             self.random_delay(2, 4)
 
             # Wait for and fill email (Cloudflare challenge aware)
@@ -313,7 +313,7 @@ class InstantlyUploader:
                 return False
 
             email_input = self.driver.find_element(
-                By.CSS_SELECTOR, "input[type='email'], input[name='email']"
+                By.XPATH, "//input[@placeholder='Email']"
             )
             email_input.clear()
             email_input.send_keys(self.instantly_email)
@@ -321,7 +321,7 @@ class InstantlyUploader:
             self.random_delay(1, 2)
             
             # Fill password
-            password_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='password'], input[name='password']")
+            password_input = self.driver.find_element(By.XPATH, "//input[@placeholder='Password']")
             password_input.clear()
             password_input.send_keys(self.instantly_password)
             logger.info(f"[Worker {self.worker_id}] Password entered")
@@ -333,7 +333,7 @@ class InstantlyUploader:
             logger.info(f"[Worker {self.worker_id}] Login button clicked")
             
             # Wait for redirect to dashboard (URL should change)
-            self.wait.until(lambda d: "login" not in d.current_url.lower())
+            self.wait.until(lambda d: "auth/login" not in d.current_url.lower())
             logger.info(f"[Worker {self.worker_id}] Successfully logged in to Instantly.ai")
             self.random_delay(2, 3)
             return True
@@ -381,7 +381,7 @@ class InstantlyUploader:
         while time.time() < end_time:
             try:
                 email_input = self.driver.find_element(
-                    By.CSS_SELECTOR, "input[type='email'], input[name='email']"
+                    By.XPATH, "//input[@placeholder='Email']"
                 )
                 if email_input:
                     return True
