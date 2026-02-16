@@ -95,23 +95,32 @@ async def run_for_tenant(tenant: Tenant, headless: bool):
 
         logger.info("Logged in for tenant %s", tenant.custom_domain)
 
-        success_ids = []
-        failed = 0
-        for mb in mailboxes:
-            ok = user_ops.set_password(mb.email, MAILBOX_PASSWORD)
-            if ok:
-                success_ids.append(str(mb.id))
-            else:
-                failed += 1
-
-        await update_mailboxes_passwords(success_ids)
-        logger.info(
-            "Tenant %s: updated %s/%s mailboxes (failed=%s)",
-            tenant.custom_domain,
-            len(success_ids),
-            len(mailboxes),
-            failed,
+        expected_count = len(mailboxes)
+        bulk_results = user_ops.set_passwords_and_enable_via_admin_ui(
+            password=MAILBOX_PASSWORD,
+            exclude_users=["me1"],
+            expected_count=expected_count,
         )
+
+        reset_count = int(bulk_results.get("passwords_set", 0))
+        error_list = bulk_results.get("errors", [])
+
+        if reset_count >= expected_count and not error_list:
+            await update_mailboxes_passwords([str(mb.id) for mb in mailboxes])
+            logger.info(
+                "Tenant %s: updated %s/%s mailboxes",
+                tenant.custom_domain,
+                reset_count,
+                expected_count,
+            )
+        else:
+            logger.warning(
+                "Tenant %s: password reset incomplete (reset=%s expected=%s errors=%s)",
+                tenant.custom_domain,
+                reset_count,
+                expected_count,
+                error_list,
+            )
     finally:
         try:
             driver.quit()

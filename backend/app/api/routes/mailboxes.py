@@ -126,25 +126,43 @@ async def _run_reset_passwords_job(tenant_id: UUID | None = None) -> None:
                     )
                     mailboxes = list(mb_result.scalars().all())
 
-                for mailbox in mailboxes:
-                    ok = user_ops.set_password(mailbox.email, MAILBOX_PASSWORD)
-                    if ok:
-                        async with async_session_factory() as session:
-                            await session.execute(
-                                update(Mailbox)
-                                .where(Mailbox.id == mailbox.id)
-                                .values(
-                                    password=MAILBOX_PASSWORD,
-                                    initial_password=MAILBOX_PASSWORD,
-                                )
+                if not mailboxes:
+                    continue
+
+                expected_count = len(mailboxes)
+                bulk_results = user_ops.set_passwords_and_enable_via_admin_ui(
+                    password=MAILBOX_PASSWORD,
+                    exclude_users=["me1"],
+                    expected_count=expected_count,
+                )
+
+                reset_count = int(bulk_results.get("passwords_set", 0))
+                error_list = bulk_results.get("errors", [])
+
+                _reset_passwords_progress["completed"] += reset_count
+                if reset_count < expected_count:
+                    _reset_passwords_progress["failed"] += expected_count - reset_count
+
+                if error_list:
+                    _reset_passwords_progress["errors"].extend(
+                        [f"Tenant {tenant.custom_domain}: {err}" for err in error_list]
+                    )
+
+                if reset_count >= expected_count and not error_list:
+                    async with async_session_factory() as session:
+                        await session.execute(
+                            update(Mailbox)
+                            .where(Mailbox.tenant_id == tenant.id)
+                            .values(
+                                password=MAILBOX_PASSWORD,
+                                initial_password=MAILBOX_PASSWORD,
                             )
-                            await session.commit()
-                        _reset_passwords_progress["completed"] += 1
-                    else:
-                        _reset_passwords_progress["failed"] += 1
-                        _reset_passwords_progress["errors"].append(
-                            f"Failed to reset {mailbox.email}"
                         )
+                        await session.commit()
+                else:
+                    _reset_passwords_progress["errors"].append(
+                        f"Tenant {tenant.custom_domain}: password reset incomplete; database not updated"
+                    )
 
             except Exception as exc:
                 _reset_passwords_progress["errors"].append(
