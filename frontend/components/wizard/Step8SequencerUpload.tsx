@@ -49,7 +49,6 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   const [selectedAccountId, setSelectedAccountId] = useState<string>("");
   const [instantlyEmail, setInstantlyEmail] = useState("");
   const [instantlyPassword, setInstantlyPassword] = useState("");
-  const [instantlyApiKey, setInstantlyApiKey] = useState("");
   
   // Smartlead configuration state
   const [smartleadApiKey, setSmartleadApiKey] = useState("");
@@ -72,6 +71,11 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   const [newAccountPassword, setNewAccountPassword] = useState("");
   const [newAccountApiKey, setNewAccountApiKey] = useState("");
   const [savingAccount, setSavingAccount] = useState(false);
+  const [editingAccountId, setEditingAccountId] = useState<string | null>(null);
+  const [editAccountLabel, setEditAccountLabel] = useState("");
+  const [editAccountEmail, setEditAccountEmail] = useState("");
+  const [editAccountPassword, setEditAccountPassword] = useState("");
+  const [editAccountApiKey, setEditAccountApiKey] = useState("");
 
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -196,11 +200,6 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         } else {
           payload.instantly_email = email;
           payload.instantly_password = password;
-        }
-
-        // Add API key if provided (for verification)
-        if (instantlyApiKey) {
-          payload.instantly_api_key = instantlyApiKey;
         }
 
         const res = await fetch(
@@ -344,6 +343,60 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       }
     } catch (err) {
       setError("Failed to delete account");
+    }
+  };
+
+  const startEditAccount = (account: InstantlyAccount) => {
+    setShowAddAccount(false);
+    setEditingAccountId(account.id);
+    setEditAccountLabel(account.label);
+    setEditAccountEmail(account.email);
+    setEditAccountPassword("");
+    setEditAccountApiKey("");
+  };
+
+  const cancelEditAccount = () => {
+    setEditingAccountId(null);
+    setEditAccountLabel("");
+    setEditAccountEmail("");
+    setEditAccountPassword("");
+    setEditAccountApiKey("");
+  };
+
+  const updateAccount = async () => {
+    if (!editingAccountId) return;
+    if (!editAccountLabel || !editAccountEmail) {
+      setError("Please fill in label and email");
+      return;
+    }
+
+    setSavingAccount(true);
+    setError(null);
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/v1/wizard/instantly/accounts/${editingAccountId}`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            label: editAccountLabel,
+            email: editAccountEmail,
+            password: editAccountPassword || undefined,
+            api_key: editAccountApiKey || undefined,
+          }),
+        }
+      );
+      const data = await res.json();
+      if (data.success) {
+        await fetchAccounts();
+        cancelEditAccount();
+      } else {
+        setError(data.message || "Failed to update account");
+      }
+    } catch (err) {
+      setError("Network error updating account");
+    } finally {
+      setSavingAccount(false);
     }
   };
 
@@ -513,26 +566,112 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
                   ) : null;
                 })()}
 
-                {/* Saved accounts list with delete option */}
+                {/* Saved accounts list with edit/delete options */}
                 {accounts.length > 0 && !showAddAccount && (
                   <div className="mt-3 space-y-2">
                     <p className="text-xs font-medium text-gray-700">Saved Accounts:</p>
                     {accounts.map((acc) => (
-                      <div key={acc.id} className="flex items-center justify-between text-sm p-2 bg-gray-50 rounded">
-                        <div className="flex items-center gap-2">
-                          <span>{acc.label} - {acc.email}</span>
-                          {acc.has_api_key && (
-                            <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
-                              🔑 API Key
-                            </span>
-                          )}
-                        </div>
-                        <button
-                          onClick={() => deleteAccount(acc.id)}
-                          className="text-red-600 hover:text-red-700 text-xs"
-                        >
-                          Delete
-                        </button>
+                      <div key={acc.id} className="rounded bg-gray-50">
+                        {editingAccountId === acc.id ? (
+                          <div className="border rounded-lg p-4 bg-white space-y-3">
+                            <div className="flex items-center justify-between">
+                              <p className="text-sm font-medium text-gray-700">Edit Account</p>
+                              {acc.has_api_key && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                                  🔑 API Key Saved
+                                </span>
+                              )}
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-700 mb-1">Label</label>
+                              <input
+                                type="text"
+                                value={editAccountLabel}
+                                onChange={(e) => setEditAccountLabel(e.target.value)}
+                                className="w-full px-3 py-2 border rounded-lg"
+                                disabled={isRunning}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-700 mb-1">Email</label>
+                              <input
+                                type="email"
+                                value={editAccountEmail}
+                                onChange={(e) => setEditAccountEmail(e.target.value)}
+                                className="w-full px-3 py-2 border rounded-lg"
+                                disabled={isRunning}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-700 mb-1">Password</label>
+                              <input
+                                type="password"
+                                value={editAccountPassword}
+                                onChange={(e) => setEditAccountPassword(e.target.value)}
+                                placeholder="Leave blank to keep current"
+                                className="w-full px-3 py-2 border rounded-lg"
+                                disabled={isRunning}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs font-medium text-gray-700 mb-1">
+                                API Key <span className="text-gray-400 font-normal">(optional)</span>
+                              </label>
+                              <input
+                                type="text"
+                                value={editAccountApiKey}
+                                onChange={(e) => setEditAccountApiKey(e.target.value)}
+                                placeholder="sk_..."
+                                className="w-full px-3 py-2 border rounded-lg font-mono text-sm"
+                                disabled={isRunning}
+                              />
+                              <p className="text-xs text-gray-500 mt-1">
+                                Leave blank to keep the saved API key as-is.
+                              </p>
+                            </div>
+                            <div className="flex gap-2">
+                              <button
+                                onClick={updateAccount}
+                                disabled={savingAccount || isRunning}
+                                className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400"
+                              >
+                                {savingAccount ? "Saving..." : "Save Changes"}
+                              </button>
+                              <button
+                                onClick={cancelEditAccount}
+                                disabled={savingAccount}
+                                className="px-4 py-2 border rounded-lg text-gray-700 hover:bg-gray-100"
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        ) : (
+                          <div className="flex items-center justify-between text-sm p-2">
+                            <div className="flex items-center gap-2">
+                              <span>{acc.label} - {acc.email}</span>
+                              {acc.has_api_key && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-green-100 text-green-700">
+                                  🔑 API Key
+                                </span>
+                              )}
+                            </div>
+                            <div className="flex items-center gap-3">
+                              <button
+                                onClick={() => startEditAccount(acc)}
+                                className="text-blue-600 hover:text-blue-700 text-xs"
+                              >
+                                Edit
+                              </button>
+                              <button
+                                onClick={() => deleteAccount(acc.id)}
+                                className="text-red-600 hover:text-red-700 text-xs"
+                              >
+                                Delete
+                              </button>
+                            </div>
+                          </div>
+                        )}
                       </div>
                     ))}
                   </div>
@@ -566,24 +705,6 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
             )}
           </div>
 
-          {/* Instantly API Key (Optional but recommended for verification) */}
-          <div className="pt-4 border-t">
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Instantly API Key <span className="text-gray-500 font-normal">(Optional - for upload verification)</span>
-            </label>
-            <input
-              type="text"
-              value={instantlyApiKey}
-              onChange={(e) => setInstantlyApiKey(e.target.value)}
-              placeholder="sk_..."
-              className="w-full px-3 py-2 border rounded-lg font-mono text-sm"
-              disabled={isRunning}
-            />
-            <p className="text-xs text-gray-500 mt-1">
-              Get your API key from Instantly → Settings → API & Webhooks → API Key. 
-              This enables real-time verification that accounts were successfully added (recommended).
-            </p>
-          </div>
         </div>
       )}
 
