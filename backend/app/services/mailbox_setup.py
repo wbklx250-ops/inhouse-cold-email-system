@@ -728,6 +728,7 @@ async def _update_tenant_step6_status(db: AsyncSession, tenant_id: str, result: 
                     local_part=mb["local_part"],
                     display_name=mb["display_name"],
                     password=mb["password"],
+                    initial_password=MAILBOX_PASSWORD,
                     created_in_exchange=result.get("success", False),
                     setup_complete=result.get("success", False),
                     setup_completed_at=datetime.utcnow() if result.get("success") else None,

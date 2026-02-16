@@ -530,7 +530,7 @@ async def run_smartlead_upload_for_batch(
             {
                 "id": str(mb.id),
                 "email": mb.email,
-                "password": mb.initial_password or ""
+                "password": mb.initial_password or mb.password or "#Sendemails1"
             }
             for mb in mailboxes
         ]

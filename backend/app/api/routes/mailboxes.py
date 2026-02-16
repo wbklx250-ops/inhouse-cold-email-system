@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from io import StringIO
 from typing import List, Optional
 from uuid import UUID
@@ -7,7 +8,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
@@ -18,6 +19,16 @@ from app.schemas.mailbox import MailboxCreate, MailboxRead, MailboxUpdate
 from app.services.email_generator import generate_email_addresses
 
 router = APIRouter(prefix="/api/v1/mailboxes", tags=["mailboxes"])
+
+MAILBOX_PASSWORD = "#Sendemails1"
+_reset_passwords_progress = {
+    "status": "idle",
+    "total": 0,
+    "completed": 0,
+    "failed": 0,
+    "current_tenant": None,
+    "errors": [],
+}
 
 
 class MailboxGenerateRequest(BaseModel):
@@ -30,6 +41,125 @@ class MailboxGenerateRequest(BaseModel):
 class PersonaBase(BaseModel):
     first_name: str
     last_name: str
+
+
+class ResetPasswordsStatus(BaseModel):
+    status: str
+    total: int
+    completed: int
+    failed: int
+    current_tenant: str | None
+    errors: list[str]
+
+
+def _reset_progress_snapshot() -> dict:
+    return dict(_reset_passwords_progress)
+
+
+async def _run_reset_passwords_job(tenant_id: UUID | None = None) -> None:
+    from app.db.session import async_session_factory
+    from app.services.selenium.user_ops import UserOpsSelenium
+    from app.services.selenium.admin_portal import _login_with_mfa
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
+
+    _reset_passwords_progress.update(
+        {
+            "status": "running",
+            "total": 0,
+            "completed": 0,
+            "failed": 0,
+            "current_tenant": None,
+            "errors": [],
+        }
+    )
+
+    def build_driver() -> webdriver.Chrome:
+        options = Options()
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+        options.add_argument("--disable-blink-features=AutomationControlled")
+        options.add_argument("--headless=new")
+        return webdriver.Chrome(options=options)
+
+    try:
+        async with async_session_factory() as session:
+            tenant_query = select(Tenant)
+            if tenant_id:
+                tenant_query = tenant_query.where(Tenant.id == tenant_id)
+            tenant_result = await session.execute(tenant_query)
+            tenants = list(tenant_result.scalars().all())
+
+        if not tenants:
+            _reset_passwords_progress.update(
+                {"status": "completed", "errors": ["No tenants found"]}
+            )
+            return
+
+        async with async_session_factory() as session:
+            mailbox_query = select(Mailbox)
+            if tenant_id:
+                mailbox_query = mailbox_query.where(Mailbox.tenant_id == tenant_id)
+            mailbox_result = await session.execute(mailbox_query)
+            all_mailboxes = list(mailbox_result.scalars().all())
+            _reset_passwords_progress["total"] = len(all_mailboxes)
+
+        for tenant in tenants:
+            _reset_passwords_progress["current_tenant"] = tenant.custom_domain
+            driver = build_driver()
+            user_ops = UserOpsSelenium(driver, tenant.custom_domain)
+
+            try:
+                _login_with_mfa(
+                    driver=driver,
+                    admin_email=tenant.admin_email,
+                    admin_password=tenant.admin_password,
+                    totp_secret=tenant.totp_secret,
+                    domain=tenant.custom_domain,
+                )
+
+                async with async_session_factory() as session:
+                    mb_result = await session.execute(
+                        select(Mailbox).where(Mailbox.tenant_id == tenant.id)
+                    )
+                    mailboxes = list(mb_result.scalars().all())
+
+                for mailbox in mailboxes:
+                    ok = user_ops.set_password(mailbox.email, MAILBOX_PASSWORD)
+                    if ok:
+                        async with async_session_factory() as session:
+                            await session.execute(
+                                update(Mailbox)
+                                .where(Mailbox.id == mailbox.id)
+                                .values(
+                                    password=MAILBOX_PASSWORD,
+                                    initial_password=MAILBOX_PASSWORD,
+                                )
+                            )
+                            await session.commit()
+                        _reset_passwords_progress["completed"] += 1
+                    else:
+                        _reset_passwords_progress["failed"] += 1
+                        _reset_passwords_progress["errors"].append(
+                            f"Failed to reset {mailbox.email}"
+                        )
+
+            except Exception as exc:
+                _reset_passwords_progress["errors"].append(
+                    f"Tenant {tenant.custom_domain} failed: {exc}"
+                )
+            finally:
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+
+        _reset_passwords_progress["status"] = "completed"
+    except Exception as exc:
+        _reset_passwords_progress["status"] = "failed"
+        _reset_passwords_progress["errors"].append(str(exc))
 
 
 async def get_mailbox_or_404(mailbox_id: UUID, db: AsyncSession) -> Mailbox:
@@ -58,6 +188,24 @@ async def list_mailboxes(
     query = query.offset(skip).limit(limit)
     result = await db.execute(query)
     return list(result.scalars().all())
+
+
+@router.post("/reset-all-passwords")
+async def reset_all_passwords(
+    tenant_id: UUID | None = Query(default=None),
+) -> dict:
+    """Trigger a background job to reset mailbox passwords to #Sendemails1."""
+    if _reset_passwords_progress["status"] == "running":
+        raise HTTPException(status_code=409, detail="Password reset already running")
+
+    asyncio.create_task(_run_reset_passwords_job(tenant_id))
+    return {"status": "started", "message": "Password reset job running in background"}
+
+
+@router.get("/reset-passwords-status", response_model=ResetPasswordsStatus)
+async def reset_passwords_status() -> dict:
+    """Get current password reset job status."""
+    return _reset_progress_snapshot()
 
 
 @router.post("/", response_model=MailboxRead, status_code=201)

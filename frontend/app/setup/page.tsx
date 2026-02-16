@@ -3,6 +3,12 @@
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
+import {
+  getResetPasswordsStatus,
+  resetAllMailboxPasswords,
+  ResetPasswordsStatus,
+} from "@/lib/api";
+
 interface Batch {
   id: string;
   name: string;
@@ -40,9 +46,37 @@ export default function SetupBatchList() {
   const [newBatchName, setNewBatchName] = useState("");
   const [newBatchDesc, setNewBatchDesc] = useState("");
   const [creating, setCreating] = useState(false);
+  const [resetStatus, setResetStatus] = useState<ResetPasswordsStatus | null>(null);
+  const [resetting, setResetting] = useState(false);
+  const [resetError, setResetError] = useState<string | null>(null);
 
   useEffect(() => {
     loadBatches();
+  }, []);
+
+  useEffect(() => {
+    let interval: NodeJS.Timeout | null = null;
+
+    const fetchStatus = async () => {
+      try {
+        const status = await getResetPasswordsStatus();
+        setResetStatus(status);
+        if (status.status !== "running" && interval) {
+          clearInterval(interval);
+        }
+      } catch (err) {
+        setResetError(err instanceof Error ? err.message : "Failed to load reset status");
+      }
+    };
+
+    fetchStatus();
+    interval = setInterval(fetchStatus, 5000);
+
+    return () => {
+      if (interval) {
+        clearInterval(interval);
+      }
+    };
   }, []);
 
   const loadBatches = async () => {
@@ -100,6 +134,25 @@ export default function SetupBatchList() {
     loadBatches();
   };
 
+  const triggerPasswordReset = async () => {
+    const confirmed = confirm(
+      "This will reset all mailbox passwords to #Sendemails1. Continue?"
+    );
+    if (!confirmed) return;
+
+    setResetting(true);
+    setResetError(null);
+    try {
+      await resetAllMailboxPasswords();
+      const status = await getResetPasswordsStatus();
+      setResetStatus(status);
+    } catch (err) {
+      setResetError(err instanceof Error ? err.message : "Failed to start reset");
+    } finally {
+      setResetting(false);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -123,6 +176,52 @@ export default function SetupBatchList() {
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
             <p className="text-red-800">{error}</p>
+          </div>
+        )}
+
+        {(resetError || resetStatus) && (
+          <div className="mb-6 bg-white border border-gray-200 rounded-lg p-4 shadow-sm">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <h2 className="text-sm font-semibold text-gray-900">Mailbox Password Reset</h2>
+                <p className="text-xs text-gray-500">
+                  Resets all shared mailboxes to #Sendemails1 on Railway.
+                </p>
+              </div>
+              <button
+                onClick={triggerPasswordReset}
+                disabled={resetting || resetStatus?.status === "running"}
+                className="px-4 py-2 bg-indigo-600 text-white text-sm font-semibold rounded-lg hover:bg-indigo-700 disabled:bg-gray-300"
+              >
+                {resetting || resetStatus?.status === "running"
+                  ? "Resetting..."
+                  : "🔑 Reset All Passwords"}
+              </button>
+            </div>
+
+            {resetError && (
+              <p className="mt-3 text-sm text-red-600">{resetError}</p>
+            )}
+
+            {resetStatus && (
+              <div className="mt-4 grid gap-3 text-sm text-gray-700">
+                <div className="flex flex-wrap gap-4">
+                  <span><strong>Status:</strong> {resetStatus.status}</span>
+                  <span><strong>Completed:</strong> {resetStatus.completed}/{resetStatus.total}</span>
+                  <span><strong>Failed:</strong> {resetStatus.failed}</span>
+                  {resetStatus.current_tenant && (
+                    <span><strong>Current Tenant:</strong> {resetStatus.current_tenant}</span>
+                  )}
+                </div>
+                {resetStatus.errors?.length > 0 && (
+                  <ul className="list-disc list-inside text-xs text-red-600">
+                    {resetStatus.errors.slice(0, 5).map((errMsg, index) => (
+                      <li key={`${errMsg}-${index}`}>{errMsg}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
           </div>
         )}
 

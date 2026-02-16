@@ -940,6 +940,37 @@ export const wizardExportCredentials = async (): Promise<void> => {
 };
 
 // ============================================================================
+// Mailbox Password Reset (UI trigger)
+// ============================================================================
+
+export interface ResetPasswordsStatus {
+  status: "idle" | "running" | "completed" | "failed";
+  total: number;
+  completed: number;
+  failed: number;
+  current_tenant: string | null;
+  errors: string[];
+}
+
+export const resetAllMailboxPasswords = async (
+  tenantId?: string,
+): Promise<{ status: string; message: string }> => {
+  return apiRequest<{ status: string; message: string }>(
+    `${API_BASE}/api/v1/mailboxes/reset-all-passwords`,
+    {
+      method: "POST",
+      params: { tenant_id: tenantId },
+    },
+  );
+};
+
+export const getResetPasswordsStatus = async (): Promise<ResetPasswordsStatus> => {
+  return apiRequest<ResetPasswordsStatus>(
+    `${API_BASE}/api/v1/mailboxes/reset-passwords-status`,
+  );
+};
+
+// ============================================================================
 // Batch Upload Tracking API Functions (Feature 3)
 // ============================================================================
 

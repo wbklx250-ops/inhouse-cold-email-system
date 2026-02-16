@@ -313,39 +313,145 @@ class UserOpsSelenium:
     def set_password(self, email: str, password: str) -> bool:
         """Set user password."""
         logger.info(f"[{self.domain}] Setting password for: {email}")
-        
-        try:
-            # Navigate to user
-            self.driver.get(f"https://admin.microsoft.com/#/users/:/UserDetails/{email}")
-            time.sleep(5)
-            
-            # Click "Reset password"
-            self._wait_and_click(By.XPATH, "//button[contains(., 'Reset password')]")
-            time.sleep(3)
-            self._screenshot(f"reset_password_{email.split('@')[0]}")
-            
-            # Uncheck auto-generate if needed
+
+        for attempt in range(1, 4):
             try:
-                auto_pwd = self.driver.find_element(By.CSS_SELECTOR, "input[type='checkbox']")
-                if auto_pwd.is_selected():
-                    auto_pwd.click()
+                # Navigate to user
+                self.driver.get(f"https://admin.microsoft.com/#/users/:/UserDetails/{email}")
+                time.sleep(5)
+
+                # Click "Reset password"
+                self._wait_and_click(By.XPATH, "//button[contains(., 'Reset password')]")
+                time.sleep(3)
+                self._screenshot(f"reset_password_{email.split('@')[0]}_attempt{attempt}")
+
+                # Uncheck auto-generate + require-change checkboxes (retry a few times)
+                for uncheck_attempt in range(1, 6):
+                    checkboxes = []
+                    try:
+                        checkboxes.extend(self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox']"))
+                    except Exception:
+                        pass
+                    try:
+                        checkboxes.extend(self.driver.find_elements(By.CSS_SELECTOR, "[role='checkbox']"))
+                    except Exception:
+                        pass
+
+                    for cb in checkboxes:
+                        try:
+                            if cb.tag_name == "input":
+                                if cb.is_selected():
+                                    cb.click()
+                            else:
+                                if cb.get_attribute("aria-checked") == "true":
+                                    cb.click()
+                        except Exception:
+                            continue
+
                     time.sleep(1)
-            except:
-                pass
-            
-            # Enter password
-            self._wait_and_type(By.CSS_SELECTOR, "input[type='password']", password)
-            
-            # Click Reset/Save
-            self._wait_and_click(By.XPATH, "//button[contains(., 'Reset') or contains(., 'Save')]")
-            time.sleep(3)
-            
-            logger.info(f"[{self.domain}] ✓ Set password for: {email}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"[{self.domain}] Failed to set password for {email}: {e}")
-            return False
+
+                    # Verify password field visible
+                    try:
+                        pwd_field = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+                        if pwd_field.is_displayed():
+                            break
+                    except Exception:
+                        pass
+
+                    if uncheck_attempt == 5:
+                        self._screenshot(f"checkbox_uncheck_failed_{email.split('@')[0]}")
+                        raise Exception("Password field still hidden after checkbox uncheck attempts")
+
+                # Enter password
+                pwd_input = self.driver.find_element(By.CSS_SELECTOR, "input[type='password']")
+                pwd_input.clear()
+                time.sleep(0.3)
+                pwd_input.send_keys(password)
+                time.sleep(0.5)
+
+                # Verify password value
+                entered_value = pwd_input.get_attribute("value")
+                if not entered_value:
+                    self.driver.execute_script(
+                        "arguments[0].value = arguments[1]; arguments[0].dispatchEvent(new Event('input', {bubbles: true}));",
+                        pwd_input,
+                        password,
+                    )
+                    time.sleep(0.5)
+                    entered_value = pwd_input.get_attribute("value")
+
+                if len(entered_value or "") < len(password) * 0.8:
+                    self._screenshot(f"password_entry_failed_{email.split('@')[0]}")
+                    raise Exception("Password not entered correctly")
+
+                # Ensure require-change checkbox unchecked
+                try:
+                    for cb in self.driver.find_elements(By.CSS_SELECTOR, "input[type='checkbox'], [role='checkbox']"):
+                        try:
+                            if cb.tag_name == "input":
+                                if cb.is_selected():
+                                    cb.click()
+                            else:
+                                if cb.get_attribute("aria-checked") == "true":
+                                    cb.click()
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+                # Click Reset/Save
+                self._wait_and_click(By.XPATH, "//button[contains(., 'Reset') or contains(., 'Save')]")
+                time.sleep(3)
+
+                # Verify success indicator or dialog closed
+                success_verified = False
+                success_indicators = [
+                    "//*[contains(text(), 'Password has been reset')]",
+                    "//*[contains(text(), 'password has been reset')]",
+                    "//*[contains(text(), 'successfully')]",
+                    "//*[contains(text(), 'Password reset')]",
+                    "//button[contains(., 'Close')]",
+                ]
+                for indicator in success_indicators:
+                    try:
+                        element = WebDriverWait(self.driver, 5).until(
+                            EC.presence_of_element_located((By.XPATH, indicator))
+                        )
+                        if element:
+                            success_verified = True
+                            break
+                    except Exception:
+                        continue
+
+                if not success_verified:
+                    try:
+                        self.driver.find_element(By.XPATH, "//div[@role='dialog']")
+                        self._screenshot(f"password_reset_dialog_open_{email.split('@')[0]}")
+                    except Exception:
+                        success_verified = True
+
+                # Close dialog if present
+                try:
+                    close_btn = self.driver.find_element(By.XPATH, "//button[contains(., 'Close')]")
+                    close_btn.click()
+                    time.sleep(1)
+                except Exception:
+                    pass
+
+                if success_verified:
+                    logger.info(f"[{self.domain}] ✓ Set password for: {email}")
+                    return True
+
+                logger.warning(
+                    f"[{self.domain}] Password reset success not verified for {email} (attempt {attempt})"
+                )
+            except Exception as e:
+                logger.error(
+                    f"[{self.domain}] Failed to set password for {email} (attempt {attempt}): {e}"
+                )
+                time.sleep(2)
+
+        return False
 
     def set_passwords_bulk(self, users: List[Dict]) -> Dict:
         """Set passwords for multiple users.
