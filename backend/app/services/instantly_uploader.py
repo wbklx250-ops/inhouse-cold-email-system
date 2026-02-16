@@ -27,6 +27,7 @@ from selenium.common.exceptions import (
     ElementClickInterceptedException, NoSuchWindowException,
     InvalidSessionIdException
 )
+from selenium_stealth import stealth
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -153,6 +154,11 @@ class InstantlyUploader:
     """Handles Selenium automation for uploading mailboxes to Instantly.ai"""
     
     RESTART_EVERY_N = 30  # Preventive browser restart after N accounts
+    DEFAULT_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    )
     
     def __init__(
         self,
@@ -173,10 +179,12 @@ class InstantlyUploader:
         """Initialize Chrome WebDriver with appropriate options"""
         try:
             chrome_options = Options()
+            chrome_options.binary_location = os.getenv("CHROME_PATH", "/usr/bin/chromium")
             chrome_options.add_argument("--disable-popup-blocking")
             chrome_options.add_argument("--disable-blink-features=AutomationControlled")
             chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
             chrome_options.add_experimental_option('useAutomationExtension', False)
+            chrome_options.add_argument(f"--user-agent={self.DEFAULT_USER_AGENT}")
             
             # Add options to improve stability
             chrome_options.add_argument("--disable-extensions")
@@ -199,6 +207,15 @@ class InstantlyUploader:
             self.driver = webdriver.Chrome(options=chrome_options)
             self.driver.execute_script(
                 "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+            )
+            stealth(
+                self.driver,
+                languages=["en-US", "en"],
+                vendor="Google Inc.",
+                platform="Win32",
+                webgl_vendor="Intel Inc.",
+                renderer="Intel Iris OpenGL Engine",
+                fix_hairline=True,
             )
             self.driver.set_page_load_timeout(60)
             self.wait = WebDriverWait(self.driver, 30)
@@ -288,10 +305,15 @@ class InstantlyUploader:
             logger.info(f"[Worker {self.worker_id}] Navigating to Instantly.ai login...")
             self.driver.get("https://app.instantly.ai/app/login")
             self.random_delay(2, 4)
-            
-            # Wait for and fill email
-            email_input = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "input[type='email'], input[name='email']"))
+
+            # Wait for and fill email (Cloudflare challenge aware)
+            if not self._wait_for_login_form(timeout=30):
+                logger.error(f"[Worker {self.worker_id}] Login form not detected (possible Cloudflare challenge)")
+                self.log_page_diagnostics("login_form_missing")
+                return False
+
+            email_input = self.driver.find_element(
+                By.CSS_SELECTOR, "input[type='email'], input[name='email']"
             )
             email_input.clear()
             email_input.send_keys(self.instantly_email)
@@ -318,17 +340,65 @@ class InstantlyUploader:
             
         except Exception as e:
             logger.error(f"[Worker {self.worker_id}] Failed to login to Instantly: {str(e)}")
+            self.log_page_diagnostics("login_failed")
             return False
             
     def save_debug_screenshot(self, label="debug"):
-        """Save a screenshot for debugging headless issues"""
+        """Log diagnostics for debugging headless issues (URL, title, source snippet, screenshot base64)"""
+        self.log_page_diagnostics(label=label)
+
+    def log_page_diagnostics(self, label: str = "debug"):
+        """Log key diagnostics for Railway logs when headless issues occur."""
         try:
-            os.makedirs('screenshots', exist_ok=True)
-            filename = f"screenshots/{self.worker_id}_{label}_{datetime.now().strftime('%H%M%S')}.png"
-            self.driver.save_screenshot(filename)
-            logger.info(f"[Worker {self.worker_id}] Debug screenshot saved: {filename}")
+            current_url = self.driver.current_url if self.driver else "unknown"
+            title = self.driver.title if self.driver else "unknown"
+            page_source = self.driver.page_source if self.driver else ""
+            snippet = page_source[:500].replace("\n", " ")
+            screenshot_b64 = ""
+            try:
+                if self.driver:
+                    screenshot_b64 = self.driver.get_screenshot_as_base64()
+            except Exception:
+                screenshot_b64 = ""
+
+            logger.info(
+                f"[Worker {self.worker_id}] Diagnostics ({label}) -> URL: {current_url} | Title: {title}"
+            )
+            if snippet:
+                logger.info(
+                    f"[Worker {self.worker_id}] Page source snippet ({label}): {snippet}"
+                )
+            if screenshot_b64:
+                logger.info(
+                    f"[Worker {self.worker_id}] Screenshot base64 ({label}): {screenshot_b64[:5000]}"
+                )
         except Exception as e:
-            logger.warning(f"[Worker {self.worker_id}] Could not save screenshot: {e}")
+            logger.warning(f"[Worker {self.worker_id}] Could not log diagnostics: {e}")
+
+    def _wait_for_login_form(self, timeout: int = 30) -> bool:
+        """Wait for login form, allowing Cloudflare challenge to pass if present."""
+        end_time = time.time() + timeout
+        while time.time() < end_time:
+            try:
+                email_input = self.driver.find_element(
+                    By.CSS_SELECTOR, "input[type='email'], input[name='email']"
+                )
+                if email_input:
+                    return True
+            except NoSuchElementException:
+                pass
+
+            try:
+                title = (self.driver.title or "").lower()
+                if "just a moment" in title or "cloudflare" in title:
+                    time.sleep(2)
+                    continue
+            except Exception:
+                pass
+
+            time.sleep(1)
+
+        return False
     
     def check_account_exists(self, account_email: str) -> bool:
         """Check if an account already exists in Instantly.ai (visible text only)"""
@@ -360,6 +430,7 @@ class InstantlyUploader:
             
         except Exception as e:
             logger.warning(f"[Worker {self.worker_id}] Error checking if account exists: {e} - proceeding with addition")
+            self.log_page_diagnostics("login_failed")
             return False
     
     def add_microsoft_account(
@@ -565,7 +636,7 @@ class InstantlyUploader:
         except Exception as e:
             error_msg = f"Unexpected error during upload: {str(e)}"
             logger.error(f"[Worker {self.worker_id}] {error_msg}")
-            self.save_debug_screenshot("add_account_failed")
+            self.log_page_diagnostics("add_account_failed")
             return {"success": False, "error": error_msg}
             
     def _handle_oauth_flow(self, email: str, password: str) -> Dict[str, Any]:
@@ -665,7 +736,7 @@ class InstantlyUploader:
             
             if not email_input:
                 logger.error(f"[Worker {self.worker_id}] Email input field not found")
-                self.save_debug_screenshot("email_input_not_found")
+                self.log_page_diagnostics("email_input_not_found")
                 return {"success": False, "error": "Email input field not found"}
             
             email_input.clear()
@@ -725,7 +796,7 @@ class InstantlyUploader:
             
             if not password_input:
                 logger.error(f"[Worker {self.worker_id}] Password input field not found")
-                self.save_debug_screenshot("password_input_not_found")
+                self.log_page_diagnostics("password_input_not_found")
                 return {"success": False, "error": "Password input field not found"}
             
             password_input.clear()
@@ -912,7 +983,7 @@ class InstantlyUploader:
         except Exception as e:
             error_msg = f"OAuth flow error: {str(e)}"
             logger.error(f"[Worker {self.worker_id}] {error_msg}")
-            self.save_debug_screenshot("oauth_failed")
+            self.log_page_diagnostics("oauth_failed")
             # Try to switch back to original window
             try:
                 if len(self.driver.window_handles) > 0:
@@ -1121,6 +1192,35 @@ async def run_instantly_upload_for_batch(
             }
             for mb in mailboxes
         ]
+
+        # Pre-filter against Instantly API cache (if available)
+        if api and api._cache_loaded:
+            existing_emails = api._known_emails
+            if existing_emails:
+                already_uploaded = [
+                    mb for mb in mailbox_list
+                    if mb["email"].strip().lower() in existing_emails
+                ]
+                if already_uploaded:
+                    logger.info(
+                        f"Pre-filter: {len(already_uploaded)} accounts already in Instantly (API cache)"
+                    )
+                    for mb in already_uploaded:
+                        await session.execute(
+                            update(Mailbox)
+                            .where(Mailbox.id == mb["id"])
+                            .values(
+                                instantly_uploaded=True,
+                                instantly_uploaded_at=datetime.utcnow(),
+                                instantly_upload_error=None,
+                            )
+                        )
+                    await session.commit()
+
+                    mailbox_list = [
+                        mb for mb in mailbox_list
+                        if mb["email"].strip().lower() not in existing_emails
+                    ]
     
     logger.info(f"Found {len(mailbox_list)} mailboxes to upload")
     

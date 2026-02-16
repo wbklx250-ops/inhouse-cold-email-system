@@ -24,6 +24,7 @@ psycopg2-binary>=2.9.0
 webdriver-manager>=4.0.0
 Pillow>=10.0.0
 pyzbar>=0.1.9
+selenium-stealth>=1.0.6
 
 # Testing dependencies
 pytest>=8.0.0
