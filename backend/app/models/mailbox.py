@@ -83,6 +83,12 @@ class Mailbox(TimestampUUIDMixin, Base):
     setup_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     setup_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
+    # Sequencer upload tracking (generic cross-sequencer)
+    uploaded_to_sequencer: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    sequencer_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)  # "instantly", "plusvibe", "smartlead"
+    upload_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
     # Error tracking
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     

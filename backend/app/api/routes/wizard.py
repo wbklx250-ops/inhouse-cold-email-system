@@ -322,6 +322,9 @@ async def mark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_db)
     - Batches that are complete but not yet uploaded to sequencer software
     - Batches that have been completed AND uploaded to sequencer
     
+    Also cascades to mailbox-level: marks all ready mailboxes in the batch
+    as uploaded_to_sequencer=True for the new cross-batch upload tracking.
+    
     Returns success with timestamp.
     """
     batch = await db.get(SetupBatch, batch_id)
@@ -331,14 +334,35 @@ async def mark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_db)
     batch.uploaded_to_sequencer = True
     batch.uploaded_at = datetime.utcnow()
     
+    # NEW: Also mark all ready mailboxes in this batch
+    from sqlalchemy import and_
+    result = await db.execute(
+        select(Mailbox).where(
+            and_(
+                Mailbox.batch_id == batch_id,
+                Mailbox.setup_complete == True,
+                Mailbox.uploaded_to_sequencer == False,
+            )
+        )
+    )
+    mailboxes = result.scalars().all()
+    now = datetime.utcnow()
+    marked_count = 0
+    for mb in mailboxes:
+        mb.uploaded_to_sequencer = True
+        mb.uploaded_at = now
+        mb.sequencer_name = "batch_toggle"  # Indicate it was marked via batch toggle
+        marked_count += 1
+    
     await db.commit()
     
-    logger.info(f"Batch {batch_id} ({batch.name}) marked as uploaded to sequencer")
+    logger.info(f"Batch {batch_id} ({batch.name}) marked as uploaded to sequencer. {marked_count} mailboxes updated.")
     
     return {
         "success": True,
-        "message": f"Batch '{batch.name}' marked as uploaded to sequencer",
-        "uploaded_at": batch.uploaded_at.isoformat()
+        "message": f"Batch '{batch.name}' marked as uploaded to sequencer. {marked_count} mailboxes updated.",
+        "uploaded_at": batch.uploaded_at.isoformat(),
+        "mailboxes_marked": marked_count,
     }
 
 
@@ -348,6 +372,8 @@ async def unmark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_d
     Remove the uploaded to sequencer marking from a batch.
     
     Useful if you accidentally marked it or need to re-upload.
+    Also cascades to mailbox-level: unmarks all mailboxes in the batch
+    that were marked via batch_toggle.
     """
     batch = await db.get(SetupBatch, batch_id)
     if not batch:
@@ -356,13 +382,33 @@ async def unmark_batch_uploaded(batch_id: UUID, db: AsyncSession = Depends(get_d
     batch.uploaded_to_sequencer = False
     batch.uploaded_at = None
     
+    # NEW: Also unmark all mailboxes in this batch that were marked via batch toggle
+    from sqlalchemy import and_
+    result = await db.execute(
+        select(Mailbox).where(
+            and_(
+                Mailbox.batch_id == batch_id,
+                Mailbox.uploaded_to_sequencer == True,
+                Mailbox.sequencer_name == "batch_toggle",
+            )
+        )
+    )
+    mailboxes = result.scalars().all()
+    unmarked_count = 0
+    for mb in mailboxes:
+        mb.uploaded_to_sequencer = False
+        mb.uploaded_at = None
+        mb.sequencer_name = None
+        unmarked_count += 1
+    
     await db.commit()
     
-    logger.info(f"Batch {batch_id} ({batch.name}) unmarked from sequencer upload")
+    logger.info(f"Batch {batch_id} ({batch.name}) unmarked from sequencer upload. {unmarked_count} mailboxes unmarked.")
     
     return {
         "success": True,
-        "message": f"Batch '{batch.name}' unmarked from sequencer upload"
+        "message": f"Batch '{batch.name}' unmarked from sequencer upload. {unmarked_count} mailboxes unmarked.",
+        "mailboxes_unmarked": unmarked_count,
     }
 
 

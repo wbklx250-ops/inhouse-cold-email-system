@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict
@@ -37,12 +38,19 @@ class MailboxRead(BaseModel):
     email: str
     display_name: str
     tenant_id: UUID
+    batch_id: UUID | None = None
     status: MailboxStatus
     account_enabled: bool
     password_set: bool
     upn_fixed: bool
     delegated: bool
+    setup_complete: bool = False
     warmup_stage: WarmupStage
+    # Upload tracking
+    uploaded_to_sequencer: bool = False
+    uploaded_at: datetime | None = None
+    sequencer_name: str | None = None
+    upload_error: str | None = None
     created_at: datetime
     updated_at: datetime
 

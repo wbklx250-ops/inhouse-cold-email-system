@@ -15,7 +15,9 @@ const navigation: NavItem[] = [
   { name: "Dashboard", href: "/", icon: "📊" },
   { name: "Domains", href: "/domains", icon: "🌐" },
   { name: "Tenants", href: "/tenants", icon: "🏢" },
+  { name: "Domain Removal", href: "/domain-removal", icon: "🗑️" },
   { name: "Sequencer Upload", href: "/instantly", icon: "📤" },
+  { name: "Upload Manager", href: "/upload", icon: "📋" },
 ];
 
 interface SidebarProps {
