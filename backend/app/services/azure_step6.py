@@ -414,12 +414,12 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                 tenant.licensed_user_password = licensed_user.get("password")
             await db.commit()
 
-            # Step 4: Generate 50 mailboxes in DB
+            # Step 4: Generate mailboxes in DB (or use custom CSV emails)
             update_progress(
                 str(tenant.id),
                 "generate_emails",
                 "in_progress",
-                "Generating 50 email variations",
+                "Generating email variations",
             )
             persona_display_name = None
             if batch:
@@ -427,11 +427,51 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             if not persona_display_name:
                 raise Exception("Missing persona display name for mailbox generation")
 
-            mailbox_data = generate_emails_for_domain(
-                display_name=persona_display_name,
-                domain=tenant.custom_domain,
-                count=50,
-            )
+            # CHECK FOR CUSTOM MAILBOX MAP (CSV-imported emails for this domain)
+            custom_emails_for_domain = None
+            if batch and batch.custom_mailbox_map:
+                domain_key = tenant.custom_domain.lower() if tenant.custom_domain else ""
+                custom_emails_for_domain = batch.custom_mailbox_map.get(domain_key)
+
+            if custom_emails_for_domain:
+                # USE CUSTOM EMAILS from uploaded CSV
+                logger.info(
+                    "[%s] Using %d custom email addresses from CSV (instead of auto-generated)",
+                    tenant.custom_domain,
+                    len(custom_emails_for_domain),
+                )
+                from app.services.email_generator import MAILBOX_PASSWORD
+                mailbox_data = []
+                for entry in custom_emails_for_domain:
+                    email = entry.get("email", "").strip().lower()
+                    if not email or "@" not in email:
+                        continue
+                    local_part = email.split("@")[0]
+                    display_name_val = entry.get("display_name", "").strip() or persona_display_name
+                    password_val = entry.get("password", "").strip() or MAILBOX_PASSWORD
+                    mailbox_data.append({
+                        "email": email,
+                        "local_part": local_part,
+                        "display_name": display_name_val,
+                        "password": password_val,
+                    })
+                if not mailbox_data:
+                    logger.warning(
+                        "[%s] Custom mailbox map had entries but none were valid - falling back to auto-generate",
+                        tenant.custom_domain,
+                    )
+                    mailbox_data = generate_emails_for_domain(
+                        display_name=persona_display_name,
+                        domain=tenant.custom_domain,
+                        count=50,
+                    )
+            else:
+                # AUTO-GENERATE emails (original behavior)
+                mailbox_data = generate_emails_for_domain(
+                    display_name=persona_display_name,
+                    domain=tenant.custom_domain,
+                    count=50,
+                )
 
             existing_mailbox_result = await db.execute(
                 select(Mailbox).where(Mailbox.tenant_id == tenant.id)

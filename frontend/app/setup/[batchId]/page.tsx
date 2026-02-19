@@ -2979,6 +2979,14 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
   const [isResettingStuck, setIsResettingStuck] = useState(false);
   const [isResumingProcessing, setIsResumingProcessing] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  
+  // Custom mailbox CSV upload state
+  const [customMailboxMap, setCustomMailboxMap] = useState<any>(null);
+  const [csvUploading, setCsvUploading] = useState(false);
+  const [csvClearing, setCsvClearing] = useState(false);
+  const [csvError, setCsvError] = useState<string | null>(null);
+  const [csvSuccess, setCsvSuccess] = useState<string | null>(null);
+  const csvFileRef = useRef<HTMLInputElement>(null);
   const summary = step6Status?.summary ?? {
     total_tenants: 0,
     step5_complete: 0,
@@ -3261,6 +3269,81 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
     }
   };
 
+  // Fetch custom mailbox map status
+  const fetchCustomMailboxMap = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/custom-mailbox-map`);
+      if (!response.ok) return;
+      const data = await response.json();
+      setCustomMailboxMap(data.has_custom_map ? data : null);
+    } catch (err) {
+      console.warn("Failed to fetch custom mailbox map:", err);
+    }
+  }, [batchId]);
+
+  // Upload custom mailbox CSV
+  const handleCsvUpload = async (file: File) => {
+    setCsvUploading(true);
+    setCsvError(null);
+    setCsvSuccess(null);
+
+    try {
+      const formData = new FormData();
+      formData.append("file", file);
+
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/upload-mailbox-csv`, {
+        method: "POST",
+        body: formData,
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.detail || "Failed to upload CSV");
+      }
+
+      setCsvSuccess(data.message);
+      await fetchCustomMailboxMap();
+    } catch (err) {
+      setCsvError(err instanceof Error ? err.message : "Failed to upload CSV");
+    } finally {
+      setCsvUploading(false);
+      if (csvFileRef.current) csvFileRef.current.value = "";
+    }
+  };
+
+  // Clear custom mailbox map
+  const handleClearCustomMap = async () => {
+    if (!confirm("Clear all custom mailbox mappings? The system will revert to auto-generating email addresses.")) return;
+
+    setCsvClearing(true);
+    setCsvError(null);
+    setCsvSuccess(null);
+
+    try {
+      const response = await fetch(`${API_BASE}/api/v1/wizard/batches/${batchId}/step6/custom-mailbox-map`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(data.detail || "Failed to clear custom map");
+      }
+
+      setCustomMailboxMap(null);
+      setCsvSuccess("Custom mailbox map cleared. Emails will be auto-generated.");
+    } catch (err) {
+      setCsvError(err instanceof Error ? err.message : "Failed to clear custom map");
+    } finally {
+      setCsvClearing(false);
+    }
+  };
+
+  // Fetch custom mailbox map on mount
+  useEffect(() => {
+    fetchCustomMailboxMap();
+  }, [fetchCustomMailboxMap]);
+
   // Get status icon
   const getStatusIcon = (tenant: TenantStep6Status) => {
     if (tenant.step6_complete) return "✅";
@@ -3478,6 +3561,138 @@ function Step6Mailboxes({ batchId, status, onComplete, onNext }: { batchId: stri
             </p>
           </div>
         )}
+      </div>
+
+      {/* Custom Mailbox CSV Upload Panel */}
+      <div className="bg-white rounded-lg shadow p-6">
+        <div className="flex items-center justify-between mb-4">
+          <div>
+            <h3 className="text-lg font-semibold text-gray-900">📧 Custom Mailbox Emails (Optional)</h3>
+            <p className="text-sm text-gray-500 mt-1">
+              Upload a CSV with pre-existing email addresses instead of auto-generating them.
+            </p>
+          </div>
+          {customMailboxMap && (
+            <span className="px-3 py-1 bg-green-100 text-green-700 text-sm font-medium rounded-full">
+              ✓ Custom emails loaded
+            </span>
+          )}
+        </div>
+
+        {/* CSV Error / Success Messages */}
+        {csvError && (
+          <div className="mb-4 bg-red-50 border border-red-200 rounded-lg p-3">
+            <p className="text-red-800 text-sm">{csvError}</p>
+            <button onClick={() => setCsvError(null)} className="text-xs text-red-600 hover:text-red-800 mt-1">Dismiss</button>
+          </div>
+        )}
+        {csvSuccess && (
+          <div className="mb-4 bg-green-50 border border-green-200 rounded-lg p-3">
+            <p className="text-green-800 text-sm">{csvSuccess}</p>
+            <button onClick={() => setCsvSuccess(null)} className="text-xs text-green-600 hover:text-green-800 mt-1">Dismiss</button>
+          </div>
+        )}
+
+        {/* Current Custom Map Status */}
+        {customMailboxMap && (
+          <div className="mb-4 bg-indigo-50 border border-indigo-200 rounded-lg p-4">
+            <div className="flex items-center justify-between mb-3">
+              <h4 className="font-medium text-indigo-900">Uploaded Custom Emails</h4>
+              <button
+                onClick={handleClearCustomMap}
+                disabled={csvClearing || isAutomationRunning}
+                className={`px-3 py-1 text-sm rounded-lg font-medium transition-colors ${
+                  csvClearing || isAutomationRunning
+                    ? "bg-gray-200 text-gray-400 cursor-not-allowed"
+                    : "bg-red-100 text-red-700 hover:bg-red-200"
+                }`}
+              >
+                {csvClearing ? "Clearing..." : "🗑️ Clear All"}
+              </button>
+            </div>
+            <div className="grid grid-cols-2 gap-3 mb-3">
+              <div className="bg-white rounded-lg p-3 text-center border">
+                <div className="text-2xl font-bold text-indigo-600">{customMailboxMap.matched_domains}</div>
+                <div className="text-xs text-gray-500">Matched Domains</div>
+              </div>
+              <div className="bg-white rounded-lg p-3 text-center border">
+                <div className="text-2xl font-bold text-indigo-600">{customMailboxMap.total_emails}</div>
+                <div className="text-xs text-gray-500">Total Emails</div>
+              </div>
+            </div>
+            {customMailboxMap.domains && Object.keys(customMailboxMap.domains).length > 0 && (
+              <details className="text-sm">
+                <summary className="cursor-pointer text-indigo-700 font-medium">
+                  Show domain details ({Object.keys(customMailboxMap.domains).length} domains)
+                </summary>
+                <div className="mt-2 max-h-40 overflow-y-auto space-y-1">
+                  {Object.entries(customMailboxMap.domains).map(([domain, count]: [string, any]) => (
+                    <div key={domain} className="flex justify-between items-center text-xs bg-white rounded px-2 py-1 border">
+                      <span className="text-gray-700 font-mono">{domain}</span>
+                      <span className="text-indigo-600 font-medium">{count} emails</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+          </div>
+        )}
+
+        {/* Upload Area */}
+        <div className="flex items-center gap-4">
+          <input
+            type="file"
+            ref={csvFileRef}
+            className="hidden"
+            accept=".csv"
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) handleCsvUpload(file);
+            }}
+          />
+          <button
+            onClick={() => csvFileRef.current?.click()}
+            disabled={csvUploading || isAutomationRunning}
+            className={`flex-1 py-3 border-2 border-dashed rounded-lg font-medium text-sm transition-colors ${
+              csvUploading || isAutomationRunning
+                ? "border-gray-200 text-gray-400 cursor-not-allowed"
+                : "border-indigo-300 text-indigo-600 hover:border-indigo-500 hover:bg-indigo-50 cursor-pointer"
+            }`}
+          >
+            {csvUploading ? (
+              <span className="flex items-center justify-center gap-2">
+                <span className="animate-spin rounded-full h-4 w-4 border-b-2 border-indigo-600"></span>
+                Uploading...
+              </span>
+            ) : (
+              <>📎 {customMailboxMap ? "Upload Another CSV (merges)" : "Upload Mailbox CSV"}</>
+            )}
+          </button>
+        </div>
+
+        {/* CSV Format Help */}
+        <details className="mt-3 text-sm">
+          <summary className="cursor-pointer text-gray-500 hover:text-gray-700">
+            📋 CSV format help
+          </summary>
+          <div className="mt-2 bg-gray-50 rounded-lg p-3 space-y-2">
+            <p className="text-gray-600">
+              Upload a CSV containing email addresses. The system auto-detects columns and only uses emails matching this batch's domains.
+            </p>
+            <div className="font-mono text-xs bg-white rounded p-2 border overflow-x-auto">
+              <pre>{`email,display_name,password
+john@coldreach.io,John Smith,
+sarah@outbound-mail.co,Sarah Jones,CustomPass123`}</pre>
+            </div>
+            <ul className="text-xs text-gray-500 list-disc list-inside space-y-0.5">
+              <li><strong>email</strong> column is required (auto-detected from: email, address, mailbox, etc.)</li>
+              <li><strong>display_name</strong> is optional — falls back to the Display Name above</li>
+              <li><strong>password</strong> is optional — defaults to #Sendemails1</li>
+              <li>Emails for domains not in this batch are automatically ignored</li>
+              <li>Uploading again merges: new domains are added, existing domains are replaced</li>
+            </ul>
+          </div>
+        </details>
       </div>
 
       {/* Tenant Status Table */}

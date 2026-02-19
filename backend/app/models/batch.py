@@ -76,6 +76,10 @@ class SetupBatch(TimestampUUIDMixin, Base):
     step6_emails_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step6_emails_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
+    # Custom mailbox map: allows importing pre-existing email addresses from CSV
+    # Format: {"domain.com": ["email1@domain.com", "email2@domain.com", ...], ...}
+    custom_mailbox_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    
     # Relationships
     # NOTE: Using save-update/merge instead of delete-orphan to prevent
     # accidental mass deletion of domains/tenants/mailboxes when a batch is deleted.

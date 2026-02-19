@@ -3995,6 +3995,244 @@ async def export_mailboxes_csv(
     )
 
 
+# =============================================================================
+# STEP 6: CUSTOM MAILBOX CSV UPLOAD (Re-use existing email addresses)
+# =============================================================================
+
+
+@router.post("/batches/{batch_id}/step6/upload-mailbox-csv")
+async def upload_mailbox_csv(
+    batch_id: UUID,
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload CSV(s) containing pre-existing email addresses for domains.
+
+    The CSV can contain email addresses for many domains, but only addresses
+    whose domain matches a domain in the current batch will be kept - the rest
+    are silently ignored.
+
+    Accepted CSV formats (auto-detected):
+      • One column: EmailAddress (or just bare emails, one per line)
+      • Multi-column: any column named email / emailaddress / Email Address
+      • Columns named DisplayName / display_name / Password are also captured
+
+    The parsed result is stored as batch.custom_mailbox_map:
+        {"domain.com": [{"email": "...", "display_name": "...", "password": "..."}, ...], ...}
+    
+    Multiple uploads are MERGED (new domains added, existing domains replaced).
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    # Read & decode CSV content
+    try:
+        raw = await file.read()
+        content = raw.decode("utf-8-sig")  # handles BOM
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Could not read file: {e}")
+
+    # --- Parse CSV into email records ---
+    parsed_emails: list[dict] = []  # [{"email", "display_name", "password"}, ...]
+
+    try:
+        # Sniff whether it has a header
+        sniffer_lines = content.strip().splitlines()[:5]
+        has_header = False
+        email_col = None
+        display_col = None
+        password_col = None
+
+        if sniffer_lines:
+            first_line_lower = sniffer_lines[0].lower().replace(" ", "")
+            # Check if first line looks like a header row
+            header_keywords = ["email", "emailaddress", "displayname", "password", "address"]
+            if any(kw in first_line_lower for kw in header_keywords):
+                has_header = True
+
+        reader = csv.reader(io.StringIO(content))
+        rows = list(reader)
+
+        if not rows:
+            raise HTTPException(status_code=400, detail="CSV file is empty")
+
+        if has_header:
+            header = [h.strip().lower().replace(" ", "_").replace("-", "_") for h in rows[0]]
+            data_rows = rows[1:]
+
+            # Find email column
+            for candidate in ["email", "emailaddress", "email_address", "address"]:
+                if candidate in header:
+                    email_col = header.index(candidate)
+                    break
+            if email_col is None:
+                # Fall back to first column
+                email_col = 0
+
+            # Find optional columns
+            for candidate in ["displayname", "display_name", "name", "full_name"]:
+                if candidate in header:
+                    display_col = header.index(candidate)
+                    break
+            for candidate in ["password", "pass", "pwd"]:
+                if candidate in header:
+                    password_col = header.index(candidate)
+                    break
+        else:
+            data_rows = rows
+            email_col = 0  # assume first column is email
+
+        for row in data_rows:
+            if not row or not row[0].strip():
+                continue
+            email_val = row[email_col].strip() if email_col < len(row) else ""
+            if not email_val or "@" not in email_val:
+                continue
+
+            display_val = ""
+            if display_col is not None and display_col < len(row):
+                display_val = row[display_col].strip()
+
+            password_val = ""
+            if password_col is not None and password_col < len(row):
+                password_val = row[password_col].strip()
+
+            parsed_emails.append({
+                "email": email_val.lower(),
+                "display_name": display_val,
+                "password": password_val,
+            })
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse CSV: {e}")
+
+    if not parsed_emails:
+        raise HTTPException(status_code=400, detail="No valid email addresses found in CSV")
+
+    # --- Get batch domains so we can filter ---
+    batch_domains_result = await db.execute(
+        select(Domain.name).where(Domain.batch_id == batch_id)
+    )
+    batch_domain_names: set[str] = {
+        row[0].lower() for row in batch_domains_result.all()
+    }
+
+    # Also check tenant custom_domain (some setups link via tenant)
+    batch_tenant_domains_result = await db.execute(
+        select(Tenant.custom_domain).where(
+            Tenant.batch_id == batch_id,
+            Tenant.custom_domain.isnot(None),
+        )
+    )
+    for row in batch_tenant_domains_result.all():
+        if row[0]:
+            batch_domain_names.add(row[0].lower())
+
+    if not batch_domain_names:
+        raise HTTPException(
+            status_code=400,
+            detail="No domains found in this batch. Import domains first.",
+        )
+
+    # --- Group emails by domain, keeping only matching ones ---
+    matched_map: dict[str, list[dict]] = {}
+    ignored_count = 0
+
+    for entry in parsed_emails:
+        email = entry["email"]
+        domain_part = email.split("@")[1] if "@" in email else ""
+        if domain_part in batch_domain_names:
+            matched_map.setdefault(domain_part, []).append(entry)
+        else:
+            ignored_count += 1
+
+    if not matched_map:
+        return {
+            "success": False,
+            "message": f"None of the {len(parsed_emails)} email addresses matched domains in this batch.",
+            "total_in_csv": len(parsed_emails),
+            "matched": 0,
+            "ignored": ignored_count,
+            "batch_domains": sorted(batch_domain_names),
+        }
+
+    # --- Merge into existing custom_mailbox_map ---
+    existing_map = batch.custom_mailbox_map or {}
+    for domain, entries in matched_map.items():
+        existing_map[domain] = entries  # replace per-domain
+
+    batch.custom_mailbox_map = existing_map
+    await db.commit()
+
+    # Build summary
+    matched_domains = sorted(matched_map.keys())
+    matched_count = sum(len(v) for v in matched_map.values())
+    total_in_map = sum(len(v) for v in existing_map.values())
+
+    logger.info(
+        "Batch %s: Uploaded custom mailbox CSV - %d emails matched across %d domains (%d ignored)",
+        batch_id, matched_count, len(matched_domains), ignored_count,
+    )
+
+    return {
+        "success": True,
+        "message": f"Imported {matched_count} email addresses for {len(matched_domains)} domain(s). {ignored_count} ignored (domain not in batch).",
+        "total_in_csv": len(parsed_emails),
+        "matched": matched_count,
+        "ignored": ignored_count,
+        "matched_domains": {d: len(matched_map[d]) for d in matched_domains},
+        "total_custom_emails": total_in_map,
+        "total_custom_domains": len(existing_map),
+    }
+
+
+@router.get("/batches/{batch_id}/step6/custom-mailbox-map")
+async def get_custom_mailbox_map(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get the current custom mailbox map for a batch (preview what's uploaded)."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    custom_map = batch.custom_mailbox_map or {}
+    domain_summary = {d: len(v) for d, v in custom_map.items()}
+
+    return {
+        "has_custom_map": bool(custom_map),
+        "total_domains": len(custom_map),
+        "total_emails": sum(len(v) for v in custom_map.values()),
+        "domains": domain_summary,
+    }
+
+
+@router.delete("/batches/{batch_id}/step6/custom-mailbox-map")
+async def clear_custom_mailbox_map(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Clear the custom mailbox map - reverts to auto-generated emails."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    had_map = bool(batch.custom_mailbox_map)
+    batch.custom_mailbox_map = None
+    await db.commit()
+
+    logger.info("Batch %s: Cleared custom mailbox map (had_map=%s)", batch_id, had_map)
+
+    return {
+        "success": True,
+        "message": "Custom mailbox map cleared. Automation will generate emails automatically.",
+        "had_custom_map": had_map,
+    }
+
+
 @router.post("/tenants/{tenant_id}/step6/retry")
 async def retry_step6_for_tenant(
     tenant_id: UUID,
