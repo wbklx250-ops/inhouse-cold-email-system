@@ -78,10 +78,11 @@ def prepare_database_url(url: str) -> tuple[str, dict]:
 database_url, connect_args = prepare_database_url(settings.database_url)
 
 # Create async engine with connection pooling settings
+# Pool sized for 300-tenant batch runs: parallel browsers + background jobs + API
 engine = create_async_engine(
     database_url,
-    pool_size=20,
-    max_overflow=30,
+    pool_size=30,
+    max_overflow=50,
     pool_timeout=60,
     pool_recycle=1800,
     pool_pre_ping=True,

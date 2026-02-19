@@ -1053,6 +1053,29 @@ def process_mailbox_sync(
             "skipped": True
         }
     
+    # Preventive browser restart after every N accounts to avoid memory leaks
+    uploader._accounts_since_restart += 1
+    if uploader._accounts_since_restart >= uploader.RESTART_EVERY_N:
+        logger.info(
+            f"[Worker {uploader.worker_id}] Preventive restart after "
+            f"{uploader._accounts_since_restart} accounts"
+        )
+        if not uploader.restart_browser():
+            logger.error(f"[Worker {uploader.worker_id}] Preventive restart failed — attempting to continue")
+        # restart_browser() resets _accounts_since_restart via setup_driver()
+    
+    # Check driver health before attempting upload
+    if not uploader.is_driver_alive():
+        logger.warning(f"[Worker {uploader.worker_id}] Driver not alive — restarting")
+        if not uploader.restart_browser():
+            return {
+                "mailbox_id": mailbox_id,
+                "success": False,
+                "error": "Browser crashed and restart failed",
+                "retries": 0,
+                "verified": False,
+            }
+    
     # Try OAuth upload with retries
     for attempt in range(max_retries + 1):
         try:
@@ -1139,8 +1162,8 @@ async def run_instantly_upload_for_batch(
     Returns:
         Dict with summary: total, uploaded, failed, skipped, errors
     """
-    # Cap workers at 3 for Railway stability
-    num_workers = min(num_workers, 3)
+    # Cap workers at 5 for Railway stability
+    num_workers = min(num_workers, 5)
     logger.info(f"Starting Instantly upload for batch {batch_id} with {num_workers} workers")
     
     # Initialize API client if key provided

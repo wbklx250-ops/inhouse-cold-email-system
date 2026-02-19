@@ -9,7 +9,7 @@ from typing import Any
 os.makedirs("logs", exist_ok=True)
 
 # Setup file logging
-log_filename = f"logs/step6_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+log_filename = f"logs/app_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
 
 logging.basicConfig(
     level=logging.INFO,

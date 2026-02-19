@@ -70,21 +70,27 @@ class SetupBatch(TimestampUUIDMixin, Base):
     
     # Auto-progression mode (Feature 2)
     auto_progress_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    auto_run_state: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)  # Persisted auto-run job state
     
     # Step 6 batch-level tracking
     step6_emails_generated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step6_emails_generated_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     
     # Relationships
+    # NOTE: Using save-update/merge instead of delete-orphan to prevent
+    # accidental mass deletion of domains/tenants/mailboxes when a batch is deleted.
+    # Deleting a batch will unlink records (set batch_id=NULL) rather than delete them.
     domains: Mapped[list[Domain]] = relationship(
         "Domain",
         back_populates="batch",
-        cascade="all, delete-orphan",
+        cascade="save-update, merge",
+        passive_deletes=True,
     )
     tenants: Mapped[list[Tenant]] = relationship(
         "Tenant",
         back_populates="batch",
-        cascade="all, delete-orphan",
+        cascade="save-update, merge",
+        passive_deletes=True,
     )
 
     def __repr__(self) -> str:

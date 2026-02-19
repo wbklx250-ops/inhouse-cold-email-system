@@ -1159,8 +1159,8 @@ class CloudflareService:
         """
         logger.info("Checking NS propagation for %s, expecting: %s", domain, expected_ns)
 
-        try:
-            # DNS resolution is synchronous, run in executor to not block
+        def _resolve_sync() -> bool:
+            """Synchronous DNS resolution - runs in thread to avoid blocking event loop."""
             resolver = dns.resolver.Resolver()
             resolver.timeout = 5
             resolver.lifetime = 10
@@ -1178,6 +1178,10 @@ class CloudflareService:
                 match,
             )
             return match
+
+        try:
+            # Run synchronous DNS resolution in a thread to avoid blocking the event loop
+            return await asyncio.to_thread(_resolve_sync)
         except dns.resolver.NXDOMAIN:
             logger.warning("Domain %s not found (NXDOMAIN)", domain)
             return False

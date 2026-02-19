@@ -342,7 +342,12 @@ class TenantImportService:
         db: AsyncSession,
         batch_id: UUID
     ) -> Dict[str, Any]:
-        """Auto-link tenants to domains (1:1 in order)."""
+        """Auto-link tenants to domains (1:1 in order).
+        
+        FIXED: Now correctly filters domains by checking ALL tenants in the batch
+        (not just unlinked tenants) to avoid double-linking domains that are
+        already assigned to other tenants.
+        """
         
         # Get unlinked tenants
         tenants = (await db.execute(
@@ -352,15 +357,25 @@ class TenantImportService:
             ).order_by(Tenant.created_at)
         )).scalars().all()
         
-        # Get unlinked domains
+        # Get domains that don't have ANY tenant linked to them
+        # Query ALL tenants in the batch to build proper exclusion set
+        all_tenants = (await db.execute(
+            select(Tenant).where(
+                Tenant.batch_id == batch_id,
+                Tenant.domain_id.isnot(None)
+            )
+        )).scalars().all()
+        
+        linked_domain_ids = {t.domain_id for t in all_tenants}
+        
+        # Get all domains in the batch, filtering out already-linked ones
         domains = (await db.execute(
             select(Domain).where(
                 Domain.batch_id == batch_id
             ).order_by(Domain.created_at)
         )).scalars().all()
         
-        # Filter domains not already linked
-        available_domains = [d for d in domains if not any(t.domain_id == d.id for t in tenants)]
+        available_domains = [d for d in domains if d.id not in linked_domain_ids]
         
         linked = 0
         for tenant, domain in zip(tenants, available_domains):

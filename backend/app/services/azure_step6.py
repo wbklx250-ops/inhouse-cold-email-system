@@ -106,30 +106,70 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         results: List[Dict[str, Any]] = []
         successful = 0
         failed = 0
-        
-        for i, tenant in enumerate(tenants, 1):
-            logger.info("=" * 80)
-            logger.info("BATCH PROGRESS: Tenant %s/%s - %s", i, len(tenants), tenant.custom_domain)
-            logger.info("=" * 80)
-            
-            try:
-                tenant_result = await run_step6_for_tenant(tenant.id)
-                results.append({"tenant_id": str(tenant.id), "result": tenant_result})
-                
-                if tenant_result.get("success"):
+
+        # Parallel processing with semaphore (default 5 concurrent browsers)
+        settings = get_settings()
+        max_parallel = int(settings.max_parallel_browsers) if hasattr(settings, "max_parallel_browsers") else 5
+        max_parallel = max(1, min(max_parallel, 10))  # clamp 1-10
+        semaphore = asyncio.Semaphore(max_parallel)
+
+        logger.info(
+            "Processing %s tenants with max_parallel=%s",
+            len(tenants),
+            max_parallel,
+        )
+
+        async def _process_one(idx: int, tenant):
+            async with semaphore:
+                logger.info("=" * 80)
+                logger.info(
+                    "BATCH PROGRESS: Tenant %s/%s - %s",
+                    idx,
+                    len(tenants),
+                    tenant.custom_domain,
+                )
+                logger.info("=" * 80)
+
+                try:
+                    tenant_result = await run_step6_for_tenant(tenant.id)
+                    return {
+                        "tenant_id": str(tenant.id),
+                        "result": tenant_result,
+                    }
+                except Exception as e:
+                    logger.error(
+                        "[%s] Tenant exception: %s",
+                        tenant.custom_domain,
+                        str(e),
+                    )
+                    return {
+                        "tenant_id": str(tenant.id),
+                        "result": {"success": False, "error": str(e)},
+                    }
+
+        tasks = [
+            _process_one(i, tenant)
+            for i, tenant in enumerate(tenants, 1)
+        ]
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for item in gathered:
+            if isinstance(item, Exception):
+                failed += 1
+                results.append(
+                    {"tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
+                )
+            else:
+                results.append(item)
+                if item["result"].get("success"):
                     successful += 1
                 else:
                     failed += 1
-                    logger.error("[%s] Tenant failed: %s", tenant.custom_domain, tenant_result.get("error"))
-            except Exception as e:
-                failed += 1
-                logger.error("[%s] Tenant exception: %s", tenant.custom_domain, str(e))
-                results.append({"tenant_id": str(tenant.id), "result": {"success": False, "error": str(e)}})
-            
-            # Add delay between tenants to allow cleanup (except after last tenant)
-            if i < len(tenants):
-                logger.info("[BATCH] Waiting 10 seconds before next tenant...")
-                await asyncio.sleep(10)
+                    logger.error(
+                        "Tenant %s failed: %s",
+                        item["tenant_id"][:8],
+                        item["result"].get("error"),
+                    )
         
         logger.info("=" * 80)
         logger.info("BATCH COMPLETE: %s/%s successful, %s failed", successful, len(tenants), failed)

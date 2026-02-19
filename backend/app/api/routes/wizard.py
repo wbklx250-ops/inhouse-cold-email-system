@@ -47,6 +47,9 @@ router = APIRouter(prefix="/api/v1/wizard", tags=["wizard"])
 
 logger = logging.getLogger(__name__)
 
+# C2 FIX: prevent fire-and-forget asyncio tasks from being garbage-collected
+_background_tasks: set = set()
+
 # Store active automation jobs
 active_jobs = {}
 
@@ -396,11 +399,27 @@ async def set_batch_sequencer(
 # Store auto-run job progress
 auto_run_jobs = {}
 
+
+async def _persist_auto_run_state(batch_id: UUID) -> None:
+    """Persist the in-memory auto_run_jobs state to the DB so it survives server restarts."""
+    job_id = str(batch_id)
+    state = auto_run_jobs.get(job_id)
+    if state is None:
+        return
+    try:
+        async with async_session_factory() as db:
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.auto_run_state = dict(state)  # shallow copy for JSONB
+                await db.commit()
+    except Exception as exc:
+        logger.warning(f"Failed to persist auto-run state for batch {batch_id}: {exc}")
+
 # Maximum retries per tenant per step
 MAX_AUTO_RETRIES = 4
 
 # Step 7 tuning (Railway-friendly defaults)
-STEP7_MAX_PARALLEL = int(os.getenv("STEP7_MAX_PARALLEL", "1"))
+STEP7_MAX_PARALLEL = int(os.getenv("STEP7_MAX_PARALLEL", "5"))
 STEP7_MAX_ATTEMPTS = int(os.getenv("STEP7_MAX_ATTEMPTS", "6"))
 STEP7_RETRY_BASE_DELAY_SECONDS = int(os.getenv("STEP7_RETRY_BASE_DELAY_SECONDS", "30"))
 STEP7_RETRY_MAX_DELAY_SECONDS = int(os.getenv("STEP7_RETRY_MAX_DELAY_SECONDS", "300"))
@@ -592,36 +611,43 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         auto_run_jobs[job_id]["current_step_name"] = "First Login"
         auto_run_jobs[job_id]["message"] = "Running first-login automation..."
         auto_run_jobs[job_id]["progress"]["step4"]["status"] = "running"
+        await _persist_auto_run_state(batch_id)
 
         await _run_step4_with_retry(batch_id, new_password, job_id)
 
         auto_run_jobs[job_id]["progress"]["step4"]["status"] = "completed"
+        await _persist_auto_run_state(batch_id)
 
         # === STEP 5: Email Setup (Domain + DKIM) ===
         auto_run_jobs[job_id]["current_step"] = 5
         auto_run_jobs[job_id]["current_step_name"] = "Email Setup"
         auto_run_jobs[job_id]["message"] = "Adding domains to M365 and configuring DKIM..."
         auto_run_jobs[job_id]["progress"]["step5"]["status"] = "running"
+        await _persist_auto_run_state(batch_id)
 
         await _run_step5_with_retry(batch_id, job_id)
 
         auto_run_jobs[job_id]["progress"]["step5"]["status"] = "completed"
+        await _persist_auto_run_state(batch_id)
 
         # === STEP 6: Mailbox Creation ===
         auto_run_jobs[job_id]["current_step"] = 6
         auto_run_jobs[job_id]["current_step_name"] = "Mailbox Creation"
         auto_run_jobs[job_id]["message"] = f"Creating mailboxes with display name '{display_name}'..."
         auto_run_jobs[job_id]["progress"]["step6"]["status"] = "running"
+        await _persist_auto_run_state(batch_id)
 
         await _run_step6_with_retry(batch_id, display_name, job_id)
 
         auto_run_jobs[job_id]["progress"]["step6"]["status"] = "completed"
+        await _persist_auto_run_state(batch_id)
 
         # === STEP 7: SMTP Auth ===
         auto_run_jobs[job_id]["current_step"] = 7
         auto_run_jobs[job_id]["current_step_name"] = f"SMTP Auth + {sequencer_name} Consent"
         auto_run_jobs[job_id]["message"] = f"Enabling SMTP authentication and granting {sequencer_name} consent..."
         auto_run_jobs[job_id]["progress"]["step7"]["status"] = "running"
+        await _persist_auto_run_state(batch_id)
 
         await _run_step7_with_retry(batch_id, job_id)
 
@@ -631,6 +657,7 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         auto_run_jobs[job_id]["status"] = "completed"
         auto_run_jobs[job_id]["message"] = "All steps completed successfully!"
         auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        await _persist_auto_run_state(batch_id)
         
         # Mark batch as completed
         async with async_session_factory() as db:
@@ -648,6 +675,7 @@ async def _run_auto_progression(batch_id: UUID, new_password: str, display_name:
         auto_run_jobs[job_id]["error"] = str(e)
         auto_run_jobs[job_id]["message"] = f"Auto-run failed: {str(e)}"
         auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        await _persist_auto_run_state(batch_id)
         logger.error(f"Auto-run FAILED for batch {batch_id}: {e}")
         import traceback
         logger.error(traceback.format_exc())
@@ -808,8 +836,9 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
         # Run step 6
         await run_azure_step6_for_batch(batch_id, display_name)
         
-        # Wait for completion (with timeout)
-        max_wait = 60 * 30  # 30 minutes max
+        # Wait for completion (with dynamic timeout based on tenant count)
+        # At least 30 min, plus ~10 min per tenant for parallel processing
+        max_wait = max(1800, len(tenants) * 600)
         waited = 0
         while waited < max_wait:
             await asyncio.sleep(30)
@@ -896,7 +925,7 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
             
             tenant_ids = [t.id for t in tenants]
         
-        # Run step 7
+        # Run step 7 (awaited directly since _run_step7_batch is async)
         await _run_step7_batch(
             batch_id,
             tenant_ids,
@@ -904,8 +933,26 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
             increment_retry_count=False,
         )
         
-        # Wait for completion
-        await asyncio.sleep(len(tenant_ids) * 30 + 60)  # ~30s per tenant + buffer
+        # C4 FIX: Poll DB for completion instead of fixed sleep
+        # Dynamic max wait: at least 10 min, ~2 min per tenant for parallel processing
+        max_wait = max(600, len(tenant_ids) * 120)
+        waited = 0
+        while waited < max_wait:
+            await asyncio.sleep(30)
+            waited += 30
+            
+            async with async_session_factory() as poll_db:
+                still_pending = await poll_db.scalar(
+                    select(func.count(Tenant.id)).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.step6_complete == True,
+                        Tenant.step7_complete == False,
+                        Tenant.step7_error.is_(None),
+                    )
+                ) or 0
+                
+                if still_pending == 0:
+                    break
         
         # Update retry counts
         async with async_session_factory() as db:
@@ -957,8 +1004,20 @@ async def get_auto_run_status(batch_id: UUID, db: AsyncSession = Depends(get_db)
     job_id = str(batch_id)
     
     if job_id not in auto_run_jobs:
-        # Check if batch has auto_progress_enabled
+        # C5 FIX: Try to restore from persisted DB state (survives server restarts)
         batch = await db.get(SetupBatch, batch_id)
+        if batch and batch.auto_run_state:
+            # Restore into memory so subsequent polls are fast
+            auto_run_jobs[job_id] = batch.auto_run_state
+            # If the server restarted mid-run, mark as interrupted
+            if batch.auto_run_state.get("status") == "running":
+                auto_run_jobs[job_id]["status"] = "interrupted"
+                auto_run_jobs[job_id]["message"] = (
+                    "Auto-run was in progress when server restarted. "
+                    "Progress up to the last completed step has been preserved. "
+                    "Re-start auto-run or continue manually from the current step."
+                )
+            return auto_run_jobs[job_id]
         if batch and batch.auto_progress_enabled:
             return {
                 "status": "unknown",
@@ -998,10 +1057,11 @@ async def stop_auto_run(batch_id: UUID, db: AsyncSession = Depends(get_db)):
     auto_run_jobs[job_id]["message"] = "Auto-run was stopped by user. Progress has been preserved."
     auto_run_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
     
-    # Disable auto-progress on batch
+    # Disable auto-progress on batch and persist stopped state
     batch = await db.get(SetupBatch, batch_id)
     if batch:
         batch.auto_progress_enabled = False
+        batch.auto_run_state = dict(auto_run_jobs[job_id])
         await db.commit()
     
     logger.info(f"Auto-run STOPPED for batch {batch_id}")
@@ -4429,7 +4489,9 @@ async def start_step7(
         }
 
     import asyncio
-    asyncio.create_task(_run_step7_batch(batch_id, [t.id for t in to_process]))
+    task = asyncio.create_task(_run_step7_batch(batch_id, [t.id for t in to_process]))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "success": True,
@@ -4881,7 +4943,9 @@ async def retry_step7_failed(
     await db.commit()
 
     import asyncio
-    asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+    task = asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "success": True,
@@ -4921,7 +4985,9 @@ async def rerun_step7_all(
 
     tenant_ids = [t.id for t in eligible]
     import asyncio
-    asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+    task = asyncio.create_task(_run_step7_batch(batch_id, tenant_ids))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
     return {
         "success": True,

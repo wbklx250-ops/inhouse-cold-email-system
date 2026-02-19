@@ -2,13 +2,14 @@
 Graph API Authentication with admin consent flow.
 
 Uses the Email Platform app registration that requires admin consent per tenant.
+Includes resilient token extraction fallbacks (storage/network/consent).
 """
 
 import json
 import logging
 import time
 import urllib.parse
-from typing import Optional
+from typing import Optional, Iterable
 
 import requests
 from selenium import webdriver
@@ -22,14 +23,13 @@ REDIRECT_URI = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 
 
 def get_graph_token_with_consent(driver: webdriver.Chrome, tenant_domain: str) -> Optional[str]:
-    """Get Graph token, forcing consent prompt."""
-    
-    logger.info(f"Getting Graph token for {tenant_domain}")
+    """Get Graph token via OAuth consent flow with resilient URL checks."""
+
+    logger.info("Getting Graph token for %s", tenant_domain)
     original_url = driver.current_url
-    
-    # Use prompt=consent to force the consent screen
+
     scope = "https://graph.microsoft.com/User.ReadWrite.All https://graph.microsoft.com/Directory.ReadWrite.All offline_access"
-    
+
     auth_url = (
         f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/authorize?"
         f"client_id={CLIENT_ID}"
@@ -37,60 +37,162 @@ def get_graph_token_with_consent(driver: webdriver.Chrome, tenant_domain: str) -
         f"&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
         f"&scope={urllib.parse.quote(scope)}"
         f"&response_mode=query"
-        f"&prompt=consent"  # Force consent screen
+        f"&prompt=consent"
     )
-    
-    logger.info("Navigating to OAuth with consent prompt...")
+
+    logger.info("Navigating to OAuth consent URL...")
     driver.get(auth_url)
     time.sleep(5)
-    
-    current_url = driver.current_url
-    logger.info(f"Current URL: {current_url[:100]}")
-    
-    # Look for and click Accept button on consent screen
+
     try:
-        from selenium.webdriver.common.by import By
         from selenium.webdriver.support.ui import WebDriverWait
         from selenium.webdriver.support import expected_conditions as EC
-        
-        # Wait for Accept button
-        accept_btn = WebDriverWait(driver, 15).until(
-            EC.element_to_be_clickable((By.ID, "idBtn_Accept"))
-        )
-        logger.info("Found Accept button, clicking...")
-        accept_btn.click()
-        time.sleep(5)
-        logger.info("Clicked Accept")
-        
-    except Exception as e:
-        logger.warning(f"No Accept button found: {e}")
-        # Maybe already consented or auto-approved
-    
-    # Check for auth code in URL
+
+        accept_selectors = [
+            (By.ID, "idBtn_Accept"),
+            (By.ID, "idSIButton9"),
+            (By.XPATH, "//button[contains(., 'Accept')]") ,
+            (By.XPATH, "//button[contains(., 'Allow')]") ,
+        ]
+
+        for by, value in accept_selectors:
+            try:
+                accept_btn = WebDriverWait(driver, 6).until(
+                    EC.element_to_be_clickable((by, value))
+                )
+                logger.info("Found consent button, clicking...")
+                accept_btn.click()
+                time.sleep(4)
+                break
+            except Exception:
+                continue
+    except Exception as exc:
+        logger.warning("Consent button handling error: %s", exc)
+
+    # Wait for redirect to include code or error
+    for _ in range(20):
+        current_url = driver.current_url
+        if "code=" in current_url or "error=" in current_url:
+            break
+        time.sleep(1)
+
     current_url = driver.current_url
-    logger.info(f"After consent URL: {current_url[:150]}")
-    
+    logger.info("After consent URL: %s", current_url[:180])
+
     if "code=" in current_url:
         parsed = urllib.parse.urlparse(current_url)
         params = urllib.parse.parse_qs(parsed.query)
         code = params.get("code", [None])[0]
-        
         if code:
-            logger.info(f"✓ Got auth code, length: {len(code)}")
+            logger.info("✓ Got auth code, length: %s", len(code))
             token = _exchange_code_for_token(code, tenant_domain)
             driver.get(original_url)
             time.sleep(2)
             return token
-    
+
     if "error" in current_url:
         parsed = urllib.parse.urlparse(current_url)
         params = urllib.parse.parse_qs(parsed.query)
         error = params.get("error", [""])[0]
         desc = params.get("error_description", [""])[0]
-        logger.error(f"Auth error: {error} - {urllib.parse.unquote(desc)}")
-    
+        logger.error("Auth error: %s - %s", error, urllib.parse.unquote(desc))
+
     driver.get(original_url)
     time.sleep(2)
+    return None
+
+
+def validate_graph_token(token: str) -> bool:
+    """Validate token against Graph API."""
+    try:
+        response = requests.get(
+            "https://graph.microsoft.com/v1.0/users?$top=1",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10,
+        )
+        return response.status_code == 200
+    except Exception as exc:
+        logger.debug("Token validation failed: %s", exc)
+        return False
+
+
+def extract_graph_token_from_storage(driver: webdriver.Chrome) -> Optional[str]:
+    """Extract Graph token from browser storage after admin login."""
+    logger.info("Extracting Graph token from storage...")
+    driver.get("https://admin.microsoft.com/#/users")
+    time.sleep(8)
+
+    script = """
+        let tokens = [];
+        const storages = [localStorage, sessionStorage];
+        for (const storage of storages) {
+            for (let i = 0; i < storage.length; i++) {
+                const key = storage.key(i);
+                const value = storage.getItem(key);
+                if (!value) continue;
+                try {
+                    const parsed = JSON.parse(value);
+                    const token = parsed.secret || parsed.accessToken || parsed.access_token;
+                    if (token && token.startsWith('eyJ') && token.length > 500) {
+                        tokens.push(token);
+                    }
+                } catch(e) {
+                    if (value.startsWith('eyJ') && value.length > 500) {
+                        tokens.push(value);
+                    }
+                }
+            }
+        }
+        return tokens;
+    """
+
+    tokens = driver.execute_script(script) or []
+    logger.info("Found %s tokens in storage", len(tokens))
+    for token in tokens:
+        if validate_graph_token(token):
+            logger.info("✓ Storage token validated")
+            return token
+    return None
+
+
+def extract_graph_token_from_network(driver: webdriver.Chrome) -> Optional[str]:
+    """Extract Graph token from Chrome performance logs."""
+    logger.info("Extracting Graph token from network logs...")
+    try:
+        driver.get("https://admin.microsoft.com/#/users")
+        time.sleep(8)
+        logs = driver.get_log("performance")
+        for entry in logs:
+            message = json.loads(entry.get("message", "{}")).get("message", {})
+            if message.get("method") != "Network.requestWillBeSent":
+                continue
+            params = message.get("params", {})
+            request = params.get("request", {})
+            headers = request.get("headers", {})
+            auth_header = headers.get("Authorization") or headers.get("authorization")
+            if auth_header and auth_header.startswith("Bearer "):
+                token = auth_header.split("Bearer ")[-1].strip()
+                if token and token.startswith("eyJ"):
+                    if validate_graph_token(token):
+                        logger.info("✓ Network token validated")
+                        return token
+    except Exception as exc:
+        logger.warning("Network token extraction failed: %s", exc)
+    return None
+
+
+def get_graph_token_resilient(driver: webdriver.Chrome, tenant_domain: str) -> Optional[str]:
+    """Get Graph token using storage/network extraction with consent fallback."""
+    token = extract_graph_token_from_storage(driver)
+    if token:
+        return token
+    token = extract_graph_token_from_network(driver)
+    if token:
+        return token
+    token = get_graph_token_with_consent(driver, tenant_domain)
+    if token and validate_graph_token(token):
+        return token
+    logger.error("Failed to obtain a valid Graph token for %s", tenant_domain)
     return None
 
 
