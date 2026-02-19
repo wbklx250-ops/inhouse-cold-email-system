@@ -93,9 +93,6 @@ async def retry_dkim_enable_job():
             
             logger.info(f"Found {len(tenants)} tenants pending DKIM enable")
             
-            # Import admin portal automation
-            from app.services.selenium.admin_portal import AdminPortalAutomation
-            
             for tenant in tenants:
                 try:
                     # Get the domain

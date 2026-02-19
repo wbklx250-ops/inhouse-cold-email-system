@@ -24,10 +24,16 @@ from app.services.tenant_automation import BrowserWorker
 # New modular Step 5 engine — these are the primary entry points now.
 # m365_setup.py imports from step5_orchestrator directly, but these
 # re-exports maintain backward compatibility for any other importers.
-from app.services.selenium.step5_orchestrator import (  # noqa: F401
-    run_domain_setup_bulletproof,
-    try_dkim_enable_standalone,
-)
+# Wrapped in try/except to prevent import failures from breaking the entire app.
+try:
+    from app.services.selenium.step5_orchestrator import (  # noqa: F401
+        run_domain_setup_bulletproof,
+        try_dkim_enable_standalone,
+    )
+except ImportError as e:
+    logging.getLogger(__name__).warning(f"Step 5 orchestrator import failed (non-fatal): {e}")
+    run_domain_setup_bulletproof = None
+    try_dkim_enable_standalone = None
 
 logger = logging.getLogger(__name__)
 SCREENSHOTS = "C:/temp/screenshots"

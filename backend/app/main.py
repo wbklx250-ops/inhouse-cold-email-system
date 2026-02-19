@@ -62,6 +62,20 @@ async def lifespan(app: FastAPI):
         logger.error("Database connection failed: %s", e)
         raise
 
+    # Safety net: ensure new columns exist even if Alembic migration failed
+    logger.info("Ensuring required database columns exist...")
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text(
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS dns_configured BOOLEAN DEFAULT FALSE"
+            ))
+            await conn.execute(text(
+                "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS permanently_failed BOOLEAN DEFAULT FALSE"
+            ))
+        logger.info("Database columns verified")
+    except Exception as e:
+        logger.warning("Column safety net failed (non-fatal): %s", e)
+
     # Startup: Ensure PowerShell modules are installed (for M365 automation)
     logger.info("Checking PowerShell environment...")
     if check_powershell_available():
