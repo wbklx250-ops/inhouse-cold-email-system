@@ -31,10 +31,16 @@ class Settings(BaseSettings):
     screenshot_dir: str = "/tmp/screenshots"  # Directory for browser screenshots
     
     # Parallel Processing for Step 5
-    # Controls how many browser instances run simultaneously
-    # Reduced from 3 to 2 to prevent Chrome resource exhaustion crashes
-    # Each headless Chrome uses ~200-300MB RAM, so 2 = ~600MB RAM needed
-    max_parallel_browsers: int = 2
+    # ALWAYS 1 per worker. Parallelism = multiple workers, NOT multiple browsers.
+    # Each headless Chrome uses ~200-300MB RAM
+    max_parallel_browsers: int = 1
+
+    # Step 5 retry configuration (3-layer retry system)
+    step5_domain_retries: int = 3      # Layer 3: Full domain retry with fresh browser
+    step5_phase_retries: int = 3       # Layer 2: Per-phase retry
+    step5_dns_wait_seconds: int = 45   # Initial DNS propagation wait
+    step5_dkim_wait_seconds: int = 90  # DKIM CNAME propagation wait
+    step5_verify_retry_wait: int = 60  # Extra wait before verify retry
     
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)

@@ -156,6 +156,10 @@ class Tenant(TimestampUUIDMixin, Base):
     dkim_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Background job retry counter
     dkim_last_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)  # Last retry timestamp
 
+    # === STEP 5 BULLETPROOF TRACKING ===
+    dns_configured: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # All DNS records (MX, SPF, autodiscover) added
+    permanently_failed: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)  # Failed after all retries
+
     # === MAILBOX TRACKING ===
     target_mailbox_count: Mapped[int] = mapped_column(Integer, nullable=False, default=50)
     mailbox_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)  # Actual count
