@@ -9,7 +9,7 @@ import sqlalchemy as sa
 
 # revision identifiers
 revision = "025"
-down_revision = "024"
+down_revision = "024_add_custom_mailbox_map"
 branch_labels = None
 depends_on = None
 

@@ -36,8 +36,30 @@ def phase_login(driver, admin_email, admin_password, totp_secret, domain):
     for attempt in range(1, PHASE_RETRIES + 1):
         try:
             logger.info(f"[{domain}] LOGIN attempt {attempt}/{PHASE_RETRIES}")
-            driver.get("https://admin.microsoft.com")
+
+            # Navigate — wrapped with explicit logging
+            logger.info(f"[{domain}] Navigating to admin.microsoft.com...")
+            try:
+                driver.get("https://admin.microsoft.com")
+                logger.info(f"[{domain}] Navigation complete, URL: {driver.current_url}")
+            except Exception as nav_err:
+                logger.error(f"[{domain}] Navigation FAILED: {nav_err}")
+                try:
+                    save_screenshot(driver, domain, f"nav_failed_a{attempt}")
+                except Exception:
+                    pass
+                continue
+
             time.sleep(4)
+            logger.info(f"[{domain}] After wait, URL: {driver.current_url}")
+
+            # Check page loaded
+            try:
+                page_text_preview = driver.find_element(By.TAG_NAME, "body").text[:200]
+                logger.info(f"[{domain}] Page text preview: {page_text_preview}")
+            except Exception as e:
+                logger.warning(f"[{domain}] Cannot read page body: {e}")
+
             dismiss_popups(driver)
             save_screenshot(driver, domain, f"login_start_a{attempt}")
 
@@ -56,8 +78,8 @@ def phase_login(driver, admin_email, admin_password, totp_secret, domain):
                             (By.XPATH, "//*[contains(text(), 'use a different account')]"),
                         ], "use another account", domain)
                         time.sleep(2)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{domain}] Account picker handling: {e}")
 
             # --- EMAIL ---
             try:
@@ -104,8 +126,8 @@ def phase_login(driver, admin_email, admin_password, totp_secret, domain):
                         (By.XPATH, "//button[contains(text(), 'Next')]"),
                     ], "Action Required Next", domain, timeout=5)
                     time.sleep(3)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"[{domain}] Action required handling: {e}")
 
             # --- MFA / TOTP ---
             try:
@@ -156,8 +178,8 @@ def phase_login(driver, admin_email, admin_password, totp_secret, domain):
                     (By.XPATH, "//button[contains(text(), 'Yes')]"),
                 ], "Stay signed in - Yes", domain, timeout=8)
                 time.sleep(3)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.info(f"[{domain}] Stay signed in prompt not found (OK): {e}")
 
             # --- VERIFY LOGGED IN ---
             time.sleep(3)
