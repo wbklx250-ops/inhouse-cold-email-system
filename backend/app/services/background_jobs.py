@@ -93,6 +93,9 @@ async def retry_dkim_enable_job():
             
             logger.info(f"Found {len(tenants)} tenants pending DKIM enable")
             
+            # Import admin portal automation
+            from app.services.selenium.admin_portal import AdminPortalAutomation
+            
             for tenant in tenants:
                 try:
                     # Get the domain
@@ -109,34 +112,23 @@ async def retry_dkim_enable_job():
                         logger.warning(f"[{domain.name}] Missing credentials, skipping")
                         continue
                     
-                    # Skip if last retry was less than 15 minutes ago
-                    if tenant.dkim_last_retry_at:
-                        elapsed = (datetime.utcnow() - tenant.dkim_last_retry_at).total_seconds()
-                        if elapsed < 900:  # 15 minutes
-                            logger.debug(f"[{domain.name}] Last retry was {int(elapsed)}s ago, skipping (need 900s)")
-                            continue
-                    
                     # Update retry tracking
                     tenant.dkim_retry_count += 1
                     tenant.dkim_last_retry_at = datetime.utcnow()
                     await session.commit()
                     
-                    logger.info(f"[{domain.name}] Attempting DKIM enable (retry #{tenant.dkim_retry_count})")
+                    logger.info(f"[{domain.name}] Attempting DKIM enable (retry #{tenant.dkim_retry_count}, last retry: {tenant.dkim_last_retry_at})")
                     
-                    # Try to enable DKIM via standalone function (fresh browser, guaranteed cleanup)
-                    from app.services.selenium.step5_orchestrator import try_dkim_enable_standalone
-                    
-                    loop = asyncio.get_event_loop()
-                    success = await loop.run_in_executor(
-                        None,
-                        try_dkim_enable_standalone,
-                        domain.name,
-                        tenant.admin_email,
-                        tenant.admin_password,
-                        tenant.totp_secret,
+                    # Try to enable DKIM via Exchange Admin Center UI
+                    automation = AdminPortalAutomation(headless=True)  # Run headless for background job
+                    result = await automation.enable_dkim_via_ui(
+                        admin_email=tenant.admin_email,
+                        admin_password=tenant.admin_password,
+                        totp_secret=tenant.totp_secret,
+                        domain_name=domain.name
                     )
                     
-                    if success:
+                    if result.success:
                         logger.info(f"[{domain.name}] DKIM enabled successfully on retry #{tenant.dkim_retry_count}!")
                         
                         # Update tenant
@@ -144,8 +136,6 @@ async def retry_dkim_enable_job():
                         tenant.dkim_enabled_at = datetime.utcnow()
                         tenant.status = TenantStatus.DKIM_ENABLED
                         tenant.setup_error = None
-                        tenant.step5_complete = True
-                        tenant.step5_completed_at = datetime.utcnow()
                         
                         # Update domain
                         domain.dkim_enabled = True
@@ -155,10 +145,17 @@ async def retry_dkim_enable_job():
                         logger.info(f"[{domain.name}] Status updated to DKIM_ENABLED")
                         
                     else:
-                        logger.info(f"[{domain.name}] DKIM enable failed (retry #{tenant.dkim_retry_count}), will retry in {DKIM_RETRY_INTERVAL_MINUTES} minutes")
+                        error = result.error or "Unknown error"
+                        if "not found" in error.lower():
+                            logger.info(f"[{domain.name}] Domain not yet in DKIM list (retry #{tenant.dkim_retry_count}), will retry in {DKIM_RETRY_INTERVAL_MINUTES} minutes")
+                        else:
+                            logger.warning(f"[{domain.name}] DKIM enable failed (retry #{tenant.dkim_retry_count}): {error}")
+                        
+                        # Don't update status - let it retry next cycle
+                        # Just log the error but keep status as PENDING_DKIM
                     
                     # Wait between tenants to avoid rate limiting
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
                     
                 except Exception as e:
                     logger.error(f"[{tenant.name}] Error enabling DKIM: {e}")
