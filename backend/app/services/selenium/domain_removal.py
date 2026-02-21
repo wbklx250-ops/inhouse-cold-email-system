@@ -710,13 +710,13 @@ def remove_domain_from_m365(
             logger.info(f"Domain '{domain_name}' removed successfully (no longer on current page)")
             return {"success": True, "error": None}
         
-        # Navigate to domains list and check — retry up to 3 times with waits
+        # Navigate to domains list and check — retry up to 4 times with waits
         # because M365 removal is async and can take time to disappear from the list
-        max_verify_attempts = 3
+        max_verify_attempts = 4
         for verify_attempt in range(max_verify_attempts):
             try:
                 driver.get("https://admin.cloud.microsoft/#/Domains")
-                wait_time = 10 + (verify_attempt * 5)  # 10s, 15s, 20s
+                wait_time = 15 + (verify_attempt * 10)  # 15s, 25s, 35s, 45s
                 logger.info(f"Verify attempt {verify_attempt + 1}/{max_verify_attempts}: waiting {wait_time}s for domains list to load...")
                 time.sleep(wait_time)
                 
@@ -730,12 +730,15 @@ def remove_domain_from_m365(
                         continue
                     else:
                         screenshot(driver, "07_domain_still_present", domain_name)
-                        # Even if domain is still in list, if we successfully clicked "Automatically remove",
-                        # treat it as success since M365 is processing it
-                        if confirm_clicked:
-                            logger.info(f"Domain '{domain_name}' still in list but 'Automatically remove' was clicked — treating as success (M365 processing)")
-                            return {"success": True, "error": None, "note": "Removal initiated - M365 may still be processing"}
-                        return {"success": False, "error": "Domain still appears in tenant after removal attempt"}
+                        # Domain is STILL in the list after all verification attempts
+                        # Do NOT treat as success — the domain was not actually removed
+                        logger.warning(f"Domain '{domain_name}' still in tenant domain list after {max_verify_attempts} verification attempts — removal FAILED")
+                        return {
+                            "success": False,
+                            "error": f"Domain still present in tenant after removal attempt and {max_verify_attempts} verification checks",
+                            "confirm_button_clicked": confirm_clicked,
+                            "needs_retry": True
+                        }
                 except NoSuchElementException:
                     driver.implicitly_wait(10)
                     logger.info(f"Domain '{domain_name}' confirmed removed (not in domain list on attempt {verify_attempt + 1})")
@@ -744,15 +747,23 @@ def remove_domain_from_m365(
                 driver.implicitly_wait(10)
                 logger.warning(f"Error during verification attempt {verify_attempt + 1}: {e}")
                 if verify_attempt == max_verify_attempts - 1:
-                    # If we can't even load the page but we clicked the button, treat as success
-                    if confirm_clicked:
-                        return {"success": True, "error": None, "note": "Removal initiated but could not verify"}
-                    return {"success": False, "error": f"Could not verify removal: {e}"}
+                    # Could not load the verification page — we cannot confirm removal
+                    logger.error(f"Could not verify removal of '{domain_name}' — treating as FAILED to be safe")
+                    return {
+                        "success": False,
+                        "error": f"Could not verify removal (page load failed): {e}",
+                        "confirm_button_clicked": confirm_clicked,
+                        "needs_retry": True
+                    }
         
-        # Should not reach here, but just in case
-        if confirm_clicked:
-            return {"success": True, "error": None, "note": "Removal button clicked - assume success"}
-        return {"success": False, "error": "Unknown state after removal attempt"}
+        # Should not reach here, but just in case — never assume success without confirmation
+        logger.error(f"Domain '{domain_name}' removal could not be confirmed — treating as FAILED")
+        return {
+            "success": False,
+            "error": "Removal could not be confirmed after all attempts",
+            "confirm_button_clicked": confirm_clicked,
+            "needs_retry": True
+        }
         
     except Exception as e:
         logger.exception(f"Error removing domain '{domain_name}': {e}")

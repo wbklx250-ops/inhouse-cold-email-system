@@ -243,6 +243,7 @@ class DomainRemovalService:
         cloudflare_zone_id: Optional[str],
         skip_m365: bool,
         headless: bool,
+        max_retries: int = 2,
     ) -> Dict[str, Any]:
         """
         Core removal logic shared by both Mode 1 and Mode 2.
@@ -344,26 +345,59 @@ class DomainRemovalService:
         else:
             steps["reset_upns"] = {"skipped": True, "note": "M365 operations skipped"}
         
-        # ===== STEP 3: Remove domain from M365 tenant (Selenium) =====
+        # ===== STEP 3: Remove domain from M365 tenant (Selenium) with retry =====
         if not skip_m365:
-            try:
-                logger.info(f"[{domain_name}] Step 3: Removing domain from M365 via Admin Portal...")
-                
-                from app.services.selenium.domain_removal import remove_domain_from_m365
-                
-                # Run synchronous Selenium in thread pool
-                m365_result = await asyncio.to_thread(
-                    remove_domain_from_m365,
-                    domain_name=domain_name,
-                    admin_email=admin_email,
-                    admin_password=admin_password,
-                    totp_secret=totp_secret,
-                    headless=headless
-                )
-                steps["m365_removal"] = m365_result
-            except Exception as e:
-                logger.error(f"[{domain_name}] Error removing from M365: {e}")
-                steps["m365_removal"] = {"success": False, "error": str(e)}
+            from app.services.selenium.domain_removal import remove_domain_from_m365
+            
+            total_attempts = 1 + max_retries  # 1 initial + N retries
+            m365_result = None
+            
+            for attempt in range(total_attempts):
+                try:
+                    if attempt == 0:
+                        logger.info(f"[{domain_name}] Step 3: Removing domain from M365 via Admin Portal...")
+                    else:
+                        retry_delay = 30 * attempt  # 30s, 60s, etc.
+                        logger.info(f"[{domain_name}] Step 3: RETRY {attempt}/{max_retries} — waiting {retry_delay}s before retrying M365 removal...")
+                        await asyncio.sleep(retry_delay)
+                    
+                    # Run synchronous Selenium in thread pool
+                    m365_result = await asyncio.to_thread(
+                        remove_domain_from_m365,
+                        domain_name=domain_name,
+                        admin_email=admin_email,
+                        admin_password=admin_password,
+                        totp_secret=totp_secret,
+                        headless=headless
+                    )
+                    
+                    if m365_result.get("success"):
+                        logger.info(f"[{domain_name}] M365 removal succeeded on attempt {attempt + 1}")
+                        m365_result["attempts"] = attempt + 1
+                        break
+                    else:
+                        needs_retry = m365_result.get("needs_retry", False)
+                        if needs_retry and attempt < total_attempts - 1:
+                            logger.warning(f"[{domain_name}] M365 removal failed on attempt {attempt + 1}: {m365_result.get('error')} — will retry")
+                            continue
+                        elif not needs_retry:
+                            # Non-retryable failure (e.g., login failed, button not found)
+                            logger.error(f"[{domain_name}] M365 removal failed (non-retryable): {m365_result.get('error')}")
+                            m365_result["attempts"] = attempt + 1
+                            break
+                        else:
+                            # Last attempt also failed
+                            logger.error(f"[{domain_name}] M365 removal failed after all {attempt + 1} attempts: {m365_result.get('error')}")
+                            m365_result["attempts"] = attempt + 1
+                            break
+                except Exception as e:
+                    logger.error(f"[{domain_name}] Error removing from M365 (attempt {attempt + 1}): {e}")
+                    m365_result = {"success": False, "error": str(e), "attempts": attempt + 1}
+                    if attempt < total_attempts - 1:
+                        continue
+                    break
+            
+            steps["m365_removal"] = m365_result or {"success": False, "error": "No result from M365 removal"}
         else:
             steps["m365_removal"] = {"skipped": True, "note": "M365 operations skipped"}
         
@@ -451,7 +485,8 @@ class DomainRemovalService:
         db: AsyncSession,
         domain_name: str,
         skip_m365: bool = False,
-        headless: bool = True
+        headless: bool = True,
+        max_retries: int = 2
     ) -> Dict[str, Any]:
         """
         Mode 1: Remove a domain using database records.
@@ -508,13 +543,55 @@ class DomainRemovalService:
             totp_secret=getattr(tenant, 'totp_secret', None),
             cloudflare_zone_id=domain.cloudflare_zone_id,
             skip_m365=skip_m365,
-            headless=headless
+            headless=headless,
+            max_retries=max_retries
         )
         result["steps"] = removal["steps"]
         
-        # ===== STEP 5: Update database =====
+        # ===== CHECK: Did M365 removal succeed? =====
+        # CRITICAL: Only clean up the database if M365 removal was confirmed successful
+        # or was intentionally skipped. If M365 removal failed, we MUST keep the tenant
+        # link intact so the system can retry the removal later.
+        m365_ok = (
+            result["steps"].get("m365_removal", {}).get("success", False)
+            or result["steps"].get("m365_removal", {}).get("skipped", False)
+        )
+        
+        if not m365_ok:
+            # M365 removal FAILED — do NOT clear the database
+            # Mark domain as PROBLEM so it's visible, but keep tenant link for retry
+            m365_error = result["steps"].get("m365_removal", {}).get("error", "Unknown error")
+            m365_attempts = result["steps"].get("m365_removal", {}).get("attempts", 1)
+            
+            logger.error(
+                f"[{domain_name}] M365 removal FAILED after {m365_attempts} attempt(s): {m365_error} "
+                f"— keeping tenant link intact for retry (tenant: {tenant.name})"
+            )
+            
+            try:
+                domain.status = DomainStatus.PROBLEM
+                domain.error_message = (
+                    f"M365 removal failed after {m365_attempts} attempt(s): {m365_error} "
+                    f"(tenant: {tenant.name}, {datetime.utcnow().isoformat()})"
+                )
+                await db.commit()
+            except Exception as e:
+                await db.rollback()
+                logger.error(f"[{domain_name}] Could not update domain status to PROBLEM: {e}")
+            
+            result["success"] = False
+            result["error"] = f"M365 removal failed: {m365_error}"
+            result["steps"]["database_update"] = {
+                "success": True,
+                "note": "Domain marked as PROBLEM — tenant link preserved for retry",
+                "m365_failed": True
+            }
+            result["completed_at"] = datetime.utcnow().isoformat()
+            return result
+        
+        # ===== STEP 5: Update database (only if M365 removal succeeded) =====
         try:
-            logger.info(f"[{domain_name}] Step 5: Updating database...")
+            logger.info(f"[{domain_name}] Step 5: Updating database (M365 removal confirmed)...")
             
             # Archive/retire mailboxes for this domain
             mb_result = await db.execute(
@@ -571,14 +648,6 @@ class DomainRemovalService:
         # Determine overall success
         result["success"] = True
         result["completed_at"] = datetime.utcnow().isoformat()
-        
-        # Add warning if M365 removal didn't succeed but DB was updated
-        m365_ok = (
-            result["steps"].get("m365_removal", {}).get("success", False)
-            or result["steps"].get("m365_removal", {}).get("skipped", False)
-        )
-        if not m365_ok:
-            result["warning"] = "Database updated but M365 removal may have failed - verify manually"
         
         return result
     
@@ -641,41 +710,63 @@ class DomainRemovalService:
         )
         result["steps"] = removal["steps"]
         
-        # If domain exists in DB, clean up there too
+        # Determine success based on M365 removal
+        m365_ok = (
+            result["steps"].get("m365_removal", {}).get("success", False)
+            or result["steps"].get("m365_removal", {}).get("skipped", False)
+        )
+        
+        # CRITICAL: Only clean up DB records if M365 removal succeeded or was skipped.
+        # If M365 removal failed, keep DB records intact for retry.
         if db_domain and db:
-            try:
-                db_domain.tenant_id = None
-                db_domain.status = DomainStatus.PURCHASED
-                db_domain.dns_records_created = False
-                db_domain.mx_configured = False
-                db_domain.spf_configured = False
-                db_domain.dkim_cnames_added = False
-                db_domain.dkim_enabled = False
-                db_domain.dkim_selector1_cname = None
-                db_domain.dkim_selector2_cname = None
-                db_domain.verification_txt_value = None
-                db_domain.verification_txt_added = False
-                db_domain.batch_id = None
-                db_domain.error_message = f"Removed via CSV at {datetime.utcnow().isoformat()}"
-                await db.commit()
+            if m365_ok:
+                try:
+                    db_domain.tenant_id = None
+                    db_domain.status = DomainStatus.PURCHASED
+                    db_domain.dns_records_created = False
+                    db_domain.mx_configured = False
+                    db_domain.spf_configured = False
+                    db_domain.dkim_cnames_added = False
+                    db_domain.dkim_enabled = False
+                    db_domain.dkim_selector1_cname = None
+                    db_domain.dkim_selector2_cname = None
+                    db_domain.verification_txt_value = None
+                    db_domain.verification_txt_added = False
+                    db_domain.batch_id = None
+                    db_domain.error_message = f"Removed via CSV at {datetime.utcnow().isoformat()}"
+                    await db.commit()
+                    result["steps"]["database_update"] = {
+                        "success": True,
+                        "note": "Domain found in DB and cleaned up (M365 removal confirmed)"
+                    }
+                except Exception as e:
+                    await db.rollback()
+                    result["steps"]["database_update"] = {"success": False, "error": str(e)}
+            else:
+                # M365 failed — mark as PROBLEM but keep tenant link
+                m365_error = result["steps"].get("m365_removal", {}).get("error", "Unknown error")
+                m365_attempts = result["steps"].get("m365_removal", {}).get("attempts", 1)
+                try:
+                    db_domain.status = DomainStatus.PROBLEM
+                    db_domain.error_message = (
+                        f"M365 removal failed via CSV after {m365_attempts} attempt(s): {m365_error} "
+                        f"({datetime.utcnow().isoformat()})"
+                    )
+                    await db.commit()
+                except Exception as e:
+                    await db.rollback()
+                    logger.error(f"[{domain_name}] Could not update domain status to PROBLEM: {e}")
                 result["steps"]["database_update"] = {
                     "success": True,
-                    "note": "Domain found in DB and cleaned up"
+                    "note": "Domain marked as PROBLEM — tenant link preserved for retry",
+                    "m365_failed": True
                 }
-            except Exception as e:
-                await db.rollback()
-                result["steps"]["database_update"] = {"success": False, "error": str(e)}
         else:
             result["steps"]["database_update"] = {
                 "skipped": True,
                 "note": "Domain not in database"
             }
         
-        # Determine success based on M365 removal
-        m365_ok = (
-            result["steps"].get("m365_removal", {}).get("success", False)
-            or result["steps"].get("m365_removal", {}).get("skipped", False)
-        )
         result["success"] = m365_ok
         result["completed_at"] = datetime.utcnow().isoformat()
         return result
