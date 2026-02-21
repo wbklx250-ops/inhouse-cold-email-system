@@ -381,6 +381,7 @@ class TenantImportService:
         for tenant, domain in zip(tenants, available_domains):
             tenant.domain_id = domain.id
             tenant.custom_domain = domain.name
+            domain.tenant_id = tenant.id  # Set both sides of the relationship
             linked += 1
         
         await db.commit()

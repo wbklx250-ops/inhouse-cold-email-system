@@ -117,26 +117,41 @@ class DomainRemovalService:
                 })
                 continue
             
-            if not domain.tenant_id:
-                results.append({
-                    "domain": domain_name,
-                    "can_remove": False,
-                    "reason": "Domain not linked to any tenant",
-                    "source": "db",
-                    "tenant": None,
-                    "mailbox_count": 0,
-                    "domain_id": str(domain.id)
-                })
-                continue
+            # Try to find the tenant - check both sides of the relationship
+            tenant = domain.tenant
+            
+            if not domain.tenant_id or not tenant:
+                # Fallback: check if a tenant links to this domain via Tenant.domain_id
+                # (auto_link_domains previously only set tenant.domain_id, not domain.tenant_id)
+                reverse_result = await db.execute(
+                    select(Tenant).where(Tenant.domain_id == domain.id)
+                )
+                tenant = reverse_result.scalar_one_or_none()
+                
+                if tenant:
+                    # Fix the missing reverse link for future lookups
+                    domain.tenant_id = tenant.id
+                    await db.commit()
+                    logger.info(f"[{domain_name}] Fixed missing domain.tenant_id -> {tenant.id} (was only linked via tenant.domain_id)")
+                else:
+                    results.append({
+                        "domain": domain_name,
+                        "can_remove": False,
+                        "reason": "Domain not linked to any tenant",
+                        "source": "db",
+                        "tenant": None,
+                        "mailbox_count": 0,
+                        "domain_id": str(domain.id)
+                    })
+                    continue
             
             # Count mailboxes for this domain
             mailbox_result = await db.execute(
-                select(Mailbox).where(Mailbox.tenant_id == domain.tenant_id)
+                select(Mailbox).where(Mailbox.tenant_id == tenant.id)
             )
             mailboxes = mailbox_result.scalars().all()
             domain_mailboxes = [m for m in mailboxes if m.email and m.email.endswith(f"@{domain_name}")]
             
-            tenant = domain.tenant
             results.append({
                 "domain": domain_name,
                 "can_remove": True,
@@ -463,11 +478,26 @@ class DomainRemovalService:
         if not domain:
             result["error"] = f"Domain '{domain_name}' not found in database"
             return result
-        if not domain.tenant_id or not domain.tenant:
-            result["error"] = f"Domain '{domain_name}' is not linked to any tenant"
-            return result
         
+        # Try to find the tenant - check both sides of the relationship
         tenant = domain.tenant
+        
+        if not domain.tenant_id or not tenant:
+            # Fallback: check if a tenant links to this domain via Tenant.domain_id
+            # (auto_link_domains previously only set tenant.domain_id, not domain.tenant_id)
+            reverse_result = await db.execute(
+                select(Tenant).where(Tenant.domain_id == domain.id)
+            )
+            tenant = reverse_result.scalar_one_or_none()
+            
+            if tenant:
+                # Fix the missing reverse link
+                domain.tenant_id = tenant.id
+                await db.commit()
+                logger.info(f"[{domain_name}] Fixed missing domain.tenant_id -> {tenant.id} during removal")
+            else:
+                result["error"] = f"Domain '{domain_name}' is not linked to any tenant"
+                return result
         result["tenant_name"] = tenant.name
         
         # Execute the shared removal logic

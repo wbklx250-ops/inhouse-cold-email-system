@@ -478,7 +478,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     IMPORTANT: Each step has individual error handling for better resilience.
     Browser is closed in finally block to ensure cleanup.
     """
-    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname
+    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup
     
     logger.info(f"[{domain}] ========== STARTING DOMAIN SETUP ==========")
     driver = None
@@ -703,13 +703,16 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         txt_value = txt_match.group(0)
         logger.info(f"[{domain}] Found TXT: {txt_value}")
         
-        # 6a: Add TXT to Cloudflare
+        # 6a: CLEANUP conflicting records, then add TXT to Cloudflare
+        logger.info(f"[{domain}] Step 6a: Cleaning up conflicting DNS records before verification")
+        cleanup_before_verification(zone_id)
+        
         logger.info(f"[{domain}] Step 6a: Adding TXT to Cloudflare")
         add_txt(zone_id, txt_value)
         
-        # 6b: Wait for DNS
-        logger.info(f"[{domain}] Step 6b: Waiting 10 seconds for DNS")
-        time.sleep(10)
+        # 6b: Wait for DNS propagation
+        logger.info(f"[{domain}] Step 6b: Waiting 30 seconds for DNS propagation")
+        time.sleep(30)
         
         # 6c: Click Verify - MUST SUCCEED
         logger.info(f"[{domain}] Step 6c: Clicking Verify button")
@@ -775,40 +778,128 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             logger.error(f"[{domain}] FAILED - browser left open for inspection")
             return result
         
-        # Wait for page to change - use wait_for_page_change for more reliable timing
-        logger.info(f"[{domain}] Waiting for verification result (up to 60s)...")
-        old_page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-        page_changed = wait_for_page_change(driver, old_page_text, timeout=60)
+        # ===== VERIFICATION RESULT DETECTION WITH RETRY =====
+        # M365 shows "Verifying your domain..." spinner first, then the actual result.
+        # We MUST wait for the spinner to finish before checking the result.
+        # If verification fails, M365 shows "Try again" button - we retry with increasing waits.
         
-        if not page_changed:
-            logger.warning(f"[{domain}] Page did not change after clicking Verify - waiting additional time...")
-            time.sleep(10)
+        MAX_VERIFY_RETRIES = 10  # Up to 10 retry attempts
+        VERIFY_RETRY_WAIT = 60   # Wait 60 seconds between retries for DNS propagation
         
-        screenshot(driver, "09_after_verify", domain)
-        
-        # Check the page ACTUALLY changed
-        current_url = driver.current_url
-        page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-        
-        # Still on verification page? That's a failure
-        if "add a record to verify" in page_text or "txt value" in page_text:
-            logger.error(f"[{domain}] Still on verification page - verification may have failed")
-            # Check for specific error messages
-            if "failed" in page_text or "try again" in page_text or "couldn't verify" in page_text:
-                result["error"] = "Domain verification failed"
-                logger.error(f"[{domain}] FAILED - browser left open for inspection")
-                return result
-            # Maybe need more time - wait and try checking again
-            time.sleep(10)
-            page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
-            if "add a record to verify" in page_text:
-                result["error"] = "Verification did not complete - still on verification page"
-                logger.error(f"[{domain}] FAILED - browser left open for inspection")
-                return result
-        
-        result["verified"] = True
-        update_status_file(domain, "verification", "complete", "Domain ownership verified")
-        logger.info(f"[{domain}] Verification SUCCESS - page changed!")
+        for verify_attempt in range(MAX_VERIFY_RETRIES + 1):
+            if verify_attempt > 0:
+                logger.info(f"[{domain}] Verification retry {verify_attempt}/{MAX_VERIFY_RETRIES} - waiting {VERIFY_RETRY_WAIT}s for DNS propagation...")
+                time.sleep(VERIFY_RETRY_WAIT)
+                
+                # Click "Try again" button
+                try_again_clicked = False
+                try:
+                    buttons = driver.find_elements(By.TAG_NAME, "button")
+                    for btn in buttons:
+                        btn_text = btn.text.strip().lower()
+                        if "try again" in btn_text or "verify" in btn_text:
+                            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                            time.sleep(0.5)
+                            driver.execute_script("arguments[0].click();", btn)
+                            try_again_clicked = True
+                            logger.info(f"[{domain}] Clicked '{btn.text.strip()}' button for retry")
+                            break
+                except Exception as e:
+                    logger.warning(f"[{domain}] Could not click Try again: {e}")
+                
+                if not try_again_clicked:
+                    logger.warning(f"[{domain}] Could not find Try again/Verify button for retry")
+                    screenshot(driver, f"error_no_retry_button_{verify_attempt}", domain)
+                    break
+            
+            # Wait for "Verifying your domain..." spinner to FINISH (up to 90 seconds)
+            logger.info(f"[{domain}] Waiting for verification to complete (attempt {verify_attempt + 1})...")
+            verification_done = False
+            for wait_sec in range(90):
+                time.sleep(1)
+                try:
+                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                except:
+                    continue
+                
+                # Still showing spinner? Keep waiting
+                if "verifying your domain" in page_text or "verifying..." in page_text:
+                    if wait_sec % 10 == 0:
+                        logger.info(f"[{domain}] Still verifying... ({wait_sec}s)")
+                    continue
+                
+                # Spinner gone - check actual result
+                verification_done = True
+                break
+            
+            if not verification_done:
+                logger.warning(f"[{domain}] Verification spinner still showing after 90s")
+                # Get page text anyway
+                try:
+                    page_text = driver.find_element(By.TAG_NAME, "body").text.lower()
+                except:
+                    page_text = ""
+            
+            screenshot(driver, f"09_after_verify_{verify_attempt}", domain)
+            logger.info(f"[{domain}] Post-verify page text (first 500 chars): {page_text[:500]}")
+            
+            # ===== CHECK FOR POSITIVE SUCCESS INDICATORS =====
+            success_indicators = [
+                "how do you want to connect",
+                "connect domain",
+                "add dns records",
+                "domain setup is complete",
+                "exchange online",
+                "mail protection"
+            ]
+            
+            if any(indicator in page_text for indicator in success_indicators):
+                result["verified"] = True
+                update_status_file(domain, "verification", "complete", "Domain ownership verified")
+                logger.info(f"[{domain}] Verification SUCCESS confirmed! (attempt {verify_attempt + 1})")
+                break
+            
+            # ===== CHECK FOR FAILURE INDICATORS =====
+            failure_indicators = [
+                "didn't detect",
+                "try again",
+                "couldn't verify",
+                "couldn't find",
+                "record not detected",
+                "we didn't detect",
+                "add a record to verify"
+            ]
+            
+            if any(indicator in page_text for indicator in failure_indicators):
+                logger.warning(f"[{domain}] Verification FAILED (attempt {verify_attempt + 1}) - M365 didn't detect DNS record yet")
+                screenshot(driver, f"verify_failed_{verify_attempt}", domain)
+                
+                if verify_attempt >= MAX_VERIFY_RETRIES:
+                    logger.error(f"[{domain}] Verification failed after {MAX_VERIFY_RETRIES + 1} attempts")
+                    result["error"] = f"Domain verification failed after {MAX_VERIFY_RETRIES + 1} attempts - M365 could not detect TXT record"
+                    update_status_file(domain, "verification", "failed", result["error"])
+                    _cleanup_driver(driver)
+                    return result
+                # Will retry at top of loop
+                continue
+            
+            # ===== UNKNOWN STATE =====
+            # Page changed to something we don't recognize - log it and assume success if not showing errors
+            logger.warning(f"[{domain}] Unknown page state after verification. Checking further...")
+            if "verify" in page_text and ("own" in page_text or "ownership" in page_text):
+                # Still on verification page but no clear failure message
+                logger.warning(f"[{domain}] Still appears to be on verification page")
+                if verify_attempt >= MAX_VERIFY_RETRIES:
+                    result["error"] = "Verification did not complete - unknown page state"
+                    _cleanup_driver(driver)
+                    return result
+                continue
+            else:
+                # Page changed to something new - likely success
+                result["verified"] = True
+                update_status_file(domain, "verification", "complete", "Domain ownership verified")
+                logger.info(f"[{domain}] Verification appears successful (page moved past verification)")
+                break
     
     # ===== STEP 7: WAIT FOR AND HANDLE "HOW DO YOU WANT TO CONNECT" PAGE =====
     # This page appears after verification OR if domain was already verified
@@ -1107,6 +1198,9 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.warning(f"[{domain}] DKIM selector2 NOT FOUND")
     
     # ===== STEP 8i: ADD ALL RECORDS TO CLOUDFLARE =====
+    logger.info(f"[{domain}] Step 8i: Cleaning up conflicting DNS records before adding M365 records")
+    cleanup_before_dns_setup(zone_id)
+    
     logger.info(f"[{domain}] Step 8i: Adding DNS records to Cloudflare")
     
     if mx_match:
