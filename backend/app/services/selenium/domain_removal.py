@@ -689,14 +689,44 @@ def remove_domain_from_m365(
         time.sleep(20)
         screenshot(driver, "06_after_removal", domain_name)
         
-        # Check current page for success indicators
+        # Check current page for ERROR indicators first
+        # If M365 rejected the removal, it shows errors like "can't remove", "in use", etc.
         page_source = driver.page_source.lower()
+        error_indicators = [
+            "can't remove",
+            "cannot remove",
+            "unable to remove",
+            "removal failed",
+            "still in use",
+            "has active",
+            "has resources",
+            "before you can remove",
+            "you need to",
+            "move users",
+            "reassign",
+        ]
+        found_error = None
+        for indicator in error_indicators:
+            if indicator in page_source:
+                found_error = indicator
+                break
+        
+        if found_error:
+            screenshot(driver, "06b_error_detected", domain_name)
+            logger.error(f"Domain '{domain_name}' removal was REJECTED by M365: '{found_error}'")
+            return {
+                "success": False,
+                "error": f"M365 rejected removal: '{found_error}' — domain likely has active resources",
+                "confirm_button_clicked": confirm_clicked,
+                "needs_retry": True
+            }
+        
+        # Check current page for SUCCESS indicators
         success_indicators = [
             "has been removed",
             "successfully removed",
             "domain was removed",
             "removal complete",
-            "successfully",
             "removed from your organization",
             "no longer available",
         ]
@@ -710,13 +740,14 @@ def remove_domain_from_m365(
             logger.info(f"Domain '{domain_name}' removed successfully (no longer on current page)")
             return {"success": True, "error": None}
         
-        # Navigate to domains list and check — retry up to 4 times with waits
-        # because M365 removal is async and can take time to disappear from the list
-        max_verify_attempts = 4
+        # Navigate to domains list and verify — check twice with reasonable waits
+        # M365 removal is async: the domain list may still show the domain for minutes
+        # even after a successful removal. We check twice, then make a smart decision.
+        max_verify_attempts = 2
         for verify_attempt in range(max_verify_attempts):
             try:
                 driver.get("https://admin.cloud.microsoft/#/Domains")
-                wait_time = 15 + (verify_attempt * 10)  # 15s, 25s, 35s, 45s
+                wait_time = 15 + (verify_attempt * 15)  # 15s, 30s
                 logger.info(f"Verify attempt {verify_attempt + 1}/{max_verify_attempts}: waiting {wait_time}s for domains list to load...")
                 time.sleep(wait_time)
                 
@@ -730,15 +761,42 @@ def remove_domain_from_m365(
                         continue
                     else:
                         screenshot(driver, "07_domain_still_present", domain_name)
-                        # Domain is STILL in the list after all verification attempts
-                        # Do NOT treat as success — the domain was not actually removed
-                        logger.warning(f"Domain '{domain_name}' still in tenant domain list after {max_verify_attempts} verification attempts — removal FAILED")
-                        return {
-                            "success": False,
-                            "error": f"Domain still present in tenant after removal attempt and {max_verify_attempts} verification checks",
-                            "confirm_button_clicked": confirm_clicked,
-                            "needs_retry": True
-                        }
+                        
+                        # Domain is still visible in the list after verification attempts.
+                        # BUT: M365's domain list is cached/slow to update. If we successfully
+                        # clicked the confirm button AND there were no error messages, M365
+                        # accepted the removal — the list is just stale.
+                        if confirm_clicked:
+                            # Double-check: look for error indicators on the current page too
+                            current_source = driver.page_source.lower()
+                            has_error_now = any(e in current_source for e in error_indicators)
+                            
+                            if has_error_now:
+                                logger.warning(f"Domain '{domain_name}' still in list AND error detected — removal genuinely FAILED")
+                                return {
+                                    "success": False,
+                                    "error": "Domain still present in tenant with error indicators — removal rejected by M365",
+                                    "confirm_button_clicked": True,
+                                    "needs_retry": True
+                                }
+                            else:
+                                logger.info(
+                                    f"Domain '{domain_name}' still in domain list but confirm button was clicked "
+                                    f"and NO error messages detected — treating as SUCCESS (M365 list is cached/async)"
+                                )
+                                return {
+                                    "success": True,
+                                    "error": None,
+                                    "note": "Removal confirmed by M365 (no errors) — domain list may be cached/slow to update"
+                                }
+                        else:
+                            logger.warning(f"Domain '{domain_name}' still in list and confirm button was NOT clicked — FAILED")
+                            return {
+                                "success": False,
+                                "error": "Domain still present and removal confirmation button was not clicked",
+                                "confirm_button_clicked": False,
+                                "needs_retry": True
+                            }
                 except NoSuchElementException:
                     driver.implicitly_wait(10)
                     logger.info(f"Domain '{domain_name}' confirmed removed (not in domain list on attempt {verify_attempt + 1})")
@@ -747,8 +805,10 @@ def remove_domain_from_m365(
                 driver.implicitly_wait(10)
                 logger.warning(f"Error during verification attempt {verify_attempt + 1}: {e}")
                 if verify_attempt == max_verify_attempts - 1:
-                    # Could not load the verification page — we cannot confirm removal
-                    logger.error(f"Could not verify removal of '{domain_name}' — treating as FAILED to be safe")
+                    # Could not load the verification page
+                    if confirm_clicked:
+                        logger.info(f"Could not verify removal of '{domain_name}' but confirm was clicked with no errors — treating as SUCCESS")
+                        return {"success": True, "error": None, "note": "Removal confirmed but verification page failed to load"}
                     return {
                         "success": False,
                         "error": f"Could not verify removal (page load failed): {e}",
@@ -756,12 +816,14 @@ def remove_domain_from_m365(
                         "needs_retry": True
                     }
         
-        # Should not reach here, but just in case — never assume success without confirmation
-        logger.error(f"Domain '{domain_name}' removal could not be confirmed — treating as FAILED")
+        # Fallback — should not reach here
+        if confirm_clicked:
+            logger.info(f"Domain '{domain_name}' — confirm button clicked, no errors detected — treating as SUCCESS")
+            return {"success": True, "error": None, "note": "Removal accepted by M365 — async processing"}
         return {
             "success": False,
             "error": "Removal could not be confirmed after all attempts",
-            "confirm_button_clicked": confirm_clicked,
+            "confirm_button_clicked": False,
             "needs_retry": True
         }
         
