@@ -6942,3 +6942,422 @@ async def retry_step8_smartlead_failed(
     # Use same start logic but with skip_uploaded=True to only process these
     request.skip_uploaded = True
     return await start_step8_smartlead_upload(batch_id, request, background_tasks, db)
+
+
+# =============================================================================
+# CSV-BASED SEQUENCER UPLOAD (Upload from CSV files, no batch required)
+# =============================================================================
+
+csv_upload_jobs = {}
+
+
+@router.post("/sequencer/csv-upload")
+async def csv_sequencer_upload(
+    background_tasks: BackgroundTasks,
+    files: List[UploadFile] = File(..., description="One or more CSV files with email,password columns"),
+    sequencer: str = Form("instantly", description="Sequencer: 'instantly' or 'smartlead'"),
+    # Instantly fields
+    account_id: Optional[str] = Form(None),
+    instantly_email: Optional[str] = Form(None),
+    instantly_password: Optional[str] = Form(None),
+    # Smartlead fields
+    smartlead_api_key: Optional[str] = Form(None),
+    smartlead_oauth_url: Optional[str] = Form(None),
+    configure_settings: bool = Form(True),
+    max_email_per_day: int = Form(6),
+    time_to_wait_in_mins: int = Form(60),
+    total_warmup_per_day: int = Form(40),
+    daily_rampup: int = Form(1),
+    reply_rate_percentage: int = Form(79),
+    # Shared
+    num_workers: int = Form(2),
+    skip_existing: bool = Form(True),
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Upload mailboxes from CSV files to a sequencer (Instantly or Smartlead).
+    
+    Accepts multiple CSV files. Each CSV must have at minimum 'email' and 'password' columns.
+    Optional columns: first_name, last_name, display_name.
+    
+    This does NOT require mailboxes to be in the database — it's a standalone CSV-to-sequencer uploader.
+    """
+    if not files:
+        raise HTTPException(400, "No CSV files provided")
+    
+    if num_workers < 1 or num_workers > 5:
+        raise HTTPException(400, "num_workers must be between 1 and 5")
+    
+    # Validate sequencer credentials
+    if sequencer == "instantly":
+        if account_id:
+            # Look up saved account
+            from app.models.instantly_account import InstantlyAccount
+            account = await db.get(InstantlyAccount, account_id)
+            if not account:
+                raise HTTPException(400, "Selected Instantly account not found")
+            instantly_email = account.email
+            instantly_password = account.password
+        elif not instantly_email or not instantly_password:
+            raise HTTPException(400, "Instantly email and password are required")
+    elif sequencer == "smartlead":
+        if not smartlead_api_key or not smartlead_oauth_url:
+            raise HTTPException(400, "Smartlead API key and OAuth URL are required")
+    else:
+        raise HTTPException(400, "Invalid sequencer. Must be 'instantly' or 'smartlead'")
+    
+    # Parse all CSV files
+    all_mailboxes = []
+    seen_emails = set()
+    parse_errors = []
+    file_summaries = []
+    
+    for file in files:
+        try:
+            content = await file.read()
+            text = content.decode("utf-8-sig")  # Handle BOM
+            reader = csv.DictReader(io.StringIO(text))
+            
+            # Normalize headers (lowercase, strip whitespace)
+            if reader.fieldnames:
+                reader.fieldnames = [f.strip().lower().replace(" ", "_") for f in reader.fieldnames]
+            
+            # Validate required columns
+            if not reader.fieldnames or "email" not in reader.fieldnames:
+                parse_errors.append(f"{file.filename}: Missing required 'email' column. Found columns: {reader.fieldnames}")
+                continue
+            
+            if "password" not in reader.fieldnames:
+                parse_errors.append(f"{file.filename}: Missing required 'password' column. Found columns: {reader.fieldnames}")
+                continue
+            
+            file_count = 0
+            file_dupes = 0
+            for row_num, row in enumerate(reader, start=2):
+                email = (row.get("email") or "").strip()
+                password = (row.get("password") or "").strip()
+                
+                if not email or not password:
+                    continue
+                
+                # Validate email format
+                if "@" not in email or "." not in email.split("@")[-1]:
+                    parse_errors.append(f"{file.filename} row {row_num}: Invalid email '{email}'")
+                    continue
+                
+                email_lower = email.lower()
+                if email_lower in seen_emails:
+                    file_dupes += 1
+                    continue
+                
+                seen_emails.add(email_lower)
+                
+                # Extract optional fields
+                first_name = (row.get("first_name") or row.get("firstname") or "").strip()
+                last_name = (row.get("last_name") or row.get("lastname") or "").strip()
+                display_name = (row.get("display_name") or row.get("displayname") or "").strip()
+                
+                if not display_name and (first_name or last_name):
+                    display_name = f"{first_name} {last_name}".strip()
+                if not display_name:
+                    display_name = email.split("@")[0]
+                
+                all_mailboxes.append({
+                    "email": email,
+                    "password": password,
+                    "first_name": first_name,
+                    "last_name": last_name,
+                    "display_name": display_name,
+                })
+                file_count += 1
+            
+            file_summaries.append({
+                "filename": file.filename,
+                "mailboxes_parsed": file_count,
+                "duplicates_skipped": file_dupes,
+            })
+            
+        except UnicodeDecodeError:
+            parse_errors.append(f"{file.filename}: Could not decode file. Ensure it's UTF-8 CSV.")
+        except Exception as e:
+            parse_errors.append(f"{file.filename}: Error parsing - {str(e)}")
+    
+    if not all_mailboxes:
+        return {
+            "success": False,
+            "message": "No valid mailboxes found in the provided CSV files",
+            "parse_errors": parse_errors,
+            "file_summaries": file_summaries,
+        }
+    
+    # Create job
+    job_id = f"csv_{sequencer}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{len(all_mailboxes)}"
+    
+    csv_upload_jobs[job_id] = {
+        "status": "running",
+        "sequencer": sequencer,
+        "started_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "total": len(all_mailboxes),
+        "uploaded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "current_email": None,
+        "error": None,
+        "errors": [],
+        "results": [],
+        "file_summaries": file_summaries,
+        "parse_errors": parse_errors,
+    }
+    
+    if sequencer == "instantly":
+        async def run_csv_instantly_upload():
+            try:
+                from app.services.instantly_uploader import InstantlyUploader, InstantlyAPI, process_mailbox_sync
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import uuid
+                
+                # Check for API key from saved account for verification
+                api = None
+                if account_id:
+                    from app.models.instantly_account import InstantlyAccount
+                    async with async_session_factory() as sess:
+                        acct = await sess.get(InstantlyAccount, account_id)
+                        if acct and acct.api_key:
+                            api = InstantlyAPI(acct.api_key)
+                            if api.test_connection():
+                                existing = api.load_all_accounts()
+                                logger.info(f"[CSV Upload] Loaded {len(existing)} existing Instantly accounts")
+                            else:
+                                api = None
+                
+                # Pre-filter existing accounts if API available + skip_existing
+                mailbox_list = []
+                for mb in all_mailboxes:
+                    mb_id = str(uuid.uuid4())
+                    if skip_existing and api and api.account_exists(mb["email"]):
+                        csv_upload_jobs[job_id]["skipped"] += 1
+                        csv_upload_jobs[job_id]["results"].append({
+                            "email": mb["email"],
+                            "status": "skipped",
+                            "error": "Already exists in Instantly",
+                        })
+                        continue
+                    mailbox_list.append({"id": mb_id, "email": mb["email"], "password": mb["password"]})
+                
+                if not mailbox_list:
+                    csv_upload_jobs[job_id]["status"] = "completed"
+                    csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                    return
+                
+                actual_workers = min(num_workers, len(mailbox_list))
+                
+                with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                    uploaders = []
+                    for i in range(actual_workers):
+                        upl = InstantlyUploader(
+                            instantly_email=instantly_email,
+                            instantly_password=instantly_password,
+                            api=api,
+                            worker_id=i,
+                        )
+                        if not upl.setup_driver():
+                            upl.cleanup()
+                            continue
+                        if not upl.login_to_instantly():
+                            upl.cleanup()
+                            continue
+                        uploaders.append(upl)
+                    
+                    if not uploaders:
+                        csv_upload_jobs[job_id]["status"] = "failed"
+                        csv_upload_jobs[job_id]["error"] = "All browser workers failed to start/login"
+                        csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                        return
+                    
+                    try:
+                        futures = {}
+                        for idx, mb_data in enumerate(mailbox_list):
+                            upl = uploaders[idx % len(uploaders)]
+                            fut = executor.submit(process_mailbox_sync, upl, mb_data)
+                            futures[fut] = mb_data
+                        
+                        for fut in as_completed(futures):
+                            result = fut.result()
+                            mb_data = futures[fut]
+                            csv_upload_jobs[job_id]["current_email"] = mb_data["email"]
+                            
+                            if result["success"]:
+                                csv_upload_jobs[job_id]["uploaded"] += 1
+                                csv_upload_jobs[job_id]["results"].append({
+                                    "email": mb_data["email"],
+                                    "status": "uploaded",
+                                    "error": None,
+                                })
+                            else:
+                                csv_upload_jobs[job_id]["failed"] += 1
+                                csv_upload_jobs[job_id]["errors"].append(f"{mb_data['email']}: {result['error']}")
+                                csv_upload_jobs[job_id]["results"].append({
+                                    "email": mb_data["email"],
+                                    "status": "failed",
+                                    "error": result["error"],
+                                })
+                    finally:
+                        for upl in uploaders:
+                            upl.cleanup()
+                
+                csv_upload_jobs[job_id]["status"] = "completed"
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                csv_upload_jobs[job_id]["current_email"] = None
+                logger.info(f"[CSV Upload] Instantly upload complete: {csv_upload_jobs[job_id]['uploaded']} uploaded, {csv_upload_jobs[job_id]['failed']} failed")
+                
+            except Exception as e:
+                csv_upload_jobs[job_id]["status"] = "failed"
+                csv_upload_jobs[job_id]["error"] = str(e)
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                logger.error(f"[CSV Upload] Instantly upload failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        background_tasks.add_task(run_csv_instantly_upload)
+    
+    else:  # smartlead
+        async def run_csv_smartlead_upload():
+            try:
+                from app.services.smartlead import SmartleadOAuthUploader, SmartleadAPI, process_smartlead_mailbox_sync
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import uuid
+                
+                # Check existing accounts
+                api = SmartleadAPI(smartlead_api_key)
+                existing_emails = set()
+                try:
+                    existing_emails = await api.get_existing_emails()
+                    logger.info(f"[CSV Upload] Found {len(existing_emails)} existing Smartlead accounts")
+                except Exception as e:
+                    logger.warning(f"[CSV Upload] Could not fetch existing Smartlead accounts: {e}")
+                
+                # Filter out existing
+                mailbox_list = []
+                for mb in all_mailboxes:
+                    mb_id = str(uuid.uuid4())
+                    if skip_existing and mb["email"].lower() in existing_emails:
+                        csv_upload_jobs[job_id]["skipped"] += 1
+                        csv_upload_jobs[job_id]["results"].append({
+                            "email": mb["email"],
+                            "status": "skipped",
+                            "error": "Already exists in Smartlead",
+                        })
+                        continue
+                    mailbox_list.append({"id": mb_id, "email": mb["email"], "password": mb["password"]})
+                
+                if not mailbox_list:
+                    csv_upload_jobs[job_id]["status"] = "completed"
+                    csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                    await api.close()
+                    return
+                
+                actual_workers = min(num_workers, len(mailbox_list))
+                
+                with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                    uploaders = [SmartleadOAuthUploader(headless=True, worker_id=i) for i in range(actual_workers)]
+                    
+                    futures = {}
+                    for idx, mb_data in enumerate(mailbox_list):
+                        upl = uploaders[idx % len(uploaders)]
+                        fut = executor.submit(process_smartlead_mailbox_sync, upl, mb_data, smartlead_oauth_url)
+                        futures[fut] = mb_data
+                    
+                    for fut in as_completed(futures):
+                        result = fut.result()
+                        mb_data = futures[fut]
+                        csv_upload_jobs[job_id]["current_email"] = mb_data["email"]
+                        
+                        if result["success"]:
+                            csv_upload_jobs[job_id]["uploaded"] += 1
+                            csv_upload_jobs[job_id]["results"].append({
+                                "email": mb_data["email"],
+                                "status": "uploaded",
+                                "error": None,
+                            })
+                            
+                            # Configure settings if enabled
+                            if configure_settings:
+                                import asyncio
+                                await asyncio.sleep(3)
+                                account_api_id = await api.find_account_id(mb_data["email"])
+                                if account_api_id:
+                                    await api.update_sending_settings(
+                                        account_api_id,
+                                        max_per_day=max_email_per_day,
+                                        wait_mins=time_to_wait_in_mins,
+                                    )
+                                    await api.update_warmup_settings(
+                                        account_api_id,
+                                        per_day=total_warmup_per_day,
+                                        rampup=daily_rampup,
+                                        reply_rate=reply_rate_percentage,
+                                    )
+                        else:
+                            csv_upload_jobs[job_id]["failed"] += 1
+                            csv_upload_jobs[job_id]["errors"].append(f"{mb_data['email']}: {result['error']}")
+                            csv_upload_jobs[job_id]["results"].append({
+                                "email": mb_data["email"],
+                                "status": "failed",
+                                "error": result["error"],
+                            })
+                
+                await api.close()
+                csv_upload_jobs[job_id]["status"] = "completed"
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                csv_upload_jobs[job_id]["current_email"] = None
+                logger.info(f"[CSV Upload] Smartlead upload complete: {csv_upload_jobs[job_id]['uploaded']} uploaded, {csv_upload_jobs[job_id]['failed']} failed")
+                
+            except Exception as e:
+                csv_upload_jobs[job_id]["status"] = "failed"
+                csv_upload_jobs[job_id]["error"] = str(e)
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                logger.error(f"[CSV Upload] Smartlead upload failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+        
+        background_tasks.add_task(run_csv_smartlead_upload)
+    
+    logger.info(f"[CSV Upload] Started {sequencer} upload for {len(all_mailboxes)} mailboxes from {len(files)} CSV file(s)")
+    
+    return {
+        "success": True,
+        "job_id": job_id,
+        "message": f"Started {sequencer} upload for {len(all_mailboxes)} mailbox(es) from {len(files)} CSV file(s)",
+        "total_mailboxes": len(all_mailboxes),
+        "file_summaries": file_summaries,
+        "parse_errors": parse_errors,
+    }
+
+
+@router.get("/sequencer/csv-upload/{job_id}/status")
+async def get_csv_upload_status(job_id: str):
+    """Get status of a CSV-based sequencer upload job."""
+    if job_id not in csv_upload_jobs:
+        raise HTTPException(404, "Upload job not found")
+    return csv_upload_jobs[job_id]
+
+
+@router.get("/sequencer/csv-upload-jobs")
+async def list_csv_upload_jobs():
+    """List all CSV upload jobs (most recent first)."""
+    jobs = []
+    for jid, jdata in csv_upload_jobs.items():
+        jobs.append({
+            "job_id": jid,
+            "sequencer": jdata.get("sequencer"),
+            "status": jdata.get("status"),
+            "total": jdata.get("total", 0),
+            "uploaded": jdata.get("uploaded", 0),
+            "failed": jdata.get("failed", 0),
+            "skipped": jdata.get("skipped", 0),
+            "started_at": jdata.get("started_at"),
+            "completed_at": jdata.get("completed_at"),
+        })
+    jobs.sort(key=lambda x: x.get("started_at", ""), reverse=True)
+    return {"jobs": jobs}
