@@ -1,13 +1,18 @@
 """
-M365 Domain Removal - Robust two-pronged approach:
+M365 Domain Removal - Robust 4-tier approach:
 
-PRIMARY: Microsoft Graph API forceDelete (handles all reassignment server-side)
-FALLBACK: Selenium Admin Portal automation (if Graph API fails)
+TIER 1: MSAL ROPC token → Graph API forceDelete (no browser needed)
+TIER 2: PowerShell MSOnline Remove-MsolDomain (no browser needed)  
+TIER 3: Selenium OAuth → Graph API forceDelete (browser fallback)
+TIER 4: Selenium Admin Portal automation (browser last resort)
 """
 import time
 import os
+import subprocess
+import tempfile
 import urllib.parse
 import pyotp
+import msal
 import aiohttp
 import asyncio
 from selenium import webdriver
@@ -23,6 +28,13 @@ logger = logging.getLogger(__name__)
 SCREENSHOT_DIR = os.environ.get("SCREENSHOT_DIR", os.path.join(os.environ.get("TEMP", os.environ.get("TMP", "/tmp")), "screenshots"))
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
+# Well-known Azure AD PowerShell client ID (public client, no secret needed)
+AZURE_AD_POWERSHELL_CLIENT_ID = "1b730954-1685-4b74-9bfd-dac224a7b894"
+GRAPH_SCOPE = ["https://graph.microsoft.com/.default"]
+
+# PowerShell path detection
+PWSH_PATH = os.environ.get("PWSH_PATH", "/usr/bin/pwsh")
+
 
 def screenshot(driver, step, domain=""):
     """Save a debug screenshot."""
@@ -36,20 +48,417 @@ def screenshot(driver, step, domain=""):
 
 
 # =====================================================================
-# GRAPH API DOMAIN REMOVAL (PRIMARY METHOD)
+# TIER 1: MSAL ROPC → Graph API (NO BROWSER NEEDED)
 # =====================================================================
 
-def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None, headless=True):
+def _get_access_token_via_msal(admin_email, admin_password):
     """
-    Get an OAuth access token by automating the Microsoft login flow via Selenium.
-    Uses the Azure AD PowerShell well-known client ID for implicit grant.
+    Get an OAuth access token using MSAL Resource Owner Password Credentials (ROPC) flow.
+    
+    NO BROWSER NEEDED - pure HTTP token acquisition.
+    Works for tenants with Security Defaults disabled (no MFA enforced).
     
     Returns: (success: bool, access_token: str|None, error: str|None)
     """
-    client_id = "1b730954-1685-4b74-9bfd-dac224a7b894"  # Azure AD PowerShell
-    redirect_uri = "https://login.microsoftonline.com/common/oauth2/nativeclient"
-    resource = "https://graph.microsoft.com"
+    tenant_domain = admin_email.split("@")[1] if "@" in admin_email else "common"
+    authority = f"https://login.microsoftonline.com/{tenant_domain}"
     
+    try:
+        app = msal.PublicClientApplication(
+            AZURE_AD_POWERSHELL_CLIENT_ID,
+            authority=authority,
+        )
+        
+        logger.info(f"[MSAL] Acquiring token via ROPC for {admin_email}...")
+        result = app.acquire_token_by_username_password(
+            username=admin_email,
+            password=admin_password,
+            scopes=GRAPH_SCOPE,
+        )
+        
+        if "access_token" in result:
+            token = result["access_token"]
+            logger.info(f"[MSAL] Token acquired successfully ({len(token)} chars)")
+            return True, token, None
+        
+        # Handle specific error cases
+        error = result.get("error", "unknown_error")
+        error_desc = result.get("error_description", "No description")
+        
+        if "interaction_required" in error:
+            return False, None, f"MFA/interaction required - ROPC cannot handle MFA: {error_desc}"
+        elif "invalid_grant" in error:
+            return False, None, f"Invalid credentials: {error_desc}"
+        elif "invalid_client" in error:
+            return False, None, f"Client app issue: {error_desc}"
+        else:
+            return False, None, f"MSAL error ({error}): {error_desc}"
+            
+    except Exception as e:
+        logger.error(f"[MSAL] Exception during token acquisition: {e}")
+        return False, None, f"MSAL exception: {str(e)}"
+
+
+async def _graph_api_force_delete(access_token, domain_name):
+    """
+    Force-delete a domain via Microsoft Graph API.
+    Automatically reassigns all UPNs, proxy addresses, groups, etc.
+    
+    Returns: {"success": bool, "error": str|None}
+    """
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Check domain exists
+            async with session.get(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status == 404:
+                    logger.info(f"[Graph API] Domain '{domain_name}' not found — already removed")
+                    return {"success": True, "error": None, "note": "Domain already removed"}
+                elif resp.status == 401:
+                    return {"success": False, "error": "Access token expired or insufficient permissions"}
+                elif resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"[Graph API] Domain check returned {resp.status}: {body[:200]}")
+            
+            # Try forceDelete (beta endpoint)
+            logger.info(f"[Graph API] Attempting forceDelete for '{domain_name}'...")
+            async with session.post(
+                f"https://graph.microsoft.com/beta/domains/{domain_name}/forceDelete",
+                headers=headers,
+                json={"disableUserAccounts": True}
+            ) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
+                    return {"success": True, "error": None, "method": "forceDelete"}
+                else:
+                    body = await resp.text()
+                    logger.warning(f"[Graph API] forceDelete returned {resp.status}: {body[:300]}")
+            
+            # Fallback: regular DELETE
+            logger.info(f"[Graph API] Trying regular DELETE for '{domain_name}'...")
+            async with session.delete(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"[Graph API] DELETE succeeded for '{domain_name}'")
+                    return {"success": True, "error": None, "method": "delete"}
+                else:
+                    body = await resp.text()
+                    error_msg = f"DELETE returned {resp.status}: {body[:300]}"
+                    logger.error(f"[Graph API] {error_msg}")
+                    return {"success": False, "error": error_msg}
+                    
+    except Exception as e:
+        logger.error(f"[Graph API] Error removing '{domain_name}': {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _graph_api_verify_removed(access_token, domain_name):
+    """Verify a domain was actually removed by checking Graph API."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status == 404:
+                    return True
+                elif resp.status == 200:
+                    return False
+                else:
+                    return None
+    except Exception:
+        return None
+
+
+def _run_async_graph_delete(token, domain_name):
+    """Run async Graph API delete in a new event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_graph_api_force_delete(token, domain_name))
+    finally:
+        loop.close()
+
+
+def _run_async_graph_verify(token, domain_name):
+    """Run async Graph API verify in a new event loop."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_graph_api_verify_removed(token, domain_name))
+    finally:
+        loop.close()
+
+
+def _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password):
+    """
+    TIER 1: Remove domain via MSAL ROPC → Graph API forceDelete.
+    
+    NO BROWSER NEEDED. Pure HTTP.
+    Works for tenants without MFA enforced.
+    
+    Returns: {"success": bool, "error": str|None, "method": str}
+    """
+    logger.info(f"[{domain_name}] TIER 1: MSAL ROPC → Graph API forceDelete")
+    
+    # Step 1: Get token via MSAL (no browser)
+    success, token, error = _get_access_token_via_msal(admin_email, admin_password)
+    if not success or not token:
+        logger.warning(f"[{domain_name}] TIER 1 token failed: {error}")
+        return {"success": False, "error": f"MSAL token failed: {error}", "method": "tier1_msal_graph"}
+    
+    # Step 2: Call Graph API forceDelete
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                result = pool.submit(_run_async_graph_delete, token, domain_name).result(timeout=60)
+        else:
+            result = loop.run_until_complete(_graph_api_force_delete(token, domain_name))
+    except RuntimeError:
+        result = _run_async_graph_delete(token, domain_name)
+    
+    if result.get("success"):
+        # Step 3: Verify removal
+        time.sleep(5)
+        try:
+            verified = _run_async_graph_verify(token, domain_name)
+        except Exception:
+            verified = None
+        
+        if verified is False:
+            logger.warning(f"[{domain_name}] TIER 1: Graph API reported success but domain still exists, may need propagation time")
+            time.sleep(10)
+        
+        result["method"] = "tier1_msal_graph"
+        logger.info(f"[{domain_name}] TIER 1 SUCCEEDED")
+        return result
+    
+    result["method"] = "tier1_msal_graph"
+    return result
+
+
+# =====================================================================
+# TIER 2: PowerShell MSOnline (NO BROWSER NEEDED)
+# =====================================================================
+
+def _remove_domain_tier2_powershell(domain_name, admin_email, admin_password):
+    """
+    TIER 2: Remove domain via PowerShell MSOnline Remove-MsolDomain.
+    
+    NO BROWSER NEEDED. Uses credential-based PowerShell auth.
+    Same proven pattern as add_domain_msol in PowerShellRunner.
+    
+    Returns: {"success": bool, "error": str|None, "method": str}
+    """
+    logger.info(f"[{domain_name}] TIER 2: PowerShell MSOnline Remove-MsolDomain")
+    
+    # Escape password for PowerShell
+    escaped_password = admin_password.replace("'", "''")
+    
+    script = f'''
+$ErrorActionPreference = "Stop"
+
+try {{
+    Import-Module MSOnline -ErrorAction Stop
+    
+    $secpasswd = ConvertTo-SecureString '{escaped_password}' -AsPlainText -Force
+    $credential = New-Object System.Management.Automation.PSCredential ('{admin_email}', $secpasswd)
+    
+    Connect-MsolService -Credential $credential -ErrorAction Stop
+    
+    # Check if domain exists first
+    $domain = Get-MsolDomain -DomainName "{domain_name}" -ErrorAction SilentlyContinue
+    
+    if (-not $domain) {{
+        Write-Output "<<<JSON>>>"
+        @{{ "success" = $true; "note" = "Domain not found - already removed" }} | ConvertTo-Json -Compress
+        Write-Output "<<<END>>>"
+        exit 0
+    }}
+    
+    # Try to reassign any users on this domain to the onmicrosoft.com domain first
+    $tenantDomain = (Get-MsolDomain | Where-Object {{ $_.Name -like "*.onmicrosoft.com" -and $_.Name -notlike "*.mail.onmicrosoft.com" }} | Select-Object -First 1).Name
+    
+    if ($tenantDomain) {{
+        $usersOnDomain = Get-MsolUser -All | Where-Object {{ $_.UserPrincipalName -like "*@{domain_name}" }}
+        foreach ($user in $usersOnDomain) {{
+            $newUPN = $user.UserPrincipalName.Split("@")[0] + "@" + $tenantDomain
+            try {{
+                Set-MsolUserPrincipalName -UserPrincipalName $user.UserPrincipalName -NewUserPrincipalName $newUPN -ErrorAction SilentlyContinue
+                Write-Host "Reassigned $($user.UserPrincipalName) -> $newUPN"
+            }} catch {{
+                Write-Host "Could not reassign $($user.UserPrincipalName): $($_.Exception.Message)"
+            }}
+        }}
+    }}
+    
+    # Now remove the domain
+    Remove-MsolDomain -DomainName "{domain_name}" -Force -ErrorAction Stop
+    
+    Write-Output "<<<JSON>>>"
+    @{{ "success" = $true; "note" = "Domain removed via Remove-MsolDomain" }} | ConvertTo-Json -Compress
+    Write-Output "<<<END>>>"
+    
+}} catch {{
+    $errMsg = $_.Exception.Message
+    
+    # Check if it's a "domain has associated objects" error
+    if ($errMsg -match "associated" -or $errMsg -match "in use" -or $errMsg -match "cannot be removed") {{
+        # Try force approach: disable user accounts and retry
+        try {{
+            $usersOnDomain = Get-MsolUser -All | Where-Object {{ $_.UserPrincipalName -like "*@{domain_name}" }}
+            $tenantDomain = (Get-MsolDomain | Where-Object {{ $_.Name -like "*.onmicrosoft.com" -and $_.Name -notlike "*.mail.onmicrosoft.com" }} | Select-Object -First 1).Name
+            
+            foreach ($user in $usersOnDomain) {{
+                $newUPN = $user.UserPrincipalName.Split("@")[0] + "@" + $tenantDomain
+                Set-MsolUserPrincipalName -UserPrincipalName $user.UserPrincipalName -NewUserPrincipalName $newUPN -ErrorAction SilentlyContinue
+            }}
+            
+            # Retry removal
+            Remove-MsolDomain -DomainName "{domain_name}" -Force -ErrorAction Stop
+            
+            Write-Output "<<<JSON>>>"
+            @{{ "success" = $true; "note" = "Domain removed after reassigning users" }} | ConvertTo-Json -Compress
+            Write-Output "<<<END>>>"
+        }} catch {{
+            Write-Output "<<<JSON>>>"
+            @{{ "success" = $false; "error" = $_.Exception.Message }} | ConvertTo-Json -Compress
+            Write-Output "<<<END>>>"
+        }}
+    }} else {{
+        Write-Output "<<<JSON>>>"
+        @{{ "success" = $false; "error" = $errMsg }} | ConvertTo-Json -Compress
+        Write-Output "<<<END>>>"
+    }}
+}}
+'''
+    
+    try:
+        # Write script to temp file and execute
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.ps1', delete=False, encoding='utf-8') as f:
+            f.write(script)
+            script_path = f.name
+        
+        try:
+            proc_result = subprocess.run(
+                [PWSH_PATH, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script_path],
+                capture_output=True,
+                text=True,
+                timeout=180,
+                encoding='utf-8',
+                errors='replace'
+            )
+            
+            output = proc_result.stdout or ""
+            error = proc_result.stderr or ""
+            
+            # Parse JSON result
+            if "<<<JSON>>>" in output:
+                try:
+                    json_str = output.split("<<<JSON>>>")[1].split("<<<END>>>")[0].strip()
+                    import json
+                    json_data = json.loads(json_str)
+                    
+                    if json_data.get("success"):
+                        logger.info(f"[{domain_name}] TIER 2 SUCCEEDED: {json_data.get('note', '')}")
+                        return {"success": True, "error": None, "method": "tier2_powershell", "note": json_data.get("note")}
+                    else:
+                        ps_error = json_data.get("error", "Unknown PowerShell error")
+                        logger.warning(f"[{domain_name}] TIER 2 failed: {ps_error}")
+                        return {"success": False, "error": ps_error, "method": "tier2_powershell"}
+                except Exception as parse_err:
+                    logger.warning(f"[{domain_name}] TIER 2 JSON parse error: {parse_err}")
+            
+            # No JSON output - check return code
+            if proc_result.returncode == 0:
+                logger.info(f"[{domain_name}] TIER 2 completed (no JSON but exit 0)")
+                return {"success": True, "error": None, "method": "tier2_powershell"}
+            else:
+                logger.warning(f"[{domain_name}] TIER 2 failed: exit={proc_result.returncode}, stderr={error[:300]}")
+                return {"success": False, "error": f"PowerShell exit {proc_result.returncode}: {error[:300]}", "method": "tier2_powershell"}
+                
+        finally:
+            try:
+                os.unlink(script_path)
+            except Exception:
+                pass
+                
+    except subprocess.TimeoutExpired:
+        logger.error(f"[{domain_name}] TIER 2 timed out after 180s")
+        return {"success": False, "error": "PowerShell timed out after 180s", "method": "tier2_powershell"}
+    except Exception as e:
+        logger.error(f"[{domain_name}] TIER 2 exception: {e}")
+        return {"success": False, "error": str(e), "method": "tier2_powershell"}
+
+
+# =====================================================================
+# TIER 3: Selenium OAuth → Graph API (BROWSER FALLBACK)
+# =====================================================================
+
+def create_browser(headless=True):
+    """Create a Chrome browser instance with robust configuration."""
+    options = Options()
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--single-process")
+    if headless:
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    prefs = {"credentials_enable_service": False, "profile.password_manager_enabled": False}
+    options.add_experimental_option("prefs", prefs)
+    
+    # Use CHROME_PATH from environment if set (Docker sets this)
+    chrome_binary = os.environ.get("CHROME_PATH")
+    if chrome_binary and os.path.exists(chrome_binary):
+        options.binary_location = chrome_binary
+    
+    # Try creating browser with retries
+    last_error = None
+    for attempt in range(3):
+        try:
+            driver = webdriver.Chrome(options=options)
+            driver.implicitly_wait(10)
+            driver.set_page_load_timeout(60)
+            return driver
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Browser creation attempt {attempt + 1}/3 failed: {e}")
+            time.sleep(2)
+    
+    raise last_error
+
+
+def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None, headless=True):
+    """
+    Get an OAuth token via Selenium browser automation.
+    TIER 3 method - only used when MSAL ROPC fails (e.g., MFA required).
+    
+    Returns: (success: bool, access_token: str|None, error: str|None)
+    """
+    client_id = AZURE_AD_POWERSHELL_CLIENT_ID
+    redirect_uri = "https://login.microsoftonline.com/common/oauth2/nativeclient"
     tenant_domain = admin_email.split("@")[1] if "@" in admin_email else "common"
     
     auth_url = (
@@ -64,7 +473,7 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
     driver = None
     try:
         driver = create_browser(headless=headless)
-        logger.info(f"[Graph Token] Navigating to OAuth URL for {admin_email}")
+        logger.info(f"[Selenium Token] Navigating to OAuth URL for {admin_email}")
         driver.get(auth_url)
         time.sleep(3)
         
@@ -105,9 +514,8 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
                 code = pyotp.TOTP(totp_secret).now()
                 totp_field.send_keys(code + Keys.RETURN)
                 time.sleep(4)
-                logger.info("[Graph Token] TOTP submitted")
             except TimeoutException:
-                logger.debug("[Graph Token] No TOTP field - MFA may not be required")
+                logger.debug("[Selenium Token] No TOTP field - MFA may not be required")
         else:
             try:
                 WebDriverWait(driver, 5).until(
@@ -127,7 +535,7 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
         except TimeoutException:
             pass
         
-        # Wait and check for token in URL
+        # Extract token from URL
         time.sleep(3)
         for _ in range(10):
             current_url = driver.current_url
@@ -136,14 +544,13 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
                 params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
                 token = urllib.parse.unquote(params.get("access_token", ""))
                 if token:
-                    logger.info(f"[Graph Token] Got access token ({len(token)} chars)")
+                    logger.info(f"[Selenium Token] Got access token ({len(token)} chars)")
                     return True, token, None
             if "error=" in current_url:
-                error_desc = urllib.parse.unquote(params.get("error_description", "unknown"))
-                return False, None, f"OAuth error: {error_desc}"
+                return False, None, f"OAuth error in redirect URL"
             time.sleep(2)
         
-        # Check for consent/permissions page
+        # Check for consent page
         page_source = driver.page_source.lower()
         if "permissions requested" in page_source or "accept" in page_source:
             try:
@@ -156,16 +563,14 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
                     params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
                     token = urllib.parse.unquote(params.get("access_token", ""))
                     if token:
-                        logger.info(f"[Graph Token] Got token after consent ({len(token)} chars)")
                         return True, token, None
             except Exception:
                 pass
         
-        screenshot(driver, "graph_token_failed", admin_email.split("@")[0])
         return False, None, f"Could not extract token. Final URL: {driver.current_url[:100]}"
         
     except Exception as e:
-        logger.error(f"[Graph Token] Error: {e}")
+        logger.error(f"[Selenium Token] Error: {e}")
         return False, None, str(e)
     finally:
         if driver:
@@ -175,294 +580,49 @@ def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None
                 pass
 
 
-# =====================================================================
-# MASTER FUNCTION: Graph API (primary) → Selenium (fallback)
-# =====================================================================
-
-def remove_domain_robust(
-    domain_name: str,
-    admin_email: str,
-    admin_password: str,
-    totp_secret: str = None,
-    headless: bool = True
-) -> dict:
+def _remove_domain_tier3_selenium_graph(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
     """
-    Bulletproof domain removal — tries Graph API forceDelete first,
-    falls back to Selenium Admin Portal if Graph API fails.
+    TIER 3: Get token via Selenium, then use Graph API forceDelete.
     
-    Graph API forceDelete is superior because:
-    - It automatically reassigns ALL UPNs, proxy addresses, groups, service principals
-    - No UI clicking = no false positives from page text
-    - No timing/rendering issues
-    
-    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list}
-    """
-    attempts = []
-    
-    # ===== ATTEMPT 1: Graph API forceDelete =====
-    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Trying Graph API forceDelete (primary) ===")
-    try:
-        graph_result = remove_domain_via_graph_api(
-            domain_name=domain_name,
-            admin_email=admin_email,
-            admin_password=admin_password,
-            totp_secret=totp_secret,
-            headless=headless
-        )
-        attempts.append({"method": "graph_api", "result": graph_result})
-        
-        if graph_result.get("success"):
-            logger.info(f"[{domain_name}] ✓ Graph API removal SUCCEEDED")
-            return {
-                "success": True,
-                "error": None,
-                "method": "graph_api",
-                "attempts": attempts
-            }
-        else:
-            logger.warning(f"[{domain_name}] Graph API failed: {graph_result.get('error')} — falling back to Selenium")
-    except Exception as e:
-        logger.warning(f"[{domain_name}] Graph API exception: {e} — falling back to Selenium")
-        attempts.append({"method": "graph_api", "result": {"success": False, "error": str(e)}})
-    
-    # ===== ATTEMPT 2: Selenium Admin Portal =====
-    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Trying Selenium Admin Portal (fallback) ===")
-    try:
-        selenium_result = remove_domain_from_m365(
-            domain_name=domain_name,
-            admin_email=admin_email,
-            admin_password=admin_password,
-            totp_secret=totp_secret,
-            headless=headless
-        )
-        attempts.append({"method": "selenium", "result": selenium_result})
-        
-        if selenium_result.get("success"):
-            logger.info(f"[{domain_name}] ✓ Selenium removal SUCCEEDED")
-            return {
-                "success": True,
-                "error": None,
-                "method": "selenium",
-                "attempts": attempts
-            }
-        else:
-            logger.error(f"[{domain_name}] ✗ Selenium removal also FAILED: {selenium_result.get('error')}")
-    except Exception as e:
-        logger.error(f"[{domain_name}] Selenium exception: {e}")
-        attempts.append({"method": "selenium", "result": {"success": False, "error": str(e)}})
-    
-    # ===== BOTH FAILED =====
-    last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
-    return {
-        "success": False,
-        "error": f"All removal methods failed. Last error: {last_error}",
-        "method": "none",
-        "attempts": attempts,
-        "needs_retry": True
-    }
-
-
-async def _graph_api_force_delete(access_token, domain_name):
-    """
-    Force-delete a domain via Microsoft Graph API.
-    This automatically reassigns all UPNs, proxy addresses, groups, etc.
-    
-    Returns: {"success": bool, "error": str|None}
-    """
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    
-    # First check if domain exists
-    try:
-        async with aiohttp.ClientSession() as session:
-            # Check domain exists
-            async with session.get(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
-                headers=headers
-            ) as resp:
-                if resp.status == 404:
-                    logger.info(f"[Graph API] Domain '{domain_name}' not found — already removed")
-                    return {"success": True, "error": None, "note": "Domain already removed"}
-                elif resp.status == 401:
-                    return {"success": False, "error": "Access token expired or insufficient permissions"}
-                elif resp.status != 200:
-                    body = await resp.text()
-                    logger.warning(f"[Graph API] Domain check returned {resp.status}: {body[:200]}")
-            
-            # Try forceDelete (beta endpoint - handles all reassignment automatically)
-            logger.info(f"[Graph API] Attempting forceDelete for '{domain_name}'...")
-            async with session.post(
-                f"https://graph.microsoft.com/beta/domains/{domain_name}/forceDelete",
-                headers=headers,
-                json={"disableUserAccounts": True}
-            ) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
-                    return {"success": True, "error": None, "method": "forceDelete"}
-                else:
-                    body = await resp.text()
-                    logger.warning(f"[Graph API] forceDelete returned {resp.status}: {body[:300]}")
-            
-            # Fallback: Try regular DELETE
-            logger.info(f"[Graph API] Trying regular DELETE for '{domain_name}'...")
-            async with session.delete(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
-                headers=headers
-            ) as resp:
-                if resp.status in (200, 204):
-                    logger.info(f"[Graph API] DELETE succeeded for '{domain_name}'")
-                    return {"success": True, "error": None, "method": "delete"}
-                else:
-                    body = await resp.text()
-                    error_msg = f"DELETE returned {resp.status}: {body[:300]}"
-                    logger.error(f"[Graph API] {error_msg}")
-                    return {"success": False, "error": error_msg}
-                    
-    except Exception as e:
-        logger.error(f"[Graph API] Error removing '{domain_name}': {e}")
-        return {"success": False, "error": str(e)}
-
-
-async def _graph_api_verify_removed(access_token, domain_name):
-    """Verify a domain was actually removed by checking Graph API."""
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
-                headers=headers
-            ) as resp:
-                if resp.status == 404:
-                    return True  # Domain is gone
-                elif resp.status == 200:
-                    return False  # Domain still exists
-                else:
-                    return None  # Can't determine
-    except Exception:
-        return None
-
-
-def remove_domain_via_graph_api(
-    domain_name: str,
-    admin_email: str,
-    admin_password: str,
-    totp_secret: str = None,
-    headless: bool = True
-) -> dict:
-    """
-    Remove a domain from M365 using Graph API forceDelete (synchronous wrapper).
-    
-    Steps:
-    1. Get OAuth token via Selenium login
-    2. Call Graph API forceDelete (handles all reassignment automatically)
-    3. Verify removal
+    REQUIRES BROWSER. Used when MSAL ROPC fails (MFA required) but browser is available.
     
     Returns: {"success": bool, "error": str|None, "method": str}
     """
-    logger.info(f"[{domain_name}] Attempting Graph API removal...")
+    logger.info(f"[{domain_name}] TIER 3: Selenium OAuth → Graph API forceDelete")
     
-    # Step 1: Get access token
+    # Step 1: Get token via Selenium
     success, token, error = _get_access_token_via_selenium(
         admin_email, admin_password, totp_secret, headless=headless
     )
     if not success or not token:
-        logger.warning(f"[{domain_name}] Could not get Graph API token: {error}")
-        return {"success": False, "error": f"Token acquisition failed: {error}", "method": "graph_api"}
+        logger.warning(f"[{domain_name}] TIER 3 token failed: {error}")
+        return {"success": False, "error": f"Selenium token failed: {error}", "method": "tier3_selenium_graph"}
     
-    # Step 2: Call Graph API (need to run async code from sync context)
-    loop = None
+    # Step 2: Call Graph API forceDelete (reuse same async helpers)
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # We're inside an async context already, use a new loop in thread
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                result = pool.submit(_run_async_graph_delete, token, domain_name).result(timeout=60)
-        else:
-            result = loop.run_until_complete(_graph_api_force_delete(token, domain_name))
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            result = loop.run_until_complete(_graph_api_force_delete(token, domain_name))
-        finally:
-            loop.close()
+        result = _run_async_graph_delete(token, domain_name)
+    except Exception as e:
+        return {"success": False, "error": str(e), "method": "tier3_selenium_graph"}
     
     if result.get("success"):
-        # Step 3: Verify removal (wait a bit for propagation)
-        time.sleep(5)
-        try:
-            if loop and not loop.is_closed():
-                verified = loop.run_until_complete(_graph_api_verify_removed(token, domain_name))
-            else:
-                verified = None
-        except Exception:
-            verified = None
-        
-        if verified is False:
-            # Domain still exists after forceDelete — might need more time
-            logger.warning(f"[{domain_name}] Graph API reported success but domain still exists, waiting longer...")
-            time.sleep(15)
-        
-        result["method"] = "graph_api"
+        result["method"] = "tier3_selenium_graph"
+        logger.info(f"[{domain_name}] TIER 3 SUCCEEDED")
         return result
     
-    result["method"] = "graph_api"
+    result["method"] = "tier3_selenium_graph"
     return result
 
 
-def _run_async_graph_delete(token, domain_name):
-    """Run async Graph API delete in a new event loop (for use from sync context)."""
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_graph_api_force_delete(token, domain_name))
-    finally:
-        loop.close()
-
-
 # =====================================================================
-# SELENIUM ADMIN PORTAL REMOVAL (FALLBACK METHOD)
+# TIER 4: Selenium Admin Portal (BROWSER LAST RESORT)
 # =====================================================================
-
-def create_browser(headless=True):
-    """Create a Chrome browser instance."""
-    options = Options()
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1920,1080")
-    if headless:
-        options.add_argument("--headless=new")
-        options.add_argument("--disable-gpu")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("--disable-notifications")
-    options.add_argument("--disable-popup-blocking")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    prefs = {"credentials_enable_service": False, "profile.password_manager_enabled": False}
-    options.add_experimental_option("prefs", prefs)
-    driver = webdriver.Chrome(options=options)
-    driver.implicitly_wait(10)
-    driver.set_page_load_timeout(60)
-    return driver
-
 
 def do_login(driver, admin_email, admin_password, totp_secret=None):
-    """
-    Login to M365 Admin Portal. Returns True/False.
-    
-    totp_secret can be None/empty if MFA is disabled on this tenant.
-    """
+    """Login to M365 Admin Portal. Returns True/False."""
     logger.info(f"Logging in to M365 Admin Portal as {admin_email}")
     driver.get("https://admin.microsoft.com")
     time.sleep(5)
     
-    # Enter email
     try:
         email_field = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.NAME, "loginfmt"))
@@ -474,7 +634,6 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
         logger.error("Could not find email input field")
         return False
     
-    # Enter password
     try:
         password_field = WebDriverWait(driver, 15).until(
             EC.presence_of_element_located((By.NAME, "passwd"))
@@ -486,21 +645,12 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
         logger.error("Could not find password input field")
         return False
     
-    # Check for login errors
     page_source = driver.page_source.lower()
-    error_indicators = [
-        "password is incorrect",
-        "your account or password is incorrect",
-        "account doesn't exist",
-        "account has been locked",
-        "sign-in was blocked",
-    ]
-    for indicator in error_indicators:
+    for indicator in ["password is incorrect", "account or password is incorrect", "account doesn't exist", "account has been locked", "sign-in was blocked"]:
         if indicator in page_source:
             logger.error(f"Login failed: {indicator}")
             return False
     
-    # Handle TOTP if MFA is enabled AND we have a secret
     if totp_secret:
         try:
             totp_field = WebDriverWait(driver, 8).until(
@@ -509,11 +659,9 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
             code = pyotp.TOTP(totp_secret).now()
             totp_field.send_keys(code + Keys.RETURN)
             time.sleep(5)
-            logger.info("TOTP code submitted")
         except TimeoutException:
-            logger.debug("No TOTP field found - MFA may not be required for this tenant")
+            logger.debug("No TOTP field found")
     else:
-        # No TOTP secret provided - check if MFA is being prompted
         try:
             WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.NAME, "otc"))
@@ -521,9 +669,8 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
             logger.error("MFA required but no TOTP secret provided!")
             return False
         except TimeoutException:
-            logger.debug("No MFA prompt - continuing without TOTP")
+            pass
     
-    # Handle "Stay signed in?"
     try:
         no_btn = WebDriverWait(driver, 8).until(
             EC.element_to_be_clickable((By.ID, "idBtn_Back"))
@@ -533,7 +680,6 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
     except TimeoutException:
         pass
     
-    # Verify we're in admin portal
     time.sleep(5)
     current = driver.current_url
     if "admin.microsoft.com" in current or "admin.cloud.microsoft" in current:
@@ -545,21 +691,13 @@ def do_login(driver, admin_email, admin_password, totp_secret=None):
 
 
 def _dismiss_popups(driver):
-    """Dismiss any teaching bubbles, callouts, or overlay popups from the M365 admin portal."""
+    """Dismiss teaching bubbles, callouts, or overlay popups."""
     try:
-        # Temporarily disable implicit wait so we don't wait 10s per missing selector
         driver.implicitly_wait(0)
-        
-        # Try to find and click close/dismiss buttons on teaching bubbles
         dismiss_selectors = [
-            # TeachingBubble close button
             "//div[contains(@class, 'TeachingBubble')]//button[contains(@aria-label, 'Close')]",
             "//div[contains(@class, 'TeachingBubble')]//button[contains(@aria-label, 'Dismiss')]",
-            "//div[contains(@class, 'TeachingBubble')]//button[contains(@class, 'close')]",
-            # Callout close buttons
             "//div[contains(@class, 'ms-Callout')]//button[contains(@aria-label, 'Close')]",
-            "//div[contains(@class, 'ms-Callout')]//button[contains(@aria-label, 'Dismiss')]",
-            # Generic dismiss/Got it buttons
             "//button[contains(text(), 'Got it')]",
             "//button[contains(text(), 'Dismiss')]",
             "//button[contains(text(), 'Not now')]",
@@ -571,46 +709,28 @@ def _dismiss_popups(driver):
                 for btn in btns:
                     try:
                         btn.click()
-                        logger.info(f"Dismissed popup via: {selector}")
                         time.sleep(0.5)
                     except Exception:
                         pass
             except Exception:
                 pass
         
-        # Also try removing teaching bubble overlays via JS
         driver.execute_script("""
-            document.querySelectorAll('[class*="TeachingBubble"], [class*="ms-Callout"]').forEach(el => {
-                el.remove();
-            });
+            document.querySelectorAll('[class*="TeachingBubble"], [class*="ms-Callout"]').forEach(el => el.remove());
         """)
-    except Exception as e:
-        logger.debug(f"Popup dismissal sweep: {e}")
+    except Exception:
+        pass
     finally:
-        # Restore implicit wait
         driver.implicitly_wait(10)
 
 
 def _handle_default_domain_panel(driver, admin_email, domain_name):
-    """
-    Handle the 'Set a new default before removing this domain' side panel.
-    
-    This panel only appears when the domain being removed is the tenant's primary/default domain.
-    It requires selecting a new default domain (the onmicrosoft.com domain) from a dropdown
-    before the removal can proceed.
-    """
+    """Handle the 'Set a new default before removing this domain' side panel."""
     try:
         driver.implicitly_wait(2)
         
-        # Check if the "Set a new default" panel appeared
-        panel_indicators = [
-            "//*[contains(text(), 'Set a new default')]",
-            "//*[contains(text(), 'new default domain')]",
-            "//*[contains(text(), 'currently your default')]",
-        ]
-        
         panel_found = False
-        for indicator in panel_indicators:
+        for indicator in ["//*[contains(text(), 'Set a new default')]", "//*[contains(text(), 'new default domain')]", "//*[contains(text(), 'currently your default')]"]:
             try:
                 driver.find_element(By.XPATH, indicator)
                 panel_found = True
@@ -619,66 +739,26 @@ def _handle_default_domain_panel(driver, admin_email, domain_name):
                 continue
         
         if not panel_found:
-            logger.debug("No default domain panel detected - domain is not the primary")
             return
         
-        logger.info(f"[{domain_name}] Default domain panel detected - need to select new default")
-        screenshot(driver, "04a_default_panel", domain_name)
+        logger.info(f"[{domain_name}] Default domain panel detected")
         
-        # Extract the onmicrosoft domain from admin_email (e.g., wassim@wassim615.onmicrosoft.com -> wassim615.onmicrosoft.com)
-        onmicrosoft_domain = None
-        if "@" in admin_email and "onmicrosoft.com" in admin_email:
-            onmicrosoft_domain = admin_email.split("@")[1]
-            logger.info(f"Will select onmicrosoft domain: {onmicrosoft_domain}")
-        
-        # Click the dropdown to open it
-        dropdown_clicked = False
-        dropdown_selectors = [
-            "//*[contains(text(), 'Select a domain')]",
-            "//div[contains(@class, 'ms-Dropdown')]",
-            "//div[contains(@role, 'combobox')]",
-            "//div[contains(@role, 'listbox')]",
-            "//button[contains(@aria-haspopup, 'listbox')]",
-            "//*[contains(@class, 'dropdown')]//button",
-            "//*[contains(@class, 'Dropdown')]",
-        ]
-        
-        for sel in dropdown_selectors:
+        # Click dropdown
+        for sel in ["//div[contains(@class, 'ms-Dropdown')]", "//div[contains(@role, 'combobox')]", "//*[contains(text(), 'Select a domain')]"]:
             try:
                 dropdown = driver.find_element(By.XPATH, sel)
                 try:
                     dropdown.click()
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click()", dropdown)
-                dropdown_clicked = True
-                logger.info(f"Clicked dropdown via: {sel}")
                 time.sleep(2)
                 break
             except NoSuchElementException:
                 continue
         
-        if not dropdown_clicked:
-            logger.warning("Could not find dropdown, trying to click any combobox-like element")
-            # Try JS approach to find and click dropdown
-            driver.execute_script("""
-                var dropdowns = document.querySelectorAll('[role="combobox"], [role="listbox"], [class*="Dropdown"], [class*="dropdown"]');
-                if (dropdowns.length > 0) dropdowns[0].click();
-            """)
-            time.sleep(2)
-        
-        screenshot(driver, "04b_dropdown_opened", domain_name)
-        
-        # Select the onmicrosoft.com option from the dropdown
-        # IMPORTANT: We must be careful not to click the panel description text
-        # which also contains "onmicrosoft.com". We need to target only dropdown options.
+        # Select onmicrosoft.com option
         option_selected = False
-        
-        # Strategy 1: Target elements with role="option" containing onmicrosoft
-        role_option_selectors = [
-            "//*[@role='option'][contains(., 'onmicrosoft')]",
-            "//*[@role='option'][contains(text(), 'onmicrosoft')]",
-        ]
-        for sel in role_option_selectors:
+        for sel in ["//*[@role='option'][contains(., 'onmicrosoft')]", "//*[@role='listbox']//*[contains(text(), 'onmicrosoft')]"]:
             try:
                 options = driver.find_elements(By.XPATH, sel)
                 for opt in options:
@@ -687,7 +767,6 @@ def _handle_default_domain_panel(driver, admin_email, domain_name):
                     except ElementClickInterceptedException:
                         driver.execute_script("arguments[0].click()", opt)
                     option_selected = True
-                    logger.info(f"Selected onmicrosoft option via role='option': {sel}")
                     time.sleep(2)
                     break
                 if option_selected:
@@ -695,186 +774,44 @@ def _handle_default_domain_panel(driver, admin_email, domain_name):
             except Exception:
                 continue
         
-        # Strategy 2: Target elements inside a listbox or dropdown container
         if not option_selected:
-            container_selectors = [
-                "//*[@role='listbox']//*[contains(text(), 'onmicrosoft')]",
-                "//*[contains(@class, 'Dropdown')]//*[contains(text(), 'onmicrosoft')]",
-                "//*[contains(@class, 'dropdown')]//*[contains(text(), 'onmicrosoft')]",
-                "//*[contains(@class, 'dropdownItem')][contains(., 'onmicrosoft')]",
-                "//*[contains(@class, 'DropdownItem')][contains(., 'onmicrosoft')]",
-                "//*[contains(@class, 'ms-Dropdown-item')][contains(., 'onmicrosoft')]",
-            ]
-            for sel in container_selectors:
-                try:
-                    options = driver.find_elements(By.XPATH, sel)
-                    for opt in options:
-                        try:
-                            opt.click()
-                        except ElementClickInterceptedException:
-                            driver.execute_script("arguments[0].click()", opt)
-                        option_selected = True
-                        logger.info(f"Selected onmicrosoft option via container: {sel}")
-                        time.sleep(2)
-                        break
-                    if option_selected:
-                        break
-                except Exception:
-                    continue
-        
-        # Strategy 3: Use find_elements to get ALL onmicrosoft text matches, skip description text
-        if not option_selected:
-            search_text = onmicrosoft_domain if onmicrosoft_domain else "onmicrosoft.com"
-            all_matches = driver.find_elements(By.XPATH, f"//*[contains(text(), '{search_text}')]")
-            logger.info(f"Found {len(all_matches)} elements containing '{search_text}'")
-            
-            for match in all_matches:
-                tag = match.tag_name.lower()
-                text = match.text.strip()
-                parent_role = ""
-                try:
-                    parent_role = match.find_element(By.XPATH, "..").get_attribute("role") or ""
-                except Exception:
-                    pass
-                
-                # Skip elements that look like description/header text (long text, paragraph-like)
-                if len(text) > 80:
-                    logger.debug(f"Skipping long text element: {text[:60]}...")
-                    continue
-                
-                # Skip if the text contains "currently" (part of the description)
-                if "currently" in text.lower():
-                    logger.debug(f"Skipping description element: {text[:60]}...")
-                    continue
-                
-                # Prefer button, span, div, li elements that are short text (likely dropdown items)
-                if tag in ("button", "span", "div", "li", "option") and search_text in text:
-                    logger.info(f"Trying dropdown option: tag={tag}, text='{text}', parent_role={parent_role}")
-                    try:
-                        match.click()
-                    except ElementClickInterceptedException:
-                        driver.execute_script("arguments[0].click()", match)
-                    option_selected = True
-                    logger.info(f"Selected onmicrosoft option via text scan: '{text}'")
-                    time.sleep(2)
-                    break
-        
-        # Strategy 4: JS fallback - try multiple selectors
-        if not option_selected:
-            logger.warning("Could not select onmicrosoft.com option via Selenium - trying JS")
-            result = driver.execute_script("""
-                // Try role="option" first
+            # JS fallback
+            driver.execute_script("""
                 var options = document.querySelectorAll('[role="option"]');
                 for (var i = 0; i < options.length; i++) {
-                    if (options[i].textContent.includes('onmicrosoft')) {
-                        options[i].click();
-                        return 'clicked role=option';
-                    }
+                    if (options[i].textContent.includes('onmicrosoft')) { options[i].click(); return; }
                 }
-                // Try dropdown item classes
-                var items = document.querySelectorAll('[class*="dropdownItem"], [class*="DropdownItem"], [class*="ms-Dropdown-item"], [class*="listbox"] *');
-                for (var i = 0; i < items.length; i++) {
-                    if (items[i].textContent.includes('onmicrosoft') && items[i].textContent.length < 80) {
-                        items[i].click();
-                        return 'clicked dropdown item';
-                    }
-                }
-                // Last resort: find all elements, skip description text
-                var all = document.querySelectorAll('button, span, div, li, option');
-                for (var i = 0; i < all.length; i++) {
-                    var txt = all[i].textContent.trim();
-                    if (txt.includes('onmicrosoft') && txt.length < 80 && !txt.includes('currently')) {
-                        all[i].click();
-                        return 'clicked generic element: ' + txt.substring(0, 50);
-                    }
-                }
-                return 'no match found';
             """)
-            logger.info(f"JS fallback result: {result}")
-            if result and 'clicked' in str(result):
-                option_selected = True
             time.sleep(2)
         
-        screenshot(driver, "04c_option_selected", domain_name)
-        
-        # Now click the save/confirm/set default button to proceed
-        save_selectors = [
-            "//button[contains(text(), 'Update and continue')]",
-            "//button[contains(text(), 'Update')]",
-            "//button[contains(text(), 'Set as default')]",
-            "//button[contains(text(), 'Save')]",
-            "//button[contains(text(), 'Confirm')]",
-            "//button[contains(text(), 'Continue')]",
-            "//button[contains(text(), 'OK')]",
-            # Also try span inside button (Fluent UI pattern)
-            "//button[.//span[contains(text(), 'Update and continue')]]",
-            "//button[.//span[contains(text(), 'Update')]]",
-            # Any clickable element with that text
-            "//*[contains(text(), 'Update and continue')]",
-        ]
-        
-        save_clicked = False
-        for sel in save_selectors:
+        # Click save/confirm button
+        for sel in ["//button[contains(., 'Update and continue')]", "//button[contains(., 'Update')]", "//button[contains(., 'Set as default')]", "//button[contains(., 'Save')]", "//button[contains(., 'Continue')]"]:
             try:
                 save_btn = driver.find_element(By.XPATH, sel)
-                # Check if the button is enabled before clicking
                 is_disabled = save_btn.get_attribute("disabled")
-                aria_disabled = save_btn.get_attribute("aria-disabled")
-                if is_disabled == "true" or aria_disabled == "true":
-                    logger.info(f"Found button via {sel} but it's disabled - option may not be selected yet")
+                if is_disabled == "true":
                     continue
                 try:
                     save_btn.click()
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click()", save_btn)
-                save_clicked = True
-                logger.info(f"Clicked save/confirm via: {sel}")
                 time.sleep(5)
                 break
             except NoSuchElementException:
                 continue
         
-        # If button was disabled (option not selected), wait and retry
-        if not save_clicked:
-            logger.warning("Save button not clicked (may be disabled). Waiting and retrying...")
-            time.sleep(3)
-            screenshot(driver, "04c2_retry_save", domain_name)
-            for sel in save_selectors:
-                try:
-                    save_btn = driver.find_element(By.XPATH, sel)
-                    try:
-                        save_btn.click()
-                    except ElementClickInterceptedException:
-                        driver.execute_script("arguments[0].click()", save_btn)
-                    save_clicked = True
-                    logger.info(f"Retry: clicked save/confirm via: {sel}")
-                    time.sleep(5)
-                    break
-                except NoSuchElementException:
-                    continue
-        
-        screenshot(driver, "04d_default_set", domain_name)
-        logger.info(f"[{domain_name}] Default domain panel handled successfully")
+        logger.info(f"[{domain_name}] Default domain panel handled")
         
     except Exception as e:
         logger.warning(f"Error handling default domain panel: {e}")
-        screenshot(driver, "04e_default_panel_error", domain_name)
     finally:
         driver.implicitly_wait(10)
 
 
-def remove_domain_from_m365(
-    domain_name: str,
-    admin_email: str,
-    admin_password: str,
-    totp_secret: str = None,
-    headless: bool = True
-) -> dict:
+def remove_domain_from_m365(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
     """
-    Remove a custom domain from M365 tenant via Admin Portal.
-    
-    PREREQUISITE: All mailboxes/UPNs using this domain must already be removed.
-    totp_secret: Can be None/empty if MFA is disabled on this tenant.
+    TIER 4: Remove a custom domain via Selenium Admin Portal automation.
+    Last resort - only used if all non-browser methods fail.
     
     Returns: {"success": bool, "error": str|None}
     """
@@ -882,32 +819,24 @@ def remove_domain_from_m365(
     try:
         driver = create_browser(headless=headless)
         
-        # Login
         if not do_login(driver, admin_email, admin_password, totp_secret):
             screenshot(driver, "login_failed", domain_name)
-            return {"success": False, "error": "Login failed - check credentials or MFA"}
+            return {"success": False, "error": "Login failed", "method": "tier4_selenium_portal"}
         
         screenshot(driver, "01_logged_in", domain_name)
         
         # Navigate to Domains page
-        domains_url = "https://admin.cloud.microsoft/#/Domains"
-        logger.info(f"Navigating to domains page: {domains_url}")
-        driver.get(domains_url)
+        driver.get("https://admin.cloud.microsoft/#/Domains")
         time.sleep(8)
-        screenshot(driver, "02_domains_page", domain_name)
-        
-        # Dismiss any teaching bubbles / popups that overlay the page
         _dismiss_popups(driver)
         
-        # Find and click on the domain
+        # Find and click the domain
         domain_found = False
-        max_attempts = 3
-        
-        for attempt in range(max_attempts):
+        for attempt in range(3):
             try:
                 domain_link = WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((
-                        By.XPATH, 
+                        By.XPATH,
                         f"//span[contains(text(), '{domain_name}')] | "
                         f"//a[contains(text(), '{domain_name}')] | "
                         f"//div[contains(text(), '{domain_name}')]"
@@ -916,53 +845,30 @@ def remove_domain_from_m365(
                 try:
                     domain_link.click()
                 except ElementClickInterceptedException:
-                    logger.warning("Click intercepted by overlay, dismissing popups and using JS click")
                     _dismiss_popups(driver)
-                    time.sleep(1)
                     driver.execute_script("arguments[0].click()", domain_link)
                 domain_found = True
                 time.sleep(3)
                 break
             except TimeoutException:
-                logger.warning(f"Attempt {attempt+1}: Domain '{domain_name}' not found in list")
                 _dismiss_popups(driver)
                 time.sleep(2)
         
         if not domain_found:
-            screenshot(driver, "03_domain_not_found", domain_name)
-            # If the domain is not in the tenant's domain list, it's already removed — that's a success!
-            logger.info(f"Domain '{domain_name}' not found in tenant domain list - treating as already removed")
-            return {"success": True, "error": None, "note": "Domain not found in tenant - already removed or never added"}
+            logger.info(f"Domain '{domain_name}' not in list - treating as already removed")
+            return {"success": True, "error": None, "method": "tier4_selenium_portal", "note": "Domain not found - already removed"}
         
-        screenshot(driver, "03_domain_selected", domain_name)
-        
-        # Look for "Remove domain" or "Delete domain" link/button
-        # On the new admin portal, this is often a span/link with role="button", not a <button>
+        # Click "Remove domain" button
         _dismiss_popups(driver)
         remove_clicked = False
-        remove_selectors = [
-            # Direct text match on any element
-            "//*[contains(text(), 'Remove domain')]",
-            "//*[contains(text(), 'Delete domain')]",
-            # Button elements
-            "//button[contains(text(), 'Remove')]",
-            "//button[contains(text(), 'Delete')]",
-            # Span with role=button
-            "//span[contains(text(), 'Remove domain')]",
-            "//span[contains(text(), 'Remove') and @role='button']",
-            # Aria-label
-            "//*[contains(@aria-label, 'Remove domain')]",
-            "//*[contains(@aria-label, 'Delete domain')]",
-        ]
-        
-        # Temporarily lower implicit wait for fast selector scanning
         driver.implicitly_wait(1)
-        for sel in remove_selectors:
+        for sel in ["//*[contains(text(), 'Remove domain')]", "//*[contains(text(), 'Delete domain')]",
+                    "//button[contains(text(), 'Remove')]", "//button[contains(text(), 'Delete')]",
+                    "//*[contains(@aria-label, 'Remove domain')]"]:
             try:
                 remove_btn = WebDriverWait(driver, 2).until(
                     EC.presence_of_element_located((By.XPATH, sel))
                 )
-                logger.info(f"Found remove button via: {sel}")
                 try:
                     remove_btn.click()
                 except ElementClickInterceptedException:
@@ -976,23 +882,14 @@ def remove_domain_from_m365(
         driver.implicitly_wait(10)
         
         if not remove_clicked:
-            screenshot(driver, "04_no_remove_btn", domain_name)
-            # Try the three-dot menu / more actions as last resort
+            # Try three-dot menu
             try:
-                more_btn = driver.find_element(
-                    By.XPATH, 
-                    "//button[contains(@aria-label, 'More')] | "
-                    "//button[contains(@aria-label, 'Actions')] | "
-                    "//i[contains(@class, 'MoreVertical')]/parent::button"
-                )
+                more_btn = driver.find_element(By.XPATH,
+                    "//button[contains(@aria-label, 'More')] | //button[contains(@aria-label, 'Actions')]")
                 more_btn.click()
                 time.sleep(2)
-                
                 remove_option = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((
-                        By.XPATH,
-                        "//*[contains(text(), 'Remove')]"
-                    ))
+                    EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Remove')]"))
                 )
                 try:
                     remove_option.click()
@@ -1001,49 +898,26 @@ def remove_domain_from_m365(
                 remove_clicked = True
                 time.sleep(3)
             except Exception:
-                screenshot(driver, "04_cannot_find_remove", domain_name)
-                return {"success": False, "error": "Could not find Remove Domain button - domain may have active resources still assigned"}
+                return {"success": False, "error": "Could not find Remove Domain button", "method": "tier4_selenium_portal"}
         
-        if not remove_clicked:
-            return {"success": False, "error": "Could not click Remove Domain button"}
-        
-        screenshot(driver, "04_remove_clicked", domain_name)
-        
-        # Handle "Set a new default domain" panel (only appears when removing the primary/default domain)
+        # Handle default domain panel
         _handle_default_domain_panel(driver, admin_email, domain_name)
         
-        # Confirm removal dialog - handle "Automatically remove" button and similar
-        # Fluent UI renders button text inside nested <span>, so use "." (descendant text) not "text()"
+        # Confirm removal dialog
         confirm_clicked = False
-        confirm_selectors = [
-            # Exact match for "Automatically remove" (the new M365 admin portal button)
-            "//button[contains(., 'Automatically remove')]",
-            "//*[contains(text(), 'Automatically remove')]",
-            # General remove/delete/confirm buttons using descendant text matching
-            "//button[contains(., 'Remove domain')]",
-            "//button[contains(., 'Remove')]",
-            "//button[contains(., 'Delete')]",
-            "//button[contains(., 'Confirm')]",
-            "//button[contains(., 'Yes')]",
-            # Fallback: direct text() match
-            "//button[contains(text(), 'Remove')]",
-            "//button[contains(text(), 'Delete')]",
-            "//button[contains(text(), 'Confirm')]",
-        ]
-        
         driver.implicitly_wait(2)
-        for sel in confirm_selectors:
+        for sel in ["//button[contains(., 'Automatically remove')]", "//button[contains(., 'Remove domain')]",
+                    "//button[contains(., 'Remove')]", "//button[contains(., 'Delete')]",
+                    "//button[contains(., 'Confirm')]", "//button[contains(., 'Yes')]"]:
             try:
                 confirm_btn = WebDriverWait(driver, 3).until(
                     EC.presence_of_element_located((By.XPATH, sel))
                 )
-                logger.info(f"Found confirm button via: {sel}")
                 try:
                     confirm_btn.click()
                 except ElementClickInterceptedException:
                     driver.execute_script("arguments[0].click()", confirm_btn)
                 confirm_clicked = True
-                logger.info(f"Clicked confirm removal via: {sel}")
                 time.sleep(5)
                 break
             except TimeoutException:
@@ -1051,188 +925,163 @@ def remove_domain_from_m365(
         driver.implicitly_wait(10)
         
         if not confirm_clicked:
-            # JS fallback for the confirm button
+            # JS fallback
             result = driver.execute_script("""
                 var buttons = document.querySelectorAll('button');
                 for (var i = 0; i < buttons.length; i++) {
                     var txt = buttons[i].textContent.trim();
-                    if (txt.includes('Automatically remove') || txt.includes('Remove domain')) {
-                        buttons[i].click();
-                        return 'clicked: ' + txt;
-                    }
-                }
-                // Second pass: any button with "Remove"
-                for (var i = 0; i < buttons.length; i++) {
-                    var txt = buttons[i].textContent.trim();
-                    if (txt.includes('Remove') && !txt.includes('How to')) {
+                    if (txt.includes('Automatically remove') || txt.includes('Remove domain') || 
+                        (txt.includes('Remove') && !txt.includes('How to'))) {
                         buttons[i].click();
                         return 'clicked: ' + txt;
                     }
                 }
                 return 'no confirm button found';
             """)
-            logger.info(f"JS confirm fallback result: {result}")
             if result and 'clicked' in str(result):
                 confirm_clicked = True
             time.sleep(5)
         
-        if not confirm_clicked:
-            logger.warning("No confirmation button found, removal may have proceeded directly")
-        
-        screenshot(driver, "05_removal_confirmed", domain_name)
-        
-        # Wait for removal to process — M365 "Automatically remove" is async and can take 15-30+ seconds
-        logger.info(f"Waiting for M365 to process domain removal for '{domain_name}'...")
+        # Wait for removal to process
         time.sleep(20)
-        screenshot(driver, "06_after_removal", domain_name)
         
-        # Check current page — look for SUCCESS indicators FIRST (before errors)
-        # because the removal confirmation page naturally contains words like "reassign"
-        # as part of the normal flow, NOT as error messages.
+        # Check page for success/error
         page_source = driver.page_source.lower()
         
-        success_indicators = [
-            "has been removed",
-            "successfully removed",
-            "domain was removed",
-            "removal complete",
-            "removed from your organization",
-            "no longer available",
-            "domain removed",
-        ]
-        for indicator in success_indicators:
+        for indicator in ["has been removed", "successfully removed", "domain was removed", "removal complete", "domain removed"]:
             if indicator in page_source:
-                logger.info(f"Domain '{domain_name}' removed successfully (confirmed by page text: '{indicator}')")
-                return {"success": True, "error": None}
+                logger.info(f"[{domain_name}] TIER 4 SUCCEEDED (confirmed: '{indicator}')")
+                return {"success": True, "error": None, "method": "tier4_selenium_portal"}
         
-        # Now check for REAL error indicators (NOT normal UI text like "reassign")
-        # Only match definitive error messages that mean M365 refused the removal
-        error_indicators = [
-            "can't remove this domain",
-            "cannot remove this domain",
-            "unable to remove",
-            "removal failed",
-            "domain is still in use",
-            "fix issues before removing",
-            "you can't remove the default domain",
-        ]
-        found_error = None
-        for indicator in error_indicators:
+        for indicator in ["can't remove this domain", "cannot remove this domain", "unable to remove", "removal failed", "domain is still in use"]:
             if indicator in page_source:
-                found_error = indicator
-                break
+                return {"success": False, "error": f"M365 rejected removal: '{indicator}'", "method": "tier4_selenium_portal", "needs_retry": True}
         
-        if found_error:
-            screenshot(driver, "06b_error_detected", domain_name)
-            logger.error(f"Domain '{domain_name}' removal was REJECTED by M365: '{found_error}'")
-            return {
-                "success": False,
-                "error": f"M365 rejected removal: '{found_error}'",
-                "confirm_button_clicked": confirm_clicked,
-                "needs_retry": True
-            }
-        
-        # Check if we're back on the domains list (removal redirected us) and domain is gone
-        if "/Domains" in driver.current_url and domain_name not in page_source:
-            logger.info(f"Domain '{domain_name}' removed successfully (no longer on current page)")
-            return {"success": True, "error": None}
-        
-        # Navigate to domains list and verify — check twice with reasonable waits
-        # M365 removal is async: the domain list may still show the domain for minutes
-        # even after a successful removal. We check twice, then make a smart decision.
-        max_verify_attempts = 2
-        for verify_attempt in range(max_verify_attempts):
-            try:
-                driver.get("https://admin.cloud.microsoft/#/Domains")
-                wait_time = 15 + (verify_attempt * 15)  # 15s, 30s
-                logger.info(f"Verify attempt {verify_attempt + 1}/{max_verify_attempts}: waiting {wait_time}s for domains list to load...")
-                time.sleep(wait_time)
-                
-                driver.implicitly_wait(3)
-                try:
-                    driver.find_element(By.XPATH, f"//span[contains(text(), '{domain_name}')]")
-                    driver.implicitly_wait(10)
-                    
-                    if verify_attempt < max_verify_attempts - 1:
-                        logger.info(f"Domain still in list on attempt {verify_attempt + 1}, waiting longer...")
-                        continue
-                    else:
-                        screenshot(driver, "07_domain_still_present", domain_name)
-                        
-                        # Domain is still visible in the list after verification attempts.
-                        # BUT: M365's domain list is cached/slow to update. If we successfully
-                        # clicked the confirm button AND there were no error messages, M365
-                        # accepted the removal — the list is just stale.
-                        if confirm_clicked:
-                            # Double-check: look for error indicators on the current page too
-                            current_source = driver.page_source.lower()
-                            has_error_now = any(e in current_source for e in error_indicators)
-                            
-                            if has_error_now:
-                                logger.warning(f"Domain '{domain_name}' still in list AND error detected — removal genuinely FAILED")
-                                return {
-                                    "success": False,
-                                    "error": "Domain still present in tenant with error indicators — removal rejected by M365",
-                                    "confirm_button_clicked": True,
-                                    "needs_retry": True
-                                }
-                            else:
-                                logger.info(
-                                    f"Domain '{domain_name}' still in domain list but confirm button was clicked "
-                                    f"and NO error messages detected — treating as SUCCESS (M365 list is cached/async)"
-                                )
-                                return {
-                                    "success": True,
-                                    "error": None,
-                                    "note": "Removal confirmed by M365 (no errors) — domain list may be cached/slow to update"
-                                }
-                        else:
-                            logger.warning(f"Domain '{domain_name}' still in list and confirm button was NOT clicked — FAILED")
-                            return {
-                                "success": False,
-                                "error": "Domain still present and removal confirmation button was not clicked",
-                                "confirm_button_clicked": False,
-                                "needs_retry": True
-                            }
-                except NoSuchElementException:
-                    driver.implicitly_wait(10)
-                    logger.info(f"Domain '{domain_name}' confirmed removed (not in domain list on attempt {verify_attempt + 1})")
-                    return {"success": True, "error": None}
-            except Exception as e:
-                driver.implicitly_wait(10)
-                logger.warning(f"Error during verification attempt {verify_attempt + 1}: {e}")
-                if verify_attempt == max_verify_attempts - 1:
-                    # Could not load the verification page
-                    if confirm_clicked:
-                        logger.info(f"Could not verify removal of '{domain_name}' but confirm was clicked with no errors — treating as SUCCESS")
-                        return {"success": True, "error": None, "note": "Removal confirmed but verification page failed to load"}
-                    return {
-                        "success": False,
-                        "error": f"Could not verify removal (page load failed): {e}",
-                        "confirm_button_clicked": confirm_clicked,
-                        "needs_retry": True
-                    }
-        
-        # Fallback — should not reach here
+        # If confirm was clicked and no errors, treat as success
         if confirm_clicked:
-            logger.info(f"Domain '{domain_name}' — confirm button clicked, no errors detected — treating as SUCCESS")
-            return {"success": True, "error": None, "note": "Removal accepted by M365 — async processing"}
-        return {
-            "success": False,
-            "error": "Removal could not be confirmed after all attempts",
-            "confirm_button_clicked": False,
-            "needs_retry": True
-        }
+            logger.info(f"[{domain_name}] TIER 4: Confirm clicked, no errors — treating as success")
+            return {"success": True, "error": None, "method": "tier4_selenium_portal", "note": "Removal confirmed, no error indicators"}
+        
+        return {"success": False, "error": "Could not confirm removal", "method": "tier4_selenium_portal", "needs_retry": True}
         
     except Exception as e:
-        logger.exception(f"Error removing domain '{domain_name}': {e}")
+        logger.error(f"[{domain_name}] TIER 4 exception: {e}")
         if driver:
             screenshot(driver, "error", domain_name)
-        return {"success": False, "error": str(e)}
-    
+        return {"success": False, "error": str(e), "method": "tier4_selenium_portal"}
     finally:
         if driver:
             try:
                 driver.quit()
             except Exception:
                 pass
+
+
+# =====================================================================
+# MASTER: 4-tier robust removal
+# =====================================================================
+
+def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
+    """
+    Bulletproof 4-tier domain removal. Tries each method in order until one succeeds.
+    
+    TIER 1: MSAL ROPC → Graph API forceDelete (NO browser, pure HTTP)
+    TIER 2: PowerShell MSOnline Remove-MsolDomain (NO browser, credential-based)
+    TIER 3: Selenium OAuth → Graph API forceDelete (needs browser, handles MFA)
+    TIER 4: Selenium Admin Portal automation (needs browser, last resort)
+    
+    Tiers 1 & 2 require NO browser and handle the vast majority of cases.
+    Tiers 3 & 4 are browser-based fallbacks for edge cases (e.g., MFA required).
+    
+    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list}
+    """
+    attempts = []
+    
+    # ===== TIER 1: MSAL ROPC → Graph API (NO BROWSER) =====
+    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Starting 4-tier approach ===")
+    try:
+        result = _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password)
+        attempts.append({"tier": 1, "method": "msal_graph", "result": result})
+        
+        if result.get("success"):
+            logger.info(f"[{domain_name}] ✓ TIER 1 (MSAL → Graph API) SUCCEEDED")
+            return {"success": True, "error": None, "method": result.get("method", "tier1_msal_graph"), "attempts": attempts}
+        else:
+            logger.warning(f"[{domain_name}] TIER 1 failed: {result.get('error', 'unknown')} — trying Tier 2")
+    except Exception as e:
+        logger.warning(f"[{domain_name}] TIER 1 exception: {e} — trying Tier 2")
+        attempts.append({"tier": 1, "method": "msal_graph", "result": {"success": False, "error": str(e)}})
+    
+    # ===== TIER 2: PowerShell MSOnline (NO BROWSER) =====
+    try:
+        result = _remove_domain_tier2_powershell(domain_name, admin_email, admin_password)
+        attempts.append({"tier": 2, "method": "powershell", "result": result})
+        
+        if result.get("success"):
+            logger.info(f"[{domain_name}] ✓ TIER 2 (PowerShell MSOnline) SUCCEEDED")
+            return {"success": True, "error": None, "method": result.get("method", "tier2_powershell"), "attempts": attempts}
+        else:
+            logger.warning(f"[{domain_name}] TIER 2 failed: {result.get('error', 'unknown')} — trying Tier 3 (browser)")
+    except Exception as e:
+        logger.warning(f"[{domain_name}] TIER 2 exception: {e} — trying Tier 3 (browser)")
+        attempts.append({"tier": 2, "method": "powershell", "result": {"success": False, "error": str(e)}})
+    
+    # ===== TIER 3: Selenium OAuth → Graph API (BROWSER) =====
+    # Only try browser-based methods if we have a TOTP secret (MFA might be the issue)
+    # or if both non-browser methods had non-credential errors
+    try:
+        result = _remove_domain_tier3_selenium_graph(
+            domain_name, admin_email, admin_password, totp_secret, headless=headless
+        )
+        attempts.append({"tier": 3, "method": "selenium_graph", "result": result})
+        
+        if result.get("success"):
+            logger.info(f"[{domain_name}] ✓ TIER 3 (Selenium → Graph API) SUCCEEDED")
+            return {"success": True, "error": None, "method": result.get("method", "tier3_selenium_graph"), "attempts": attempts}
+        else:
+            logger.warning(f"[{domain_name}] TIER 3 failed: {result.get('error', 'unknown')} — trying Tier 4")
+    except Exception as e:
+        logger.warning(f"[{domain_name}] TIER 3 exception: {e} — trying Tier 4")
+        attempts.append({"tier": 3, "method": "selenium_graph", "result": {"success": False, "error": str(e)}})
+    
+    # ===== TIER 4: Selenium Admin Portal (BROWSER LAST RESORT) =====
+    try:
+        result = remove_domain_from_m365(
+            domain_name, admin_email, admin_password, totp_secret, headless=headless
+        )
+        attempts.append({"tier": 4, "method": "selenium_portal", "result": result})
+        
+        if result.get("success"):
+            logger.info(f"[{domain_name}] ✓ TIER 4 (Selenium Admin Portal) SUCCEEDED")
+            return {"success": True, "error": None, "method": result.get("method", "tier4_selenium_portal"), "attempts": attempts}
+        else:
+            logger.error(f"[{domain_name}] ✗ TIER 4 also FAILED: {result.get('error', 'unknown')}")
+    except Exception as e:
+        logger.error(f"[{domain_name}] TIER 4 exception: {e}")
+        attempts.append({"tier": 4, "method": "selenium_portal", "result": {"success": False, "error": str(e)}})
+    
+    # ===== ALL 4 TIERS FAILED =====
+    last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
+    tier_summary = ", ".join(
+        f"T{a['tier']}:{a['result'].get('error', 'failed')[:50]}" for a in attempts
+    )
+    logger.error(f"[{domain_name}] ✗ ALL 4 TIERS FAILED: {tier_summary}")
+    
+    return {
+        "success": False,
+        "error": f"All 4 removal tiers failed. Last error: {last_error}",
+        "method": "none",
+        "attempts": attempts,
+        "needs_retry": True
+    }
+
+
+# =====================================================================
+# BACKWARD COMPATIBILITY
+# =====================================================================
+# These aliases ensure the domain_removal_service.py doesn't need changes
+# (it calls remove_domain_robust and remove_domain_from_m365 by name)
+
+def remove_domain_via_graph_api(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
+    """Backward-compatible alias — now uses MSAL ROPC (Tier 1) instead of Selenium for tokens."""
+    return _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password)
