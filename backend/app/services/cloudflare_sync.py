@@ -107,17 +107,27 @@ def resolve_zone_id(zone_id, domain):
     domain_lower = domain.lower().strip()
     
     # Step 1: Check if the stored zone_id is valid and matches the domain (check ALL accounts)
+    # BUT: If the stored zone is "pending", DON'T return immediately - check other accounts for "active"
+    stored_zone_match = None  # (zone_id, acct_idx, status)
     if zone_id:
         for acct_idx in range(len(all_creds)):
             try:
                 headers = _headers(acct_idx)
                 resp = httpx.get(f"{CF_API}/zones/{zone_id}", headers=headers, timeout=30)
                 if _cf_success(resp):
-                    zone_name = resp.json().get("result", {}).get("name", "").lower().strip()
+                    result = resp.json().get("result", {})
+                    zone_name = result.get("name", "").lower().strip()
+                    zone_status = result.get("status", "pending")
                     if zone_name == domain_lower:
-                        logger.info(f"[{domain}] Zone ID validated: {zone_id} -> {zone_name} (account #{acct_idx})")
-                        _zone_account_cache[zone_id] = acct_idx
-                        return zone_id, False
+                        if zone_status == "active":
+                            # Active zone found - use it immediately
+                            logger.info(f"[{domain}] Zone ID validated (ACTIVE): {zone_id} -> {zone_name} (account #{acct_idx})")
+                            _zone_account_cache[zone_id] = acct_idx
+                            return zone_id, False
+                        else:
+                            # Pending zone - note it but keep looking for an active one
+                            logger.info(f"[{domain}] Zone ID matches but PENDING: {zone_id} (account #{acct_idx}). Checking other accounts for active zone...")
+                            stored_zone_match = (zone_id, acct_idx, zone_status)
                     else:
                         logger.warning(
                             f"[{domain}] zone_id={zone_id} belongs to '{zone_name}' in account #{acct_idx}, "
@@ -126,7 +136,7 @@ def resolve_zone_id(zone_id, domain):
             except Exception as e:
                 logger.warning(f"[{domain}] Error checking zone {zone_id} in account #{acct_idx}: {e}")
     
-    # Step 2: Look up the correct zone by domain name across ALL accounts
+    # Step 2: Look up the correct zone by domain name across ALL accounts (prefer active)
     best_zone = None
     best_acct_idx = 0
     for acct_idx in range(len(all_creds)):
@@ -153,11 +163,22 @@ def resolve_zone_id(zone_id, domain):
         correct_name = best_zone["name"]
         correct_status = best_zone.get("status", "unknown")
         _zone_account_cache[correct_zone_id] = best_acct_idx
+        was_corrected = correct_zone_id != zone_id
         logger.info(
             f"[{domain}] RESOLVED correct zone: {correct_zone_id} (name={correct_name}, "
-            f"status={correct_status}, account #{best_acct_idx}). Old zone_id was: {zone_id}"
+            f"status={correct_status}, account #{best_acct_idx}). Old zone_id was: {zone_id}, corrected={was_corrected}"
         )
-        return correct_zone_id, True
+        return correct_zone_id, was_corrected
+    
+    # Step 3: If we found a pending zone match in Step 1 but no active zone anywhere, use the pending one
+    if stored_zone_match:
+        pending_zone_id, pending_acct_idx, pending_status = stored_zone_match
+        _zone_account_cache[pending_zone_id] = pending_acct_idx
+        logger.info(
+            f"[{domain}] No active zone found anywhere. Using pending zone: {pending_zone_id} "
+            f"(status={pending_status}, account #{pending_acct_idx})"
+        )
+        return pending_zone_id, False
     
     error_msg = f"[{domain}] Domain not found in ANY Cloudflare account! Cannot resolve zone_id."
     logger.error(error_msg)

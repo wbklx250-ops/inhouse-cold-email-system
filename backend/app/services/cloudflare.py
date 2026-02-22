@@ -1743,7 +1743,50 @@ class MultiCloudflareService:
         return await svc.get_zone_nameservers(zone_id)
 
     async def bulk_create_zones(self, domains: list[str]) -> list[dict]:
-        return await self.primary.bulk_create_zones(domains)
+        """
+        Create zones for multiple domains, searching ALL accounts first.
+        Uses get_or_create_zone() per domain to prefer active zones from any account.
+        """
+        logger.info("Multi-account bulk creating zones for %d domains", len(domains))
+        results: list[dict] = []
+
+        for i, domain in enumerate(domains):
+            result: dict = {
+                "domain": domain,
+                "success": False,
+                "zone_id": None,
+                "nameservers": [],
+                "phase1_dns": None,
+                "error": None,
+            }
+
+            try:
+                # Search ALL accounts for existing zone (prefers active over pending)
+                zone_data = await self.get_or_create_zone(domain)
+                result["zone_id"] = zone_data["zone_id"]
+                result["nameservers"] = zone_data["nameservers"]
+
+                # Create Phase 1 DNS records (uses correct account via _find_service_for_zone)
+                phase1_result = await self.create_phase1_dns(zone_data["zone_id"], domain)
+                result["phase1_dns"] = phase1_result
+                result["success"] = True
+
+                logger.info("Successfully processed zone for %s (%d/%d) from account %s",
+                           domain, i + 1, len(domains), zone_data.get("account_label", "?"))
+
+            except Exception as e:
+                result["error"] = str(e)
+                logger.error("Failed to create/find zone for %s: %s", domain, e)
+
+            results.append(result)
+
+            # Rate limiting
+            if i < len(domains) - 1:
+                await asyncio.sleep(0.25)
+
+        success_count = sum(1 for r in results if r["success"])
+        logger.info("Multi-account bulk zone creation complete: %d/%d successful", success_count, len(domains))
+        return results
 
     async def bulk_create_redirect_rules(self, domains: list[dict]) -> list[dict]:
         return await self.primary.bulk_create_redirect_rules(domains)

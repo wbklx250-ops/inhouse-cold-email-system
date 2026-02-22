@@ -1952,10 +1952,27 @@ async def batch_create_zones(
                     # CRITICAL: Validate the zone actually belongs to THIS domain
                     zone_name = zone_info.get("name", "").lower()
                     if zone_name == domain_name.lower():
-                        print(f"DEBUG batch_create_zones: {domain_name} zone verified in CF (name matches)")
-                        zone_data = zone_info
-                        nameservers = zone_info.get("nameservers", [])
-                        zone_status = zone_info.get("status", "pending")
+                        stored_status = zone_info.get("status", "pending")
+                        # If stored zone is PENDING, check all accounts for an ACTIVE zone
+                        if stored_status == "pending":
+                            print(f"DEBUG batch_create_zones: {domain_name} stored zone is PENDING, searching all accounts for active zone...")
+                            active_zone = await cloudflare_service.get_zone_by_name(domain_name)
+                            if active_zone and active_zone.get("status") == "active":
+                                print(f"DEBUG batch_create_zones: {domain_name} FOUND ACTIVE zone in {active_zone.get('account_label', '?')} (zone_id={active_zone['zone_id']})")
+                                zone_data = active_zone
+                                existing_zone_id = active_zone["zone_id"]
+                                nameservers = active_zone.get("nameservers", [])
+                                zone_status = "active"
+                            else:
+                                print(f"DEBUG batch_create_zones: {domain_name} no active zone found, using pending zone")
+                                zone_data = zone_info
+                                nameservers = zone_info.get("nameservers", [])
+                                zone_status = stored_status
+                        else:
+                            print(f"DEBUG batch_create_zones: {domain_name} zone verified in CF (name matches, status={stored_status})")
+                            zone_data = zone_info
+                            nameservers = zone_info.get("nameservers", [])
+                            zone_status = stored_status
                     else:
                         # WRONG zone_id stored in DB! It belongs to a different domain.
                         print(f"WARNING batch_create_zones: {domain_name} zone_id {existing_zone_id} actually belongs to '{zone_name}' - looking up correct zone")
