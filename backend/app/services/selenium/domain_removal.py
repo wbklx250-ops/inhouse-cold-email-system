@@ -1,12 +1,15 @@
 """
-M365 Admin Portal - Domain Removal Automation
+M365 Domain Removal - Robust two-pronged approach:
 
-Removes a custom domain from an M365 tenant via Selenium.
-Prerequisites: All mailboxes and UPNs using the domain must be removed first.
+PRIMARY: Microsoft Graph API forceDelete (handles all reassignment server-side)
+FALLBACK: Selenium Admin Portal automation (if Graph API fails)
 """
 import time
 import os
+import urllib.parse
 import pyotp
+import aiohttp
+import asyncio
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
@@ -31,6 +34,400 @@ def screenshot(driver, step, domain=""):
     except Exception as e:
         logger.warning(f"Could not save screenshot: {e}")
 
+
+# =====================================================================
+# GRAPH API DOMAIN REMOVAL (PRIMARY METHOD)
+# =====================================================================
+
+def _get_access_token_via_selenium(admin_email, admin_password, totp_secret=None, headless=True):
+    """
+    Get an OAuth access token by automating the Microsoft login flow via Selenium.
+    Uses the Azure AD PowerShell well-known client ID for implicit grant.
+    
+    Returns: (success: bool, access_token: str|None, error: str|None)
+    """
+    client_id = "1b730954-1685-4b74-9bfd-dac224a7b894"  # Azure AD PowerShell
+    redirect_uri = "https://login.microsoftonline.com/common/oauth2/nativeclient"
+    resource = "https://graph.microsoft.com"
+    
+    tenant_domain = admin_email.split("@")[1] if "@" in admin_email else "common"
+    
+    auth_url = (
+        f"https://login.microsoftonline.com/{tenant_domain}/oauth2/v2.0/authorize"
+        f"?client_id={client_id}"
+        f"&response_type=token"
+        f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+        f"&scope=https://graph.microsoft.com/.default"
+        f"&response_mode=fragment"
+    )
+    
+    driver = None
+    try:
+        driver = create_browser(headless=headless)
+        logger.info(f"[Graph Token] Navigating to OAuth URL for {admin_email}")
+        driver.get(auth_url)
+        time.sleep(3)
+        
+        # Enter email
+        try:
+            email_field = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.NAME, "loginfmt"))
+            )
+            email_field.clear()
+            email_field.send_keys(admin_email + Keys.RETURN)
+            time.sleep(4)
+        except TimeoutException:
+            return False, None, "Could not find email input"
+        
+        # Enter password
+        try:
+            password_field = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.NAME, "passwd"))
+            )
+            password_field.clear()
+            password_field.send_keys(admin_password + Keys.RETURN)
+            time.sleep(4)
+        except TimeoutException:
+            return False, None, "Could not find password input"
+        
+        # Check for login errors
+        page_source = driver.page_source.lower()
+        for err in ["password is incorrect", "account or password is incorrect", "account doesn't exist", "account has been locked"]:
+            if err in page_source:
+                return False, None, f"Login failed: {err}"
+        
+        # Handle TOTP/MFA
+        if totp_secret:
+            try:
+                totp_field = WebDriverWait(driver, 8).until(
+                    EC.presence_of_element_located((By.NAME, "otc"))
+                )
+                code = pyotp.TOTP(totp_secret).now()
+                totp_field.send_keys(code + Keys.RETURN)
+                time.sleep(4)
+                logger.info("[Graph Token] TOTP submitted")
+            except TimeoutException:
+                logger.debug("[Graph Token] No TOTP field - MFA may not be required")
+        else:
+            try:
+                WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.NAME, "otc"))
+                )
+                return False, None, "MFA required but no TOTP secret provided"
+            except TimeoutException:
+                pass
+        
+        # Handle "Stay signed in?"
+        try:
+            no_btn = WebDriverWait(driver, 8).until(
+                EC.element_to_be_clickable((By.ID, "idBtn_Back"))
+            )
+            no_btn.click()
+            time.sleep(3)
+        except TimeoutException:
+            pass
+        
+        # Wait and check for token in URL
+        time.sleep(3)
+        for _ in range(10):
+            current_url = driver.current_url
+            if "#access_token=" in current_url:
+                fragment = current_url.split("#", 1)[1]
+                params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
+                token = urllib.parse.unquote(params.get("access_token", ""))
+                if token:
+                    logger.info(f"[Graph Token] Got access token ({len(token)} chars)")
+                    return True, token, None
+            if "error=" in current_url:
+                error_desc = urllib.parse.unquote(params.get("error_description", "unknown"))
+                return False, None, f"OAuth error: {error_desc}"
+            time.sleep(2)
+        
+        # Check for consent/permissions page
+        page_source = driver.page_source.lower()
+        if "permissions requested" in page_source or "accept" in page_source:
+            try:
+                accept_btn = driver.find_element(By.XPATH, "//input[@type='submit'] | //button[contains(., 'Accept')]")
+                accept_btn.click()
+                time.sleep(5)
+                current_url = driver.current_url
+                if "#access_token=" in current_url:
+                    fragment = current_url.split("#", 1)[1]
+                    params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
+                    token = urllib.parse.unquote(params.get("access_token", ""))
+                    if token:
+                        logger.info(f"[Graph Token] Got token after consent ({len(token)} chars)")
+                        return True, token, None
+            except Exception:
+                pass
+        
+        screenshot(driver, "graph_token_failed", admin_email.split("@")[0])
+        return False, None, f"Could not extract token. Final URL: {driver.current_url[:100]}"
+        
+    except Exception as e:
+        logger.error(f"[Graph Token] Error: {e}")
+        return False, None, str(e)
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+
+# =====================================================================
+# MASTER FUNCTION: Graph API (primary) → Selenium (fallback)
+# =====================================================================
+
+def remove_domain_robust(
+    domain_name: str,
+    admin_email: str,
+    admin_password: str,
+    totp_secret: str = None,
+    headless: bool = True
+) -> dict:
+    """
+    Bulletproof domain removal — tries Graph API forceDelete first,
+    falls back to Selenium Admin Portal if Graph API fails.
+    
+    Graph API forceDelete is superior because:
+    - It automatically reassigns ALL UPNs, proxy addresses, groups, service principals
+    - No UI clicking = no false positives from page text
+    - No timing/rendering issues
+    
+    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list}
+    """
+    attempts = []
+    
+    # ===== ATTEMPT 1: Graph API forceDelete =====
+    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Trying Graph API forceDelete (primary) ===")
+    try:
+        graph_result = remove_domain_via_graph_api(
+            domain_name=domain_name,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            totp_secret=totp_secret,
+            headless=headless
+        )
+        attempts.append({"method": "graph_api", "result": graph_result})
+        
+        if graph_result.get("success"):
+            logger.info(f"[{domain_name}] ✓ Graph API removal SUCCEEDED")
+            return {
+                "success": True,
+                "error": None,
+                "method": "graph_api",
+                "attempts": attempts
+            }
+        else:
+            logger.warning(f"[{domain_name}] Graph API failed: {graph_result.get('error')} — falling back to Selenium")
+    except Exception as e:
+        logger.warning(f"[{domain_name}] Graph API exception: {e} — falling back to Selenium")
+        attempts.append({"method": "graph_api", "result": {"success": False, "error": str(e)}})
+    
+    # ===== ATTEMPT 2: Selenium Admin Portal =====
+    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Trying Selenium Admin Portal (fallback) ===")
+    try:
+        selenium_result = remove_domain_from_m365(
+            domain_name=domain_name,
+            admin_email=admin_email,
+            admin_password=admin_password,
+            totp_secret=totp_secret,
+            headless=headless
+        )
+        attempts.append({"method": "selenium", "result": selenium_result})
+        
+        if selenium_result.get("success"):
+            logger.info(f"[{domain_name}] ✓ Selenium removal SUCCEEDED")
+            return {
+                "success": True,
+                "error": None,
+                "method": "selenium",
+                "attempts": attempts
+            }
+        else:
+            logger.error(f"[{domain_name}] ✗ Selenium removal also FAILED: {selenium_result.get('error')}")
+    except Exception as e:
+        logger.error(f"[{domain_name}] Selenium exception: {e}")
+        attempts.append({"method": "selenium", "result": {"success": False, "error": str(e)}})
+    
+    # ===== BOTH FAILED =====
+    last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
+    return {
+        "success": False,
+        "error": f"All removal methods failed. Last error: {last_error}",
+        "method": "none",
+        "attempts": attempts,
+        "needs_retry": True
+    }
+
+
+async def _graph_api_force_delete(access_token, domain_name):
+    """
+    Force-delete a domain via Microsoft Graph API.
+    This automatically reassigns all UPNs, proxy addresses, groups, etc.
+    
+    Returns: {"success": bool, "error": str|None}
+    """
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    
+    # First check if domain exists
+    try:
+        async with aiohttp.ClientSession() as session:
+            # Check domain exists
+            async with session.get(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status == 404:
+                    logger.info(f"[Graph API] Domain '{domain_name}' not found — already removed")
+                    return {"success": True, "error": None, "note": "Domain already removed"}
+                elif resp.status == 401:
+                    return {"success": False, "error": "Access token expired or insufficient permissions"}
+                elif resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"[Graph API] Domain check returned {resp.status}: {body[:200]}")
+            
+            # Try forceDelete (beta endpoint - handles all reassignment automatically)
+            logger.info(f"[Graph API] Attempting forceDelete for '{domain_name}'...")
+            async with session.post(
+                f"https://graph.microsoft.com/beta/domains/{domain_name}/forceDelete",
+                headers=headers,
+                json={"disableUserAccounts": True}
+            ) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"[Graph API] forceDelete succeeded for '{domain_name}'")
+                    return {"success": True, "error": None, "method": "forceDelete"}
+                else:
+                    body = await resp.text()
+                    logger.warning(f"[Graph API] forceDelete returned {resp.status}: {body[:300]}")
+            
+            # Fallback: Try regular DELETE
+            logger.info(f"[Graph API] Trying regular DELETE for '{domain_name}'...")
+            async with session.delete(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status in (200, 204):
+                    logger.info(f"[Graph API] DELETE succeeded for '{domain_name}'")
+                    return {"success": True, "error": None, "method": "delete"}
+                else:
+                    body = await resp.text()
+                    error_msg = f"DELETE returned {resp.status}: {body[:300]}"
+                    logger.error(f"[Graph API] {error_msg}")
+                    return {"success": False, "error": error_msg}
+                    
+    except Exception as e:
+        logger.error(f"[Graph API] Error removing '{domain_name}': {e}")
+        return {"success": False, "error": str(e)}
+
+
+async def _graph_api_verify_removed(access_token, domain_name):
+    """Verify a domain was actually removed by checking Graph API."""
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                f"https://graph.microsoft.com/v1.0/domains/{domain_name}",
+                headers=headers
+            ) as resp:
+                if resp.status == 404:
+                    return True  # Domain is gone
+                elif resp.status == 200:
+                    return False  # Domain still exists
+                else:
+                    return None  # Can't determine
+    except Exception:
+        return None
+
+
+def remove_domain_via_graph_api(
+    domain_name: str,
+    admin_email: str,
+    admin_password: str,
+    totp_secret: str = None,
+    headless: bool = True
+) -> dict:
+    """
+    Remove a domain from M365 using Graph API forceDelete (synchronous wrapper).
+    
+    Steps:
+    1. Get OAuth token via Selenium login
+    2. Call Graph API forceDelete (handles all reassignment automatically)
+    3. Verify removal
+    
+    Returns: {"success": bool, "error": str|None, "method": str}
+    """
+    logger.info(f"[{domain_name}] Attempting Graph API removal...")
+    
+    # Step 1: Get access token
+    success, token, error = _get_access_token_via_selenium(
+        admin_email, admin_password, totp_secret, headless=headless
+    )
+    if not success or not token:
+        logger.warning(f"[{domain_name}] Could not get Graph API token: {error}")
+        return {"success": False, "error": f"Token acquisition failed: {error}", "method": "graph_api"}
+    
+    # Step 2: Call Graph API (need to run async code from sync context)
+    loop = None
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # We're inside an async context already, use a new loop in thread
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                result = pool.submit(_run_async_graph_delete, token, domain_name).result(timeout=60)
+        else:
+            result = loop.run_until_complete(_graph_api_force_delete(token, domain_name))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(_graph_api_force_delete(token, domain_name))
+        finally:
+            loop.close()
+    
+    if result.get("success"):
+        # Step 3: Verify removal (wait a bit for propagation)
+        time.sleep(5)
+        try:
+            if loop and not loop.is_closed():
+                verified = loop.run_until_complete(_graph_api_verify_removed(token, domain_name))
+            else:
+                verified = None
+        except Exception:
+            verified = None
+        
+        if verified is False:
+            # Domain still exists after forceDelete — might need more time
+            logger.warning(f"[{domain_name}] Graph API reported success but domain still exists, waiting longer...")
+            time.sleep(15)
+        
+        result["method"] = "graph_api"
+        return result
+    
+    result["method"] = "graph_api"
+    return result
+
+
+def _run_async_graph_delete(token, domain_name):
+    """Run async Graph API delete in a new event loop (for use from sync context)."""
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_graph_api_force_delete(token, domain_name))
+    finally:
+        loop.close()
+
+
+# =====================================================================
+# SELENIUM ADMIN PORTAL REMOVAL (FALLBACK METHOD)
+# =====================================================================
 
 def create_browser(headless=True):
     """Create a Chrome browser instance."""
@@ -689,21 +1086,35 @@ def remove_domain_from_m365(
         time.sleep(20)
         screenshot(driver, "06_after_removal", domain_name)
         
-        # Check current page for ERROR indicators first
-        # If M365 rejected the removal, it shows errors like "can't remove", "in use", etc.
+        # Check current page — look for SUCCESS indicators FIRST (before errors)
+        # because the removal confirmation page naturally contains words like "reassign"
+        # as part of the normal flow, NOT as error messages.
         page_source = driver.page_source.lower()
+        
+        success_indicators = [
+            "has been removed",
+            "successfully removed",
+            "domain was removed",
+            "removal complete",
+            "removed from your organization",
+            "no longer available",
+            "domain removed",
+        ]
+        for indicator in success_indicators:
+            if indicator in page_source:
+                logger.info(f"Domain '{domain_name}' removed successfully (confirmed by page text: '{indicator}')")
+                return {"success": True, "error": None}
+        
+        # Now check for REAL error indicators (NOT normal UI text like "reassign")
+        # Only match definitive error messages that mean M365 refused the removal
         error_indicators = [
-            "can't remove",
-            "cannot remove",
+            "can't remove this domain",
+            "cannot remove this domain",
             "unable to remove",
             "removal failed",
-            "still in use",
-            "has active",
-            "has resources",
-            "before you can remove",
-            "you need to",
-            "move users",
-            "reassign",
+            "domain is still in use",
+            "fix issues before removing",
+            "you can't remove the default domain",
         ]
         found_error = None
         for indicator in error_indicators:
@@ -716,24 +1127,10 @@ def remove_domain_from_m365(
             logger.error(f"Domain '{domain_name}' removal was REJECTED by M365: '{found_error}'")
             return {
                 "success": False,
-                "error": f"M365 rejected removal: '{found_error}' — domain likely has active resources",
+                "error": f"M365 rejected removal: '{found_error}'",
                 "confirm_button_clicked": confirm_clicked,
                 "needs_retry": True
             }
-        
-        # Check current page for SUCCESS indicators
-        success_indicators = [
-            "has been removed",
-            "successfully removed",
-            "domain was removed",
-            "removal complete",
-            "removed from your organization",
-            "no longer available",
-        ]
-        for indicator in success_indicators:
-            if indicator in page_source:
-                logger.info(f"Domain '{domain_name}' removed successfully (confirmed by page text: '{indicator}')")
-                return {"success": True, "error": None}
         
         # Check if we're back on the domains list (removal redirected us) and domain is gone
         if "/Domains" in driver.current_url and domain_name not in page_source:

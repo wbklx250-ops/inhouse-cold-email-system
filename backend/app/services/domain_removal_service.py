@@ -6,11 +6,10 @@ Supports two modes:
   Mode 2 (CSV): Given domain + tenant credentials directly, no DB lookup needed
 
 For both modes, the removal steps are:
-1. Delete mailboxes from M365 (via PowerShell/Exchange Online)
-2. Reset all user UPNs on this domain back to onmicrosoft.com
-3. Remove the domain from M365 tenant (via Selenium Admin Portal)
-4. Clean up Cloudflare DNS records
-5. Update database (Mode 1 only, or Mode 2 if domain happens to exist in DB)
+1. Remove domain from M365 (Graph API forceDelete primary, Selenium fallback)
+   - Graph API forceDelete automatically reassigns all UPNs, mailboxes, proxy addresses, etc.
+2. Clean up Cloudflare DNS records
+3. Update database (Mode 1 only, or Mode 2 if domain happens to exist in DB)
 """
 import asyncio
 import csv
@@ -248,106 +247,21 @@ class DomainRemovalService:
         """
         Core removal logic shared by both Mode 1 and Mode 2.
         
-        Steps:
-        1. Delete mailboxes from M365 via PowerShell Exchange
-        2. Reset user UPNs back to onmicrosoft.com via PowerShell MSOnline
-        3. Remove domain from M365 tenant via Selenium Admin Portal
-        4. Clean up Cloudflare DNS records (MX, SPF, DKIM, verification TXT, autodiscover)
+        Uses the robust two-pronged approach:
+        1. Graph API forceDelete (primary) — handles ALL reassignment server-side
+        2. Selenium Admin Portal (fallback) — if Graph API fails
+        3. Clean up Cloudflare DNS records
+        
+        Graph API forceDelete automatically reassigns all UPNs, mailboxes,
+        proxy addresses, groups, etc. — no need for separate PowerShell steps.
         
         Returns dict with "steps" key containing results of each step.
         """
         steps = {}
         
-        # ===== STEP 1: Delete mailboxes from M365 =====
+        # ===== STEP 1: Remove domain from M365 (Graph API primary, Selenium fallback) =====
         if not skip_m365:
-            try:
-                logger.info(f"[{domain_name}] Step 1: Deleting mailboxes...")
-                
-                remove_commands = [
-                    f'$mailboxes = Get-Mailbox -ResultSize Unlimited | Where-Object {{ $_.PrimarySmtpAddress -like "*@{domain_name}" -or $_.UserPrincipalName -like "*@{domain_name}" }}',
-                    f'$count = ($mailboxes | Measure-Object).Count',
-                    f'Write-Output "FOUND_MAILBOXES:$count"',
-                    f'foreach ($mb in $mailboxes) {{',
-                    f'    try {{',
-                    f'        Remove-Mailbox -Identity $mb.PrimarySmtpAddress -Confirm:$false -Force -ErrorAction Stop',
-                    f'        Write-Output "REMOVED:$($mb.PrimarySmtpAddress)"',
-                    f'    }} catch {{',
-                    f'        Write-Output "FAILED:$($mb.PrimarySmtpAddress):$($_.Exception.Message)"',
-                    f'    }}',
-                    f'}}',
-                    f'Write-Output "MAILBOX_CLEANUP_DONE"'
-                ]
-                
-                ps_result = await self.ps_runner.run_exchange_with_credentials(
-                    admin_email=admin_email,
-                    admin_password=admin_password,
-                    commands=remove_commands
-                )
-                
-                output = ps_result.output or ""
-                removed_count = output.count("REMOVED:")
-                failed_count = output.count("FAILED:")
-                
-                steps["delete_mailboxes"] = {
-                    "success": ps_result.success or "MAILBOX_CLEANUP_DONE" in output,
-                    "removed": removed_count,
-                    "failed": failed_count,
-                    "error": ps_result.error if not ps_result.success and "MAILBOX_CLEANUP_DONE" not in output else None
-                }
-            except Exception as e:
-                logger.error(f"[{domain_name}] Error deleting mailboxes: {e}")
-                steps["delete_mailboxes"] = {"success": False, "error": str(e)}
-        else:
-            steps["delete_mailboxes"] = {"skipped": True, "note": "M365 operations skipped"}
-        
-        # ===== STEP 2: Reset user UPNs on this domain =====
-        if not skip_m365:
-            try:
-                logger.info(f"[{domain_name}] Step 2: Resetting user UPNs...")
-                
-                # Extract onmicrosoft domain from admin email
-                onmicrosoft_domain = admin_email.split("@")[1] if "@" in admin_email else None
-                
-                if onmicrosoft_domain:
-                    upn_commands = [
-                        f'$users = Get-MsolUser -All | Where-Object {{ $_.UserPrincipalName -like "*@{domain_name}" }}',
-                        f'$count = ($users | Measure-Object).Count',
-                        f'Write-Output "FOUND_USERS:$count"',
-                        f'foreach ($user in $users) {{',
-                        f'    $newUPN = $user.UserPrincipalName.Split("@")[0] + "@{onmicrosoft_domain}"',
-                        f'    try {{',
-                        f'        Set-MsolUserPrincipalName -UserPrincipalName $user.UserPrincipalName -NewUserPrincipalName $newUPN -ErrorAction Stop',
-                        f'        Write-Output "UPN_RESET:$($user.UserPrincipalName) -> $newUPN"',
-                        f'    }} catch {{',
-                        f'        Write-Output "UPN_FAILED:$($user.UserPrincipalName):$($_.Exception.Message)"',
-                        f'    }}',
-                        f'}}',
-                        f'Write-Output "UPN_CLEANUP_DONE"'
-                    ]
-                    
-                    ps_result = await self.ps_runner.run_msol_with_credentials(
-                        admin_email=admin_email,
-                        admin_password=admin_password,
-                        commands=upn_commands
-                    )
-                    
-                    output = ps_result.output or ""
-                    steps["reset_upns"] = {
-                        "success": ps_result.success or "UPN_CLEANUP_DONE" in output,
-                        "upns_reset": output.count("UPN_RESET:"),
-                        "error": ps_result.error if not ps_result.success and "UPN_CLEANUP_DONE" not in output else None
-                    }
-                else:
-                    steps["reset_upns"] = {"success": True, "note": "Could not determine onmicrosoft domain from admin email"}
-            except Exception as e:
-                logger.error(f"[{domain_name}] Error resetting UPNs: {e}")
-                steps["reset_upns"] = {"success": False, "error": str(e)}
-        else:
-            steps["reset_upns"] = {"skipped": True, "note": "M365 operations skipped"}
-        
-        # ===== STEP 3: Remove domain from M365 tenant (Selenium) with retry =====
-        if not skip_m365:
-            from app.services.selenium.domain_removal import remove_domain_from_m365
+            from app.services.selenium.domain_removal import remove_domain_robust
             
             total_attempts = 1 + max_retries  # 1 initial + N retries
             m365_result = None
@@ -355,15 +269,15 @@ class DomainRemovalService:
             for attempt in range(total_attempts):
                 try:
                     if attempt == 0:
-                        logger.info(f"[{domain_name}] Step 3: Removing domain from M365 via Admin Portal...")
+                        logger.info(f"[{domain_name}] Step 1: Removing domain from M365 (Graph API + Selenium fallback)...")
                     else:
                         retry_delay = 30 * attempt  # 30s, 60s, etc.
-                        logger.info(f"[{domain_name}] Step 3: RETRY {attempt}/{max_retries} — waiting {retry_delay}s before retrying M365 removal...")
+                        logger.info(f"[{domain_name}] Step 1: RETRY {attempt}/{max_retries} — waiting {retry_delay}s before retrying...")
                         await asyncio.sleep(retry_delay)
                     
-                    # Run synchronous Selenium in thread pool
+                    # Run synchronous robust removal in thread pool
                     m365_result = await asyncio.to_thread(
-                        remove_domain_from_m365,
+                        remove_domain_robust,
                         domain_name=domain_name,
                         admin_email=admin_email,
                         admin_password=admin_password,
@@ -372,7 +286,7 @@ class DomainRemovalService:
                     )
                     
                     if m365_result.get("success"):
-                        logger.info(f"[{domain_name}] M365 removal succeeded on attempt {attempt + 1}")
+                        logger.info(f"[{domain_name}] M365 removal succeeded on attempt {attempt + 1} via {m365_result.get('method', 'unknown')}")
                         m365_result["attempts"] = attempt + 1
                         break
                     else:
@@ -381,12 +295,10 @@ class DomainRemovalService:
                             logger.warning(f"[{domain_name}] M365 removal failed on attempt {attempt + 1}: {m365_result.get('error')} — will retry")
                             continue
                         elif not needs_retry:
-                            # Non-retryable failure (e.g., login failed, button not found)
                             logger.error(f"[{domain_name}] M365 removal failed (non-retryable): {m365_result.get('error')}")
                             m365_result["attempts"] = attempt + 1
                             break
                         else:
-                            # Last attempt also failed
                             logger.error(f"[{domain_name}] M365 removal failed after all {attempt + 1} attempts: {m365_result.get('error')}")
                             m365_result["attempts"] = attempt + 1
                             break
@@ -401,9 +313,9 @@ class DomainRemovalService:
         else:
             steps["m365_removal"] = {"skipped": True, "note": "M365 operations skipped"}
         
-        # ===== STEP 4: Clean up Cloudflare DNS records =====
+        # ===== STEP 2: Clean up Cloudflare DNS records =====
         try:
-            logger.info(f"[{domain_name}] Step 4: Cleaning Cloudflare DNS...")
+            logger.info(f"[{domain_name}] Step 2: Cleaning Cloudflare DNS...")
             
             cf_service = self._get_cf_service()
             
@@ -589,9 +501,9 @@ class DomainRemovalService:
             result["completed_at"] = datetime.utcnow().isoformat()
             return result
         
-        # ===== STEP 5: Update database (only if M365 removal succeeded) =====
+        # ===== STEP 3: Update database (only if M365 removal succeeded) =====
         try:
-            logger.info(f"[{domain_name}] Step 5: Updating database (M365 removal confirmed)...")
+            logger.info(f"[{domain_name}] Step 3: Updating database (M365 removal confirmed)...")
             
             # Archive/retire mailboxes for this domain
             mb_result = await db.execute(

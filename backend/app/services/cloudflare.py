@@ -77,21 +77,46 @@ class CloudflareService:
     async def create_zone(self, domain_name: str) -> dict[str, Any]:
         """
         Create a new zone in Cloudflare.
+        
+        If the zone already exists (domain was previously added to Cloudflare),
+        this will automatically look up and return the existing zone info
+        instead of failing.
 
         Returns:
             {"zone_id": str, "nameservers": list[str], "status": str}
         """
         logger.info("Creating Cloudflare zone for domain: %s", domain_name)
 
-        data = await self._request(
-            method="POST",
-            endpoint="/zones",
-            json_data={
-                "name": domain_name,
-                "account": {"id": self._account_id},
-                "type": "full",
-            },
-        )
+        try:
+            data = await self._request(
+                method="POST",
+                endpoint="/zones",
+                json_data={
+                    "name": domain_name,
+                    "account": {"id": self._account_id},
+                    "type": "full",
+                },
+            )
+        except CloudflareError as e:
+            # Handle "zone already exists" - look up existing zone instead of failing
+            error_str = str(e).lower()
+            if "already exists" in error_str or "is already" in error_str:
+                logger.info("Zone already exists for %s, fetching existing zone info...", domain_name)
+                existing = await self.get_zone_by_name(domain_name)
+                if existing:
+                    logger.info(
+                        "Found existing zone for %s: zone_id=%s, status=%s, nameservers=%s",
+                        domain_name, existing["zone_id"], existing["status"], existing["nameservers"]
+                    )
+                    return {
+                        "zone_id": existing["zone_id"],
+                        "nameservers": existing["nameservers"],
+                        "status": existing["status"],
+                    }
+                else:
+                    logger.error("Zone 'already exists' for %s but could not find it by name!", domain_name)
+            # Re-raise if not "already exists" or lookup failed
+            raise
 
         result = data.get("result", {})
         zone_id = result.get("id", "")
@@ -100,15 +125,10 @@ class CloudflareService:
 
         logger.info("Zone created: zone_id=%s, nameservers=%s, status=%s", zone_id, nameservers, status)
         
-        # DEBUG: Log full result to help diagnose nameserver issues
-        print(f"DEBUG create_zone: Full API result for {domain_name}: {result}")
-        print(f"DEBUG create_zone: Extracted nameservers: {nameservers}")
-        
         # If nameservers are empty, try to fetch them from the zone details
         if not nameservers and zone_id:
             logger.warning("Nameservers empty after zone creation, fetching from zone details...")
             nameservers = await self.get_zone_nameservers(zone_id)
-            print(f"DEBUG create_zone: Fetched nameservers from zone details: {nameservers}")
 
         return {
             "zone_id": zone_id,
