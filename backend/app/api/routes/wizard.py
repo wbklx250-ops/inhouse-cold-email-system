@@ -1949,10 +1949,21 @@ async def batch_create_zones(
                 # Verify it still exists in Cloudflare
                 zone_info = await cloudflare_service.get_zone_by_id(existing_zone_id)
                 if zone_info:
-                    print(f"DEBUG batch_create_zones: {domain_name} zone verified in CF")
-                    zone_data = zone_info
-                    nameservers = zone_info.get("nameservers", [])
-                    zone_status = zone_info.get("status", "pending")
+                    # CRITICAL: Validate the zone actually belongs to THIS domain
+                    zone_name = zone_info.get("name", "").lower()
+                    if zone_name == domain_name.lower():
+                        print(f"DEBUG batch_create_zones: {domain_name} zone verified in CF (name matches)")
+                        zone_data = zone_info
+                        nameservers = zone_info.get("nameservers", [])
+                        zone_status = zone_info.get("status", "pending")
+                    else:
+                        # WRONG zone_id stored in DB! It belongs to a different domain.
+                        print(f"WARNING batch_create_zones: {domain_name} zone_id {existing_zone_id} actually belongs to '{zone_name}' - looking up correct zone")
+                        logger.warning(
+                            "Domain %s has wrong zone_id %s (belongs to '%s') - will look up correct zone by name",
+                            domain_name, existing_zone_id, zone_name
+                        )
+                        existing_zone_id = None  # Force re-lookup by name below
                 else:
                     # Zone was deleted from CF, need to recreate
                     print(f"DEBUG batch_create_zones: {domain_name} zone NOT found in CF, recreating")
