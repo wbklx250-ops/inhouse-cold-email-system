@@ -1818,6 +1818,7 @@ async def batch_import_domains(
         
         created = 0
         skipped = 0
+        reassigned = 0
         with_redirect = 0
         
         for domain_data in parsed_domains:
@@ -1825,9 +1826,20 @@ async def batch_import_domains(
             existing = await db.execute(
                 select(Domain).where(Domain.name == domain_data.name)
             )
-            if existing.scalar_one_or_none():
-                skipped += 1
-                continue
+            existing_domain = existing.scalar_one_or_none()
+            if existing_domain:
+                if existing_domain.batch_id == batch_id:
+                    # Already in this batch - skip
+                    skipped += 1
+                    continue
+                else:
+                    # Domain exists in a different/deleted batch - reassign to current batch
+                    domain_redirect = domain_data.redirect_url or redirect_url or batch.redirect_url
+                    if domain_redirect:
+                        existing_domain.redirect_url = domain_redirect
+                    existing_domain.batch_id = batch_id
+                    reassigned += 1
+                    continue
             
             # Extract TLD
             parts = domain_data.name.split('.')
@@ -1850,19 +1862,35 @@ async def batch_import_domains(
             db.add(domain)
             created += 1
         
-        # Update batch step
-        if batch.current_step == 1 and created > 0:
+        # Update batch step - advance if we created OR reassigned domains
+        if batch.current_step == 1 and (created > 0 or reassigned > 0):
             batch.current_step = 2
         
         await db.commit()
         
+        # Build message
+        parts = []
+        if created > 0:
+            parts.append(f"{created} new")
+        if reassigned > 0:
+            parts.append(f"{reassigned} reassigned from other batches")
+        if skipped > 0:
+            parts.append(f"{skipped} already in batch")
+        
+        total_added = created + reassigned
+        message = f"Imported {total_added} domains"
+        if parts:
+            message += f" ({', '.join(parts)})"
+        
         return StepResult(
             success=True,
-            message=f"Imported {created} domains ({with_redirect} with redirect), skipped {skipped} duplicates",
+            message=message,
             details={
-                "created": created, 
+                "created": created,
+                "reassigned": reassigned,
                 "skipped": skipped,
                 "with_redirect": with_redirect,
+                "total_added": total_added,
                 "fallback_redirect": redirect_url or batch.redirect_url or None
             }
         )
