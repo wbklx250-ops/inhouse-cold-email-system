@@ -978,92 +978,222 @@ def remove_domain_from_m365(domain_name, admin_email, admin_password, totp_secre
 
 
 # =====================================================================
+# EXTERNAL VERIFICATION: Confirm domain is actually removed
+# =====================================================================
+
+def _verify_domain_actually_removed(domain_name, admin_email=None, admin_password=None, max_wait=90):
+    """
+    Externally verify a domain is no longer attached to any M365 tenant.
+    Uses the same methods as saas-dance.deno.dev — pure HTTP, no browser.
+    
+    Checks:
+    1. OpenID Connect discovery endpoint → does domain resolve to a tenant?
+    2. User Realm discovery → is NameSpaceType still Managed/Federated?
+    3. Graph API (if we have credentials) → does domain still exist?
+    
+    Retries with propagation waits up to max_wait seconds.
+    
+    Returns: {"verified_removed": bool, "checks": dict, "error": str|None}
+    """
+    import requests
+    
+    logger.info(f"[{domain_name}] VERIFICATION: Checking if domain is actually removed from M365...")
+    
+    # Wait for M365 propagation before first check
+    logger.info(f"[{domain_name}] Waiting 20s for M365 propagation...")
+    time.sleep(20)
+    
+    checks_done = {}
+    elapsed = 20
+    
+    for attempt in range(3):
+        if attempt > 0:
+            wait = min(30, max_wait - elapsed)
+            if wait <= 0:
+                break
+            logger.info(f"[{domain_name}] VERIFICATION retry {attempt}: waiting {wait}s...")
+            time.sleep(wait)
+            elapsed += wait
+        
+        still_in_tenant = False
+        
+        # CHECK 1: User Realm discovery (most reliable for "is domain in a tenant?")
+        try:
+            realm_url = f"https://login.microsoftonline.com/getuserrealm.srf?login=test@{domain_name}&json=1"
+            resp = requests.get(realm_url, timeout=15)
+            if resp.status_code == 200:
+                realm_data = resp.json()
+                ns_type = realm_data.get("NameSpaceType", "").lower()
+                tenant_brand = realm_data.get("FederationBrandName", "")
+                
+                checks_done["user_realm"] = {
+                    "namespace_type": ns_type,
+                    "federation_brand": tenant_brand,
+                    "raw": realm_data
+                }
+                
+                if ns_type in ("managed", "federated"):
+                    still_in_tenant = True
+                    logger.warning(f"[{domain_name}] User Realm check: NameSpaceType={ns_type} — domain STILL in a tenant (brand: {tenant_brand})")
+                else:
+                    logger.info(f"[{domain_name}] User Realm check: NameSpaceType={ns_type} — domain appears FREE")
+            else:
+                checks_done["user_realm"] = {"error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            checks_done["user_realm"] = {"error": str(e)}
+            logger.warning(f"[{domain_name}] User Realm check error: {e}")
+        
+        # CHECK 2: OpenID Connect discovery
+        try:
+            oidc_url = f"https://login.microsoftonline.com/{domain_name}/.well-known/openid-configuration"
+            resp = requests.get(oidc_url, timeout=15)
+            if resp.status_code == 200:
+                oidc_data = resp.json()
+                tenant_id = oidc_data.get("issuer", "").split("/")[-2] if "issuer" in oidc_data else None
+                
+                # A domain not in a tenant returns a generic "common" tenant or error
+                if tenant_id and tenant_id not in ("common", "{tenantid}", "9188040d-6c67-4c5b-b112-36a304b66dad"):
+                    still_in_tenant = True
+                    checks_done["openid"] = {"tenant_id": tenant_id, "in_tenant": True}
+                    logger.warning(f"[{domain_name}] OpenID check: resolves to tenant {tenant_id}")
+                else:
+                    checks_done["openid"] = {"tenant_id": tenant_id, "in_tenant": False}
+                    logger.info(f"[{domain_name}] OpenID check: no specific tenant found")
+            elif resp.status_code == 400:
+                checks_done["openid"] = {"in_tenant": False, "note": "400 — domain not recognized"}
+                logger.info(f"[{domain_name}] OpenID check: 400 — domain not in any tenant")
+            else:
+                checks_done["openid"] = {"error": f"HTTP {resp.status_code}"}
+        except Exception as e:
+            checks_done["openid"] = {"error": str(e)}
+            logger.warning(f"[{domain_name}] OpenID check error: {e}")
+        
+        # CHECK 3: Graph API (if we have credentials and can get a token)
+        if admin_email and admin_password:
+            try:
+                token_ok, token, _ = _get_access_token_via_msal(admin_email, admin_password)
+                if token_ok and token:
+                    verified = _run_async_graph_verify(token, domain_name)
+                    if verified is True:
+                        checks_done["graph_api"] = {"domain_exists": False, "removed": True}
+                        logger.info(f"[{domain_name}] Graph API check: domain NOT found (404) — confirmed removed")
+                    elif verified is False:
+                        still_in_tenant = True
+                        checks_done["graph_api"] = {"domain_exists": True, "removed": False}
+                        logger.warning(f"[{domain_name}] Graph API check: domain STILL EXISTS in tenant")
+                    else:
+                        checks_done["graph_api"] = {"domain_exists": None, "note": "Inconclusive"}
+                else:
+                    checks_done["graph_api"] = {"skipped": True, "note": "Could not get token"}
+            except Exception as e:
+                checks_done["graph_api"] = {"error": str(e)}
+        
+        # VERDICT
+        if not still_in_tenant:
+            logger.info(f"[{domain_name}] ✓ VERIFIED: Domain is confirmed removed from M365 tenant")
+            return {"verified_removed": True, "checks": checks_done, "error": None}
+        
+        logger.warning(f"[{domain_name}] Domain still in tenant on attempt {attempt + 1}")
+    
+    # After all retries, domain is still in a tenant
+    logger.error(f"[{domain_name}] ✗ VERIFICATION FAILED: Domain is STILL attached to a tenant after {elapsed}s of waiting")
+    return {
+        "verified_removed": False,
+        "checks": checks_done,
+        "error": f"Domain still attached to tenant after {elapsed}s of verification checks"
+    }
+
+
+# =====================================================================
 # MASTER: 4-tier robust removal
 # =====================================================================
 
 def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=None, headless=True):
     """
-    Bulletproof 4-tier domain removal. Tries each method in order until one succeeds.
+    Bulletproof 4-tier domain removal with MANDATORY external verification.
     
-    TIER 1: MSAL ROPC → Graph API forceDelete (NO browser, pure HTTP)
-    TIER 2: PowerShell MSOnline Remove-MsolDomain (NO browser, credential-based)
-    TIER 3: Selenium OAuth → Graph API forceDelete (needs browser, handles MFA)
-    TIER 4: Selenium Admin Portal automation (needs browser, last resort)
+    Tries each removal method in order, then VERIFIES the domain is actually gone
+    using external Microsoft discovery endpoints (same as saas-dance.deno.dev).
     
-    Tiers 1 & 2 require NO browser and handle the vast majority of cases.
-    Tiers 3 & 4 are browser-based fallbacks for edge cases (e.g., MFA required).
+    Only reports success if external verification confirms the domain is free.
     
-    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list}
+    Returns: {"success": bool, "error": str|None, "method": str, "attempts": list, "verification": dict}
     """
     attempts = []
+    tier_succeeded = False
+    success_method = None
     
-    # ===== TIER 1: MSAL ROPC → Graph API (NO BROWSER) =====
-    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Starting 4-tier approach ===")
-    try:
-        result = _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password)
-        attempts.append({"tier": 1, "method": "msal_graph", "result": result})
-        
-        if result.get("success"):
-            logger.info(f"[{domain_name}] ✓ TIER 1 (MSAL → Graph API) SUCCEEDED")
-            return {"success": True, "error": None, "method": result.get("method", "tier1_msal_graph"), "attempts": attempts}
-        else:
-            logger.warning(f"[{domain_name}] TIER 1 failed: {result.get('error', 'unknown')} — trying Tier 2")
-    except Exception as e:
-        logger.warning(f"[{domain_name}] TIER 1 exception: {e} — trying Tier 2")
-        attempts.append({"tier": 1, "method": "msal_graph", "result": {"success": False, "error": str(e)}})
+    tiers = [
+        ("TIER 1", "MSAL → Graph API", "msal_graph",
+         lambda: _remove_domain_tier1_graph_api(domain_name, admin_email, admin_password)),
+        ("TIER 2", "PowerShell MSOnline", "powershell",
+         lambda: _remove_domain_tier2_powershell(domain_name, admin_email, admin_password)),
+        ("TIER 3", "Selenium → Graph API", "selenium_graph",
+         lambda: _remove_domain_tier3_selenium_graph(domain_name, admin_email, admin_password, totp_secret, headless=headless)),
+        ("TIER 4", "Selenium Admin Portal", "selenium_portal",
+         lambda: remove_domain_from_m365(domain_name, admin_email, admin_password, totp_secret, headless=headless)),
+    ]
     
-    # ===== TIER 2: PowerShell MSOnline (NO BROWSER) =====
-    try:
-        result = _remove_domain_tier2_powershell(domain_name, admin_email, admin_password)
-        attempts.append({"tier": 2, "method": "powershell", "result": result})
-        
-        if result.get("success"):
-            logger.info(f"[{domain_name}] ✓ TIER 2 (PowerShell MSOnline) SUCCEEDED")
-            return {"success": True, "error": None, "method": result.get("method", "tier2_powershell"), "attempts": attempts}
-        else:
-            logger.warning(f"[{domain_name}] TIER 2 failed: {result.get('error', 'unknown')} — trying Tier 3 (browser)")
-    except Exception as e:
-        logger.warning(f"[{domain_name}] TIER 2 exception: {e} — trying Tier 3 (browser)")
-        attempts.append({"tier": 2, "method": "powershell", "result": {"success": False, "error": str(e)}})
+    logger.info(f"[{domain_name}] === ROBUST REMOVAL: Starting 4-tier approach with verification ===")
     
-    # ===== TIER 3: Selenium OAuth → Graph API (BROWSER) =====
-    # Only try browser-based methods if we have a TOTP secret (MFA might be the issue)
-    # or if both non-browser methods had non-credential errors
-    try:
-        result = _remove_domain_tier3_selenium_graph(
-            domain_name, admin_email, admin_password, totp_secret, headless=headless
+    for tier_name, tier_desc, tier_method, tier_func in tiers:
+        try:
+            logger.info(f"[{domain_name}] Trying {tier_name} ({tier_desc})...")
+            result = tier_func()
+            attempts.append({"tier": tier_name, "method": tier_method, "result": result})
+            
+            if result.get("success"):
+                logger.info(f"[{domain_name}] {tier_name} ({tier_desc}) reported success — proceeding to VERIFICATION")
+                tier_succeeded = True
+                success_method = result.get("method", tier_method)
+                break
+            else:
+                logger.warning(f"[{domain_name}] {tier_name} failed: {result.get('error', 'unknown')}")
+        except Exception as e:
+            logger.warning(f"[{domain_name}] {tier_name} exception: {e}")
+            attempts.append({"tier": tier_name, "method": tier_method, "result": {"success": False, "error": str(e)}})
+    
+    # ===== MANDATORY VERIFICATION =====
+    # Even if a tier reported success, we VERIFY externally that the domain is actually gone.
+    # This prevents false positives where the API accepted the request but didn't complete it.
+    
+    if tier_succeeded:
+        logger.info(f"[{domain_name}] === VERIFICATION PHASE: Confirming domain is actually removed ===")
+        verification = _verify_domain_actually_removed(
+            domain_name, admin_email=admin_email, admin_password=admin_password, max_wait=90
         )
-        attempts.append({"tier": 3, "method": "selenium_graph", "result": result})
         
-        if result.get("success"):
-            logger.info(f"[{domain_name}] ✓ TIER 3 (Selenium → Graph API) SUCCEEDED")
-            return {"success": True, "error": None, "method": result.get("method", "tier3_selenium_graph"), "attempts": attempts}
+        if verification["verified_removed"]:
+            logger.info(f"[{domain_name}] ✓✓ VERIFIED REMOVED — {success_method} + external verification confirmed")
+            return {
+                "success": True,
+                "error": None,
+                "method": success_method,
+                "attempts": attempts,
+                "verification": verification,
+                "verified": True,
+            }
         else:
-            logger.warning(f"[{domain_name}] TIER 3 failed: {result.get('error', 'unknown')} — trying Tier 4")
-    except Exception as e:
-        logger.warning(f"[{domain_name}] TIER 3 exception: {e} — trying Tier 4")
-        attempts.append({"tier": 3, "method": "selenium_graph", "result": {"success": False, "error": str(e)}})
-    
-    # ===== TIER 4: Selenium Admin Portal (BROWSER LAST RESORT) =====
-    try:
-        result = remove_domain_from_m365(
-            domain_name, admin_email, admin_password, totp_secret, headless=headless
-        )
-        attempts.append({"tier": 4, "method": "selenium_portal", "result": result})
-        
-        if result.get("success"):
-            logger.info(f"[{domain_name}] ✓ TIER 4 (Selenium Admin Portal) SUCCEEDED")
-            return {"success": True, "error": None, "method": result.get("method", "tier4_selenium_portal"), "attempts": attempts}
-        else:
-            logger.error(f"[{domain_name}] ✗ TIER 4 also FAILED: {result.get('error', 'unknown')}")
-    except Exception as e:
-        logger.error(f"[{domain_name}] TIER 4 exception: {e}")
-        attempts.append({"tier": 4, "method": "selenium_portal", "result": {"success": False, "error": str(e)}})
+            # Tier said success but domain is STILL IN TENANT
+            logger.error(
+                f"[{domain_name}] ✗ VERIFICATION FAILED — {success_method} reported success but domain "
+                f"is STILL attached to a tenant. Checks: {verification.get('checks', {})}"
+            )
+            return {
+                "success": False,
+                "error": f"Removal method ({success_method}) reported success but external verification "
+                         f"shows domain is still in a tenant: {verification.get('error', 'still attached')}",
+                "method": success_method,
+                "attempts": attempts,
+                "verification": verification,
+                "verified": False,
+                "needs_retry": True,
+            }
     
     # ===== ALL 4 TIERS FAILED =====
     last_error = attempts[-1]["result"].get("error", "Unknown error") if attempts else "No attempts made"
     tier_summary = ", ".join(
-        f"T{a['tier']}:{a['result'].get('error', 'failed')[:50]}" for a in attempts
+        f"{a['tier']}:{a['result'].get('error', 'failed')[:50]}" for a in attempts
     )
     logger.error(f"[{domain_name}] ✗ ALL 4 TIERS FAILED: {tier_summary}")
     
@@ -1072,7 +1202,9 @@ def remove_domain_robust(domain_name, admin_email, admin_password, totp_secret=N
         "error": f"All 4 removal tiers failed. Last error: {last_error}",
         "method": "none",
         "attempts": attempts,
-        "needs_retry": True
+        "verification": None,
+        "verified": False,
+        "needs_retry": True,
     }
 
 

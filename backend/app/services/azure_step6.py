@@ -69,6 +69,10 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         display_name,
     )
 
+    # --- Phase 1: Use a DB session to set up batch and collect tenant IDs ---
+    tenant_ids: List[UUID] = []
+    total_tenants = 0
+
     async with async_session_factory() as db:
         batch = await db.get(SetupBatch, batch_id)
         if not batch:
@@ -103,105 +107,120 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             logger.warning("No eligible tenants found for batch %s", batch_id)
             return {"success": False, "error": "No eligible tenants"}
 
-        results: List[Dict[str, Any]] = []
-        successful = 0
-        failed = 0
+        # Extract plain IDs before closing the session
+        tenant_ids = [t.id for t in tenants]
+        total_tenants = len(tenant_ids)
+    # --- Parent session is now CLOSED before parallel work begins ---
 
-        # Parallel processing with semaphore (default 5 concurrent browsers)
-        settings = get_settings()
-        max_parallel = int(settings.max_parallel_browsers) if hasattr(settings, "max_parallel_browsers") else 5
-        max_parallel = max(1, min(max_parallel, 10))  # clamp 1-10
-        semaphore = asyncio.Semaphore(max_parallel)
+    results: List[Dict[str, Any]] = []
+    successful = 0
+    failed = 0
 
-        logger.info(
-            "Processing %s tenants with max_parallel=%s",
-            len(tenants),
-            max_parallel,
-        )
+    # Parallel processing with semaphore (default 5 concurrent browsers)
+    settings = get_settings()
+    max_parallel = int(settings.max_parallel_browsers) if hasattr(settings, "max_parallel_browsers") else 5
+    max_parallel = max(1, min(max_parallel, 10))  # clamp 1-10
+    semaphore = asyncio.Semaphore(max_parallel)
 
-        async def _process_one(idx: int, tenant):
-            async with semaphore:
-                logger.info("=" * 80)
-                logger.info(
-                    "BATCH PROGRESS: Tenant %s/%s - %s",
-                    idx,
-                    len(tenants),
-                    tenant.custom_domain,
+    logger.info(
+        "Processing %s tenants with max_parallel=%s",
+        total_tenants,
+        max_parallel,
+    )
+
+    async def _process_one(idx: int, tenant_id: UUID):
+        """Each parallel task gets its own DB session to avoid asyncpg conflicts."""
+        async with semaphore:
+            # Load tenant info in an independent session (read-only, closed quickly)
+            async with async_session_factory() as own_db:
+                tenant = await own_db.get(Tenant, tenant_id)
+                domain = tenant.custom_domain if tenant else "unknown"
+
+            logger.info("=" * 80)
+            logger.info(
+                "BATCH PROGRESS: Tenant %s/%s - %s",
+                idx,
+                total_tenants,
+                domain,
+            )
+            logger.info("=" * 80)
+
+            try:
+                tenant_result = await run_step6_for_tenant(tenant_id)
+                return {
+                    "tenant_id": str(tenant_id),
+                    "result": tenant_result,
+                }
+            except Exception as e:
+                logger.error(
+                    "[%s] Tenant exception: %s",
+                    domain,
+                    str(e),
                 )
-                logger.info("=" * 80)
+                return {
+                    "tenant_id": str(tenant_id),
+                    "result": {"success": False, "error": str(e)},
+                }
 
-                try:
-                    tenant_result = await run_step6_for_tenant(tenant.id)
-                    return {
-                        "tenant_id": str(tenant.id),
-                        "result": tenant_result,
-                    }
-                except Exception as e:
-                    logger.error(
-                        "[%s] Tenant exception: %s",
-                        tenant.custom_domain,
-                        str(e),
-                    )
-                    return {
-                        "tenant_id": str(tenant.id),
-                        "result": {"success": False, "error": str(e)},
-                    }
+    tasks = [
+        _process_one(i, tid)
+        for i, tid in enumerate(tenant_ids, 1)
+    ]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
-        tasks = [
-            _process_one(i, tenant)
-            for i, tenant in enumerate(tenants, 1)
-        ]
-        gathered = await asyncio.gather(*tasks, return_exceptions=True)
-
-        for item in gathered:
-            if isinstance(item, Exception):
-                failed += 1
-                results.append(
-                    {"tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
-                )
-            else:
-                results.append(item)
-                if item["result"].get("success"):
-                    successful += 1
-                else:
-                    failed += 1
-                    logger.error(
-                        "Tenant %s failed: %s",
-                        item["tenant_id"][:8],
-                        item["result"].get("error"),
-                    )
-        
-        logger.info("=" * 80)
-        logger.info("BATCH COMPLETE: %s/%s successful, %s failed", successful, len(tenants), failed)
-        logger.info("=" * 80)
-
-        # Update batch status when step 6 completes
-        # IMPORTANT: Step 6 should NOT mark the batch as complete.
-        # Instead, advance to Step 7 when all tenants succeed.
-        completed_steps = batch.completed_steps or []
-        if 6 not in completed_steps:
-            completed_steps.append(6)
-
-        batch.completed_steps = sorted(completed_steps)
-
-        if failed == 0:
-            # All tenants succeeded - advance to Step 7
-            batch.current_step = 7
-            await db.commit()
-            logger.info("Batch %s advanced to Step 7 (step 6 done, all tenants succeeded)", batch_id)
+    for item in gathered:
+        if isinstance(item, Exception):
+            failed += 1
+            results.append(
+                {"tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
+            )
         else:
-            # Some tenants failed - stay on Step 6 for retry
-            batch.current_step = 6
-            await db.commit()
-            logger.info("Batch %s step 6 finished with %s failures - batch NOT marked complete", batch_id, failed)
+            results.append(item)
+            if item["result"].get("success"):
+                successful += 1
+            else:
+                failed += 1
+                logger.error(
+                    "Tenant %s failed: %s",
+                    item["tenant_id"][:8],
+                    item["result"].get("error"),
+                )
+    
+    logger.info("=" * 80)
+    logger.info("BATCH COMPLETE: %s/%s successful, %s failed", successful, total_tenants, failed)
+    logger.info("=" * 80)
 
-        return {
-            "success": failed == 0,
-            "total": len(tenants),
-            "successful": successful,
-            "failed": failed,
-            "results": results,
-        }
+    # --- Phase 3: Update batch status in a fresh session ---
+    async with async_session_factory() as db:
+        batch = await db.get(SetupBatch, batch_id)
+        if batch:
+            # Update batch status when step 6 completes
+            # IMPORTANT: Step 6 should NOT mark the batch as complete.
+            # Instead, advance to Step 7 when all tenants succeed.
+            completed_steps = batch.completed_steps or []
+            if 6 not in completed_steps:
+                completed_steps.append(6)
+
+            batch.completed_steps = sorted(completed_steps)
+
+            if failed == 0:
+                # All tenants succeeded - advance to Step 7
+                batch.current_step = 7
+                await db.commit()
+                logger.info("Batch %s advanced to Step 7 (step 6 done, all tenants succeeded)", batch_id)
+            else:
+                # Some tenants failed - stay on Step 6 for retry
+                batch.current_step = 6
+                await db.commit()
+                logger.info("Batch %s step 6 finished with %s failures - batch NOT marked complete", batch_id, failed)
+
+    return {
+        "success": failed == 0,
+        "total": total_tenants,
+        "successful": successful,
+        "failed": failed,
+        "results": results,
+    }
 
 
 async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
