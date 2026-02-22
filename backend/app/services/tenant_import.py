@@ -264,6 +264,7 @@ class TenantImportService:
 
         imported = 0
         skipped = 0
+        reassigned = 0
         skipped_limit = 0
         missing_pwd = 0
 
@@ -293,8 +294,39 @@ class TenantImportService:
                 existing = existing.scalar_one_or_none()
 
             if existing:
-                skipped += 1
-                continue
+                if existing.batch_id == batch_id:
+                    skipped += 1
+                    continue
+                else:
+                    # Tenant exists in a different batch - reassign to current batch
+                    existing.batch_id = batch_id
+                    existing.name = data["name"]
+                    existing.onmicrosoft_domain = data["onmicrosoft_domain"]
+                    existing.microsoft_tenant_id = data["microsoft_tenant_id"]
+                    existing.address = data["address"]
+                    existing.contact_name = data["contact_name"]
+                    existing.contact_email = data["contact_email"]
+                    existing.contact_phone = data["contact_phone"]
+                    existing.admin_email = data["admin_email"]
+                    if data["admin_password"]:
+                        existing.admin_password = data["admin_password"]
+                        existing.initial_password = data["admin_password"]
+                    existing.provider = provider or existing.provider
+                    existing.status = TenantStatus.IMPORTED
+                    # Clear domain linkage since it's a new batch
+                    if existing.domain_id:
+                        # Also clear the old domain's reference to this tenant
+                        old_domain = await db.execute(
+                            select(Domain).where(Domain.id == existing.domain_id)
+                        )
+                        old_domain = old_domain.scalar_one_or_none()
+                        if old_domain:
+                            old_domain.tenant_id = None
+                    existing.domain_id = None
+                    existing.custom_domain = None
+                    reassigned += 1
+                    imported += 1  # Count reassigned as imported for the limit
+                    continue
 
             if not data["admin_password"]:
                 missing_pwd += 1
@@ -326,6 +358,7 @@ class TenantImportService:
             "total_credentials": len(credentials),
             "imported": imported,
             "skipped_duplicate": skipped,
+            "reassigned": reassigned,
             "skipped_not_needed": skipped_limit,
             "domains_needing_tenants": needed_count,
             "missing_password": missing_pwd,

@@ -120,6 +120,18 @@ export default function BatchWizard() {
     }
   };
 
+  // Lightweight refresh: updates status counts without showing the loading spinner
+  // or changing the active step. Used as onComplete callback for child step components
+  // so they don't unmount mid-action (which destroys local state like file inputs).
+  const refreshStatus = async () => {
+    try {
+      const data = await fetchStatus(batchId);
+      setStatus(data);
+    } catch (e) {
+      console.error("Failed to refresh status:", e);
+    }
+  };
+
   if (loading) {
     return (
       <div className="min-h-screen bg-gray-50 flex items-center justify-center">
@@ -205,24 +217,24 @@ export default function BatchWizard() {
 
       <div className="max-w-4xl mx-auto px-4 pb-12">
         <div className="bg-white rounded-lg shadow-lg p-8">
-          {activeStep === 1 && <Step1Domains batchId={batchId} status={status} onComplete={loadStatus} />}
+          {activeStep === 1 && <Step1Domains batchId={batchId} status={status} onComplete={refreshStatus} />}
           {activeStep === 2 && (
             <Step2Zones
               batchId={batchId}
               status={status}
-              onComplete={loadStatus}
+              onComplete={refreshStatus}
               nameserversConfirmed={nameserversConfirmed}
               onConfirmNameservers={async () => {
                 setNameserversConfirmed(true);
-                await loadStatus();
+                await refreshStatus();
                 setActiveStep(3);
               }}
             />
           )}
-          {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(4)} />}
-          {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={loadStatus} />}
-          {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={loadStatus} onNext={() => setActiveStep(6)} />}
-          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={loadStatus} onNext={() => { setSuppressStep7AutoComplete(false); setActiveStep(7); }} />}
+          {activeStep === 3 && <Step3Propagation batchId={batchId} status={status} onComplete={refreshStatus} onNext={() => setActiveStep(4)} />}
+          {activeStep === 4 && <Step4Tenants batchId={batchId} status={status} onComplete={refreshStatus} />}
+          {activeStep === 5 && <Step5M365 batchId={batchId} status={status} onComplete={refreshStatus} onNext={() => setActiveStep(6)} />}
+          {activeStep === 6 && <Step6Mailboxes batchId={batchId} status={status} onComplete={refreshStatus} onNext={() => { setSuppressStep7AutoComplete(false); setActiveStep(7); }} />}
           {activeStep === 7 && (
             <Step7SequencerPrep
               batchId={batchId}
