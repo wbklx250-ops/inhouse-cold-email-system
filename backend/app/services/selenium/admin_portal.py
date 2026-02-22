@@ -478,7 +478,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     IMPORTANT: Each step has individual error handling for better resilience.
     Browser is closed in finally block to ensure cleanup.
     """
-    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup
+    from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id
     
     logger.info(f"[{domain}] ========== STARTING DOMAIN SETUP ==========")
     driver = None
@@ -526,6 +526,20 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     if not driver:
         raise Exception("Failed to create browser driver")
     
+    # ===== VALIDATE ZONE ID =====
+    try:
+        zone_id, zone_was_corrected = resolve_zone_id(zone_id, domain)
+        if zone_was_corrected:
+            result["corrected_zone_id"] = zone_id
+            logger.info(f"[{domain}] Zone ID corrected to {zone_id}")
+        else:
+            logger.info(f"[{domain}] Zone ID validated OK: {zone_id}")
+    except ValueError as e:
+        logger.error(f"[{domain}] Zone ID validation failed: {e}")
+        result["error"] = f"Zone ID validation failed: {e}"
+        _cleanup_driver(driver)
+        return result
+
     # ===== STEP 1: LOGIN =====
     logger.info(f"[{domain}] Step 1: Login")
     update_status_file(domain, "login", "in_progress", "Logging into M365 Admin Portal")
@@ -1235,8 +1249,23 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         # Store in result for database update
         result["dkim_selector2_cname"] = dkim2_target
     
-    result["dns_configured"] = True
-    update_status_file(domain, "dns_setup", "complete", "DNS records added to Cloudflare")
+    # Only mark dns_configured if we actually found and added the critical records
+    if mx_match and spf_match:
+        result["dns_configured"] = True
+        update_status_file(domain, "dns_setup", "complete", "DNS records added to Cloudflare")
+    else:
+        missing = []
+        if not mx_match:
+            missing.append("MX")
+        if not spf_match:
+            missing.append("SPF")
+        if not sel1_match:
+            missing.append("DKIM selector1")
+        if not sel2_match:
+            missing.append("DKIM selector2")
+        logger.error(f"[{domain}] DNS setup INCOMPLETE - missing values: {', '.join(missing)}")
+        result["dns_configured"] = False
+        update_status_file(domain, "dns_setup", "partial", f"Missing DNS values: {', '.join(missing)}")
     
     # ===== STEP 8f: WAIT FOR DNS PROPAGATION =====
     update_status_file(domain, "finalizing", "in_progress", "Waiting for DNS propagation")

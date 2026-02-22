@@ -381,6 +381,12 @@ async def run_step5_for_batch(
                             domain.dns_records_created = True
                             domain.dkim_cnames_added = True
                             domain.dkim_enabled = True
+                            
+                            # Persist corrected zone_id if resolve_zone_id found a mismatch
+                            if selenium_result.get("corrected_zone_id"):
+                                old_zone_id = domain.cloudflare_zone_id
+                                domain.cloudflare_zone_id = selenium_result["corrected_zone_id"]
+                                logger.info(f"[{domain_name}] Updated cloudflare_zone_id: {old_zone_id} -> {selenium_result['corrected_zone_id']}")
 
                             logger.info(f"[{domain_name}] Fields set, calling db.commit()...")
                             await db.commit()
@@ -603,6 +609,12 @@ async def run_step5_for_tenant(db: AsyncSession, tenant_id: UUID, on_progress=No
             domain.dns_records_created = True
             domain.dkim_cnames_added = True
             domain.dkim_enabled = True
+            
+            # Persist corrected zone_id if resolve_zone_id found a mismatch
+            if selenium_result.get("corrected_zone_id"):
+                old_zone_id = domain.cloudflare_zone_id
+                domain.cloudflare_zone_id = selenium_result["corrected_zone_id"]
+                logger.info(f"[{result.domain_name}] Updated cloudflare_zone_id: {old_zone_id} -> {selenium_result['corrected_zone_id']}")
             
             logger.info(f"[{result.domain_name}] Calling db.commit()...")
             await db.commit()

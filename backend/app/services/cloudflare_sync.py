@@ -35,6 +35,81 @@ def _headers():
     return {"X-Auth-Email": email, "X-Auth-Key": key, "Content-Type": "application/json"}
 
 
+def resolve_zone_id(zone_id, domain):
+    """
+    Validate that zone_id matches the domain, and auto-correct if wrong.
+    
+    This is CRITICAL for domains that were pre-existing in Cloudflare before
+    being imported into the system. The database may have a stale/wrong zone_id.
+    
+    Flow:
+    1. GET /zones/{zone_id} - check if zone exists and name matches domain
+    2. If zone doesn't exist OR name doesn't match:
+       a. GET /zones?name={domain} - find the correct zone by domain name
+       b. Return the correct zone_id
+    3. If domain not found in Cloudflare at all, raise ValueError
+    
+    Args:
+        zone_id: The zone_id stored in the database (may be wrong)
+        domain: The domain name we expect this zone to be for
+        
+    Returns:
+        tuple: (correct_zone_id, was_corrected)
+        - correct_zone_id: The validated/corrected zone_id
+        - was_corrected: True if the zone_id was wrong and had to be looked up
+    """
+    logger.info(f"[{domain}] Validating zone_id={zone_id}")
+    headers = _headers()
+    domain_lower = domain.lower().strip()
+    
+    # Step 1: Check if the stored zone_id is valid and matches the domain
+    if zone_id:
+        try:
+            resp = httpx.get(f"{CF_API}/zones/{zone_id}", headers=headers, timeout=30)
+            if _cf_success(resp):
+                zone_name = resp.json().get("result", {}).get("name", "").lower().strip()
+                if zone_name == domain_lower:
+                    logger.info(f"[{domain}] Zone ID validated: {zone_id} -> {zone_name}")
+                    return zone_id, False
+                else:
+                    logger.warning(
+                        f"[{domain}] ZONE ID MISMATCH! zone_id={zone_id} belongs to '{zone_name}', "
+                        f"not '{domain_lower}'. Looking up correct zone..."
+                    )
+            else:
+                logger.warning(f"[{domain}] Zone {zone_id} not found in Cloudflare. Looking up by name...")
+        except Exception as e:
+            logger.warning(f"[{domain}] Error checking zone {zone_id}: {e}. Looking up by name...")
+    
+    # Step 2: Look up the correct zone by domain name
+    try:
+        resp = httpx.get(f"{CF_API}/zones?name={domain_lower}", headers=headers, timeout=30)
+        if _cf_success(resp):
+            zones = resp.json().get("result", [])
+            if zones:
+                correct_zone_id = zones[0]["id"]
+                correct_name = zones[0]["name"]
+                logger.info(
+                    f"[{domain}] RESOLVED correct zone: {correct_zone_id} (name={correct_name}). "
+                    f"Old zone_id was: {zone_id}"
+                )
+                return correct_zone_id, True
+            else:
+                error_msg = f"[{domain}] Domain not found in Cloudflare! Cannot resolve zone_id."
+                logger.error(error_msg)
+                raise ValueError(error_msg)
+        else:
+            error_msg = f"[{domain}] Cloudflare API error looking up domain: {_cf_error_message(resp)}"
+            logger.error(error_msg)
+            raise ValueError(error_msg)
+    except ValueError:
+        raise
+    except Exception as e:
+        error_msg = f"[{domain}] Failed to resolve zone_id: {e}"
+        logger.error(error_msg)
+        raise ValueError(error_msg)
+
+
 def _cf_success(resp) -> bool:
     """
     Check if a Cloudflare API response was truly successful.
