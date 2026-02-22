@@ -26,13 +26,33 @@ class CloudflareService:
 
     BASE_URL = "https://api.cloudflare.com/client/v4"
 
-    def __init__(self) -> None:
-        settings = get_settings()
-        if not settings.cloudflare_api_key or not settings.cloudflare_email or not settings.cloudflare_account_id:
-            raise CloudflareError("Cloudflare API key, email, and account ID are required")
-        self._api_key = settings.cloudflare_api_key
-        self._email = settings.cloudflare_email
-        self._account_id = settings.cloudflare_account_id
+    def __init__(
+        self,
+        api_key: str | None = None,
+        email: str | None = None,
+        account_id: str | None = None,
+        label: str = "primary",
+    ) -> None:
+        """Initialize with explicit credentials or fall back to settings.
+        
+        Args:
+            api_key: Cloudflare API key (optional, falls back to settings)
+            email: Cloudflare email (optional, falls back to settings)
+            account_id: Cloudflare account ID (optional, falls back to settings)
+            label: Human-readable label for logging (e.g., "primary", "secondary")
+        """
+        if api_key and email and account_id:
+            self._api_key = api_key
+            self._email = email
+            self._account_id = account_id
+        else:
+            settings = get_settings()
+            if not settings.cloudflare_api_key or not settings.cloudflare_email or not settings.cloudflare_account_id:
+                raise CloudflareError("Cloudflare API key, email, and account ID are required")
+            self._api_key = settings.cloudflare_api_key
+            self._email = settings.cloudflare_email
+            self._account_id = settings.cloudflare_account_id
+        self._label = label
         self._headers = {
             "X-Auth-Email": self._email,
             "X-Auth-Key": self._api_key,
@@ -1479,10 +1499,294 @@ class CloudflareService:
         return results
 
 
+class MultiCloudflareService:
+    """
+    Wrapper that searches multiple Cloudflare accounts for zones.
+    
+    For zone lookup/creation: checks ALL accounts, prefers active zones.
+    For DNS operations on a known zone_id: tries each account until one works.
+    
+    This is a drop-in replacement for CloudflareService - it delegates all methods
+    to the correct account's service based on which account owns the zone.
+    """
+
+    def __init__(self) -> None:
+        settings = get_settings()
+        self._services: list[CloudflareService] = []
+        self._labels: list[str] = []
+
+        # Primary account
+        if settings.cloudflare_api_key and settings.cloudflare_email and settings.cloudflare_account_id:
+            self._services.append(CloudflareService(
+                api_key=settings.cloudflare_api_key,
+                email=settings.cloudflare_email,
+                account_id=settings.cloudflare_account_id,
+                label="primary",
+            ))
+            self._labels.append(f"primary ({settings.cloudflare_email})")
+
+        # Secondary account
+        if settings.cloudflare_api_key_2 and settings.cloudflare_email_2 and settings.cloudflare_account_id_2:
+            self._services.append(CloudflareService(
+                api_key=settings.cloudflare_api_key_2,
+                email=settings.cloudflare_email_2,
+                account_id=settings.cloudflare_account_id_2,
+                label="secondary",
+            ))
+            self._labels.append(f"secondary ({settings.cloudflare_email_2})")
+
+        if not self._services:
+            raise CloudflareError("No Cloudflare accounts configured")
+
+        logger.info("MultiCloudflareService initialized with %d account(s): %s",
+                    len(self._services), ", ".join(self._labels))
+
+        # Cache: zone_id -> service index (so we don't re-lookup every time)
+        self._zone_owner_cache: dict[str, int] = {}
+
+    @property
+    def primary(self) -> CloudflareService:
+        """Get the primary account service."""
+        return self._services[0]
+
+    async def _find_service_for_zone(self, zone_id: str) -> CloudflareService:
+        """
+        Find which account owns a zone_id by trying each account.
+        Results are cached for performance.
+        """
+        # Check cache first
+        if zone_id in self._zone_owner_cache:
+            idx = self._zone_owner_cache[zone_id]
+            return self._services[idx]
+
+        # Try each account
+        for i, svc in enumerate(self._services):
+            try:
+                zone_info = await svc.get_zone_by_id(zone_id)
+                if zone_info:
+                    self._zone_owner_cache[zone_id] = i
+                    logger.info("Zone %s owned by account %s", zone_id, self._labels[i])
+                    return svc
+            except Exception:
+                continue
+
+        # Fallback to primary
+        logger.warning("Zone %s not found in any account, using primary", zone_id)
+        return self._services[0]
+
+    async def get_zone_by_name(self, domain: str) -> Optional[dict]:
+        """Search ALL accounts for a zone by domain name. Prefer active zones."""
+        best_result = None
+        best_service_idx = 0
+
+        for i, svc in enumerate(self._services):
+            try:
+                result = await svc.get_zone_by_name(domain)
+                if result:
+                    zone_id = result["zone_id"]
+                    self._zone_owner_cache[zone_id] = i
+                    logger.info("Found zone for %s in account %s (status=%s, zone_id=%s)",
+                               domain, self._labels[i], result["status"], zone_id)
+
+                    # Prefer active zones over pending
+                    if result["status"] == "active":
+                        return {**result, "account_label": self._labels[i]}
+                    elif best_result is None:
+                        best_result = {**result, "account_label": self._labels[i]}
+                        best_service_idx = i
+            except Exception as e:
+                logger.warning("Error checking account %s for zone %s: %s", self._labels[i], domain, e)
+                continue
+
+        return best_result
+
+    async def get_zone_by_id(self, zone_id: str) -> Optional[dict]:
+        """Get zone by ID, trying each account."""
+        for i, svc in enumerate(self._services):
+            try:
+                result = await svc.get_zone_by_id(zone_id)
+                if result:
+                    self._zone_owner_cache[zone_id] = i
+                    return result
+            except Exception:
+                continue
+        return None
+
+    async def get_or_create_zone(self, domain: str) -> dict:
+        """
+        Search ALL accounts for existing zone, create in primary if not found.
+        
+        This is the key method - it checks every account before creating a new zone.
+        """
+        # Search all accounts for existing zone
+        existing = await self.get_zone_by_name(domain)
+        if existing:
+            logger.info("Using existing zone for %s from account %s (zone_id=%s, status=%s)",
+                       domain, existing.get("account_label", "?"), existing["zone_id"], existing["status"])
+            return {
+                "zone_id": existing["zone_id"],
+                "nameservers": existing["nameservers"],
+                "status": existing["status"],
+                "already_existed": True,
+                "account_label": existing.get("account_label"),
+            }
+
+        # Not found in any account - create in primary
+        logger.info("Zone not found in any account for %s, creating in primary", domain)
+        zone_data = await self.primary.create_zone(domain)
+        zone_id = zone_data["zone_id"]
+        self._zone_owner_cache[zone_id] = 0
+
+        return {
+            "zone_id": zone_id,
+            "nameservers": zone_data["nameservers"],
+            "status": zone_data["status"],
+            "already_existed": False,
+            "account_label": self._labels[0],
+        }
+
+    # === Delegate all DNS operations to the correct account ===
+
+    async def ensure_email_dns_records(self, zone_id: str, domain: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_email_dns_records(zone_id, domain)
+
+    async def create_redirect_rule(self, zone_id: str, domain: str, redirect_url: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_redirect_rule(zone_id, domain, redirect_url)
+
+    async def check_ns_propagation(self, domain: str, expected_ns: list[str]) -> bool:
+        # NS propagation is DNS-level, doesn't need a specific account
+        return await self.primary.check_ns_propagation(domain, expected_ns)
+
+    async def create_txt_record(self, zone_id: str, name: str, value: str) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_txt_record(zone_id, name, value)
+
+    async def create_mx_record(self, zone_id: str, name: str, target: str, priority: int = 0) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_mx_record(zone_id, name, target, priority)
+
+    async def create_cname_record(self, zone_id: str, name: str, target: str, proxied: bool = False) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_cname_record(zone_id, name, target, proxied)
+
+    async def ensure_txt_record(self, zone_id: str, name: str, content: str, domain: Optional[str] = None) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_txt_record(zone_id, name, content, domain)
+
+    async def ensure_mx_record(self, zone_id: str, name: str, target: str, priority: int = 0, domain: Optional[str] = None) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_mx_record(zone_id, name, target, priority, domain)
+
+    async def ensure_cname_record(self, zone_id: str, name: str, target: str, proxied: bool = False, domain: Optional[str] = None) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_cname_record(zone_id, name, target, proxied, domain)
+
+    async def ensure_dkim_cnames(self, zone_id: str, domain: str, selector1_value: str, selector2_value: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_dkim_cnames(zone_id, domain, selector1_value, selector2_value)
+
+    async def ensure_verification_txt(self, zone_id: str, domain: str, txt_value: str) -> bool:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_verification_txt(zone_id, domain, txt_value)
+
+    async def create_zone(self, domain_name: str) -> dict:
+        return await self.primary.create_zone(domain_name)
+
+    async def create_phase1_dns(self, zone_id: str, domain: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_phase1_dns(zone_id, domain)
+
+    async def create_verification_txt(self, zone_id: str, domain: str, ms_value: str) -> bool:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_verification_txt(zone_id, domain, ms_value)
+
+    async def create_dkim_cnames(self, zone_id: str, domain: str, selector1_value: str, selector2_value: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_dkim_cnames(zone_id, domain, selector1_value, selector2_value)
+
+    async def replace_spf_record(self, zone_id: str, domain: str, new_spf_value: str) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.replace_spf_record(zone_id, domain, new_spf_value)
+
+    async def replace_dkim_cnames(self, zone_id: str, domain: str, selector1_value: str, selector2_value: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.replace_dkim_cnames(zone_id, domain, selector1_value, selector2_value)
+
+    async def delete_conflicting_spf_records(self, zone_id: str, domain: str, keep_value: Optional[str] = None) -> int:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.delete_conflicting_spf_records(zone_id, domain, keep_value)
+
+    async def delete_conflicting_dkim_records(self, zone_id: str, domain: str) -> int:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.delete_conflicting_dkim_records(zone_id, domain)
+
+    async def list_dns_records(self, zone_id: str) -> list:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.list_dns_records(zone_id)
+
+    async def get_dns_records_by_type(self, zone_id: str, record_type: str) -> list:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.get_dns_records_by_type(zone_id, record_type)
+
+    async def delete_dns_record(self, zone_id: str, record_id: str) -> bool:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.delete_dns_record(zone_id, record_id)
+
+    async def get_zone_status(self, zone_id: str) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.get_zone_status(zone_id)
+
+    async def get_zone_nameservers(self, zone_id: str) -> list[str]:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.get_zone_nameservers(zone_id)
+
+    async def bulk_create_zones(self, domains: list[str]) -> list[dict]:
+        return await self.primary.bulk_create_zones(domains)
+
+    async def bulk_create_redirect_rules(self, domains: list[dict]) -> list[dict]:
+        return await self.primary.bulk_create_redirect_rules(domains)
+
+    async def create_all_dns_records(self, zone_id: str, domain: str) -> dict:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_all_dns_records(zone_id, domain)
+
+    async def create_spf_record(self, zone_id: str) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_spf_record(zone_id)
+
+    async def create_dmarc_record(self, zone_id: str, domain: str) -> str:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.create_dmarc_record(zone_id, domain)
+
+    async def record_exists(self, zone_id: str, record_type: str, name: str, domain: Optional[str] = None) -> Optional[dict]:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.record_exists(zone_id, record_type, name, domain)
+
+    async def update_record(self, zone_id: str, record_id: str, updates: dict) -> None:
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.update_record(zone_id, record_id, updates)
+
+    # Alias for compatibility
+    async def get_dns_records(self, zone_id: str, record_type: Optional[str] = None) -> list:
+        """Compatibility alias used by wizard_completion.py."""
+        svc = await self._find_service_for_zone(zone_id)
+        if record_type:
+            return await svc.get_dns_records_by_type(zone_id, record_type)
+        return await svc.list_dns_records(zone_id)
+
+    # Alias for compatibility
+    async def ensure_autodiscover_cname(self, zone_id: str, domain: str, target: str) -> str:
+        """Compatibility alias used by wizard_completion.py."""
+        svc = await self._find_service_for_zone(zone_id)
+        return await svc.ensure_cname_record(zone_id, "autodiscover", target, proxied=False, domain=domain)
+
+
 # Singleton instance for use throughout the application
-# Note: This will raise CloudflareError if environment variables are not set
+# Uses MultiCloudflareService to support multiple Cloudflare accounts
 try:
-    cloudflare_service = CloudflareService()
+    cloudflare_service = MultiCloudflareService()
 except CloudflareError:
     # Allow module to load even without credentials (for testing/development)
     cloudflare_service = None  # type: ignore

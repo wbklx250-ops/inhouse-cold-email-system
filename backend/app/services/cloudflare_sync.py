@@ -5,49 +5,93 @@ import logging
 logger = logging.getLogger(__name__)
 CF_API = "https://api.cloudflare.com/client/v4"
 
-def _get_creds():
-    """Get Cloudflare credentials."""
-    email = os.environ.get("CLOUDFLARE_EMAIL")
-    key = os.environ.get("CLOUDFLARE_API_KEY")
+# Cache: zone_id -> account index (0=primary, 1=secondary)
+_zone_account_cache: dict[str, int] = {}
+
+
+def _get_all_creds() -> list[tuple[str, str]]:
+    """Get credentials for ALL configured Cloudflare accounts.
     
-    if not email or not key:
+    Returns:
+        List of (email, api_key) tuples. Primary first, secondary second.
+    """
+    accounts = []
+    env_vars = {}
+    
+    # Read from environment first
+    for key in ["CLOUDFLARE_EMAIL", "CLOUDFLARE_API_KEY", 
+                "CLOUDFLARE_EMAIL_2", "CLOUDFLARE_API_KEY_2"]:
+        env_vars[key] = os.environ.get(key)
+    
+    # Fall back to .env files if any creds are missing
+    any_missing = any(not env_vars.get(k) for k in env_vars)
+    if any_missing:
         for env_path in [".env", "../.env", "backend/.env"]:
             try:
                 with open(env_path) as f:
                     for line in f:
                         line = line.strip()
-                        if line.startswith("CLOUDFLARE_EMAIL="):
-                            email = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        elif line.startswith("CLOUDFLARE_API_KEY="):
-                            key = line.split("=", 1)[1].strip().strip('"').strip("'")
-                if email and key:
-                    break
+                        if "=" in line and not line.startswith("#"):
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip('"').strip("'")
+                            if k in env_vars and not env_vars[k]:
+                                env_vars[k] = v
             except:
                 continue
     
-    if not email or not key:
+    # Primary account
+    if env_vars.get("CLOUDFLARE_EMAIL") and env_vars.get("CLOUDFLARE_API_KEY"):
+        accounts.append((env_vars["CLOUDFLARE_EMAIL"], env_vars["CLOUDFLARE_API_KEY"]))
+    
+    # Secondary account
+    if env_vars.get("CLOUDFLARE_EMAIL_2") and env_vars.get("CLOUDFLARE_API_KEY_2"):
+        accounts.append((env_vars["CLOUDFLARE_EMAIL_2"], env_vars["CLOUDFLARE_API_KEY_2"]))
+    
+    if not accounts:
         raise ValueError("Cloudflare credentials missing!")
     
-    return email, key
+    return accounts
 
-def _headers():
-    email, key = _get_creds()
+
+def _get_creds(account_index: int = 0):
+    """Get Cloudflare credentials for a specific account.
+    
+    Args:
+        account_index: 0 for primary, 1 for secondary
+    """
+    accounts = _get_all_creds()
+    if account_index >= len(accounts):
+        return accounts[0]  # Fallback to primary
+    return accounts[account_index]
+
+
+def _headers(account_index: int = 0):
+    email, key = _get_creds(account_index)
     return {"X-Auth-Email": email, "X-Auth-Key": key, "Content-Type": "application/json"}
+
+
+def _headers_for_zone(zone_id: str):
+    """Get headers for the account that owns this zone_id."""
+    account_idx = _zone_account_cache.get(zone_id, 0)
+    return _headers(account_idx)
 
 
 def resolve_zone_id(zone_id, domain):
     """
     Validate that zone_id matches the domain, and auto-correct if wrong.
+    Searches ALL configured Cloudflare accounts.
     
     This is CRITICAL for domains that were pre-existing in Cloudflare before
     being imported into the system. The database may have a stale/wrong zone_id.
     
     Flow:
-    1. GET /zones/{zone_id} - check if zone exists and name matches domain
+    1. For each account, GET /zones/{zone_id} - check if zone exists and name matches
     2. If zone doesn't exist OR name doesn't match:
-       a. GET /zones?name={domain} - find the correct zone by domain name
-       b. Return the correct zone_id
-    3. If domain not found in Cloudflare at all, raise ValueError
+       a. For each account, GET /zones?name={domain} - find the correct zone
+       b. Prefer active zones over pending
+       c. Return the correct zone_id
+    3. If domain not found in ANY Cloudflare account, raise ValueError
     
     Args:
         zone_id: The zone_id stored in the database (may be wrong)
@@ -59,55 +103,65 @@ def resolve_zone_id(zone_id, domain):
         - was_corrected: True if the zone_id was wrong and had to be looked up
     """
     logger.info(f"[{domain}] Validating zone_id={zone_id}")
-    headers = _headers()
+    all_creds = _get_all_creds()
     domain_lower = domain.lower().strip()
     
-    # Step 1: Check if the stored zone_id is valid and matches the domain
+    # Step 1: Check if the stored zone_id is valid and matches the domain (check ALL accounts)
     if zone_id:
-        try:
-            resp = httpx.get(f"{CF_API}/zones/{zone_id}", headers=headers, timeout=30)
-            if _cf_success(resp):
-                zone_name = resp.json().get("result", {}).get("name", "").lower().strip()
-                if zone_name == domain_lower:
-                    logger.info(f"[{domain}] Zone ID validated: {zone_id} -> {zone_name}")
-                    return zone_id, False
-                else:
-                    logger.warning(
-                        f"[{domain}] ZONE ID MISMATCH! zone_id={zone_id} belongs to '{zone_name}', "
-                        f"not '{domain_lower}'. Looking up correct zone..."
-                    )
-            else:
-                logger.warning(f"[{domain}] Zone {zone_id} not found in Cloudflare. Looking up by name...")
-        except Exception as e:
-            logger.warning(f"[{domain}] Error checking zone {zone_id}: {e}. Looking up by name...")
+        for acct_idx in range(len(all_creds)):
+            try:
+                headers = _headers(acct_idx)
+                resp = httpx.get(f"{CF_API}/zones/{zone_id}", headers=headers, timeout=30)
+                if _cf_success(resp):
+                    zone_name = resp.json().get("result", {}).get("name", "").lower().strip()
+                    if zone_name == domain_lower:
+                        logger.info(f"[{domain}] Zone ID validated: {zone_id} -> {zone_name} (account #{acct_idx})")
+                        _zone_account_cache[zone_id] = acct_idx
+                        return zone_id, False
+                    else:
+                        logger.warning(
+                            f"[{domain}] zone_id={zone_id} belongs to '{zone_name}' in account #{acct_idx}, "
+                            f"not '{domain_lower}'. Continuing search..."
+                        )
+            except Exception as e:
+                logger.warning(f"[{domain}] Error checking zone {zone_id} in account #{acct_idx}: {e}")
     
-    # Step 2: Look up the correct zone by domain name
-    try:
-        resp = httpx.get(f"{CF_API}/zones?name={domain_lower}", headers=headers, timeout=30)
-        if _cf_success(resp):
-            zones = resp.json().get("result", [])
-            if zones:
-                correct_zone_id = zones[0]["id"]
-                correct_name = zones[0]["name"]
-                logger.info(
-                    f"[{domain}] RESOLVED correct zone: {correct_zone_id} (name={correct_name}). "
-                    f"Old zone_id was: {zone_id}"
-                )
-                return correct_zone_id, True
-            else:
-                error_msg = f"[{domain}] Domain not found in Cloudflare! Cannot resolve zone_id."
-                logger.error(error_msg)
-                raise ValueError(error_msg)
-        else:
-            error_msg = f"[{domain}] Cloudflare API error looking up domain: {_cf_error_message(resp)}"
-            logger.error(error_msg)
-            raise ValueError(error_msg)
-    except ValueError:
-        raise
-    except Exception as e:
-        error_msg = f"[{domain}] Failed to resolve zone_id: {e}"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+    # Step 2: Look up the correct zone by domain name across ALL accounts
+    best_zone = None
+    best_acct_idx = 0
+    for acct_idx in range(len(all_creds)):
+        try:
+            headers = _headers(acct_idx)
+            resp = httpx.get(f"{CF_API}/zones?name={domain_lower}", headers=headers, timeout=30)
+            if _cf_success(resp):
+                zones = resp.json().get("result", [])
+                for z in zones:
+                    if z.get("name", "").lower().strip() == domain_lower:
+                        status = z.get("status", "")
+                        logger.info(f"[{domain}] Found zone {z['id']} in account #{acct_idx} (status={status})")
+                        # Prefer active zones
+                        if status == "active" or best_zone is None:
+                            best_zone = z
+                            best_acct_idx = acct_idx
+                        if status == "active":
+                            break  # Active zone found, no need to check more
+        except Exception as e:
+            logger.warning(f"[{domain}] Error searching account #{acct_idx}: {e}")
+    
+    if best_zone:
+        correct_zone_id = best_zone["id"]
+        correct_name = best_zone["name"]
+        correct_status = best_zone.get("status", "unknown")
+        _zone_account_cache[correct_zone_id] = best_acct_idx
+        logger.info(
+            f"[{domain}] RESOLVED correct zone: {correct_zone_id} (name={correct_name}, "
+            f"status={correct_status}, account #{best_acct_idx}). Old zone_id was: {zone_id}"
+        )
+        return correct_zone_id, True
+    
+    error_msg = f"[{domain}] Domain not found in ANY Cloudflare account! Cannot resolve zone_id."
+    logger.error(error_msg)
+    raise ValueError(error_msg)
 
 
 def _cf_success(resp) -> bool:
@@ -160,7 +214,7 @@ def delete_records_by_type(zone_id, record_type, name_contains=None):
     """Delete ALL records of a specific type, optionally filtering by name."""
     logger.info(f"Deleting {record_type} records{' containing ' + name_contains if name_contains else ''}...")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type={record_type}", headers=headers, timeout=30)
         if _cf_success(resp):
             records = resp.json().get("result", [])
@@ -195,7 +249,7 @@ def cleanup_before_verification(zone_id):
     """
     logger.info(f"=== CLEANUP BEFORE VERIFICATION ===")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=TXT", headers=headers, timeout=30)
         if _cf_success(resp):
             for r in resp.json().get("result", []):
@@ -246,7 +300,7 @@ def cleanup_before_dns_setup(zone_id):
     """
     logger.info(f"=== CLEANUP BEFORE DNS SETUP ===")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         
         # Get ALL DNS records for the zone
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records", headers=headers, timeout=30)
@@ -336,7 +390,7 @@ def add_txt(zone_id, value):
     """
     logger.info(f"Adding TXT: {value}")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         
         # Delete ALL existing MS= verification records (may be multiple from retries)
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=TXT", headers=headers, timeout=30)
@@ -386,7 +440,7 @@ def add_mx(zone_id, target, priority=0):
     """
     logger.info(f"Adding MX: {target} (priority {priority})")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         
         # DELETE ALL existing MX records
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=MX", headers=headers, timeout=30)
@@ -422,7 +476,7 @@ def add_spf(zone_id, value):
     """
     logger.info(f"Adding SPF: {value}")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         
         # DELETE ALL existing SPF records (TXT records containing v=spf1)
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=TXT", headers=headers, timeout=30)
@@ -459,7 +513,7 @@ def add_cname(zone_id, name, target):
     """
     logger.info(f"Adding CNAME: {name} -> {target}")
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         
         # Get zone details to get the domain name
         zone_resp = httpx.get(f"{CF_API}/zones/{zone_id}", headers=headers, timeout=30)
@@ -510,7 +564,7 @@ def add_dkim(zone_id, selector1_target, selector2_target):
     
     # Delete existing DKIM records
     try:
-        headers = _headers()
+        headers = _headers_for_zone(zone_id)
         resp = httpx.get(f"{CF_API}/zones/{zone_id}/dns_records?type=CNAME", headers=headers, timeout=30)
         if _cf_success(resp):
             for r in resp.json().get("result", []):

@@ -15,6 +15,11 @@ class Settings(BaseSettings):
     cloudflare_email: str | None = None
     cloudflare_account_id: str | None = None
 
+    # Secondary Cloudflare account (for multi-account zone lookup)
+    cloudflare_api_key_2: str | None = None
+    cloudflare_email_2: str | None = None
+    cloudflare_account_id_2: str | None = None
+
     azure_client_id: str | None = None
     azure_client_secret: str | None = None
     azure_tenant_id: str | None = None
