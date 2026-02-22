@@ -7021,7 +7021,11 @@ async def csv_sequencer_upload(
             # Normalize headers (lowercase, strip whitespace)
             if reader.fieldnames:
                 reader.fieldnames = [f.strip().lower().replace(" ", "_") for f in reader.fieldnames]
-            
+
+                # Remap common alternative column names
+                col_aliases = {"emailaddress": "email", "email_address": "email"}
+                reader.fieldnames = [col_aliases.get(f, f) for f in reader.fieldnames]
+
             # Validate required columns
             if not reader.fieldnames or "email" not in reader.fieldnames:
                 parse_errors.append(f"{file.filename}: Missing required 'email' column. Found columns: {reader.fieldnames}")
