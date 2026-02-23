@@ -858,6 +858,33 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                     "Skipped Admin UI - PowerShell not successful",
                 )
             else:
+                # PROACTIVE BROWSER HEALTH CHECK before Phase 2
+                # Phase 1 PowerShell can take 5-15+ minutes, during which the
+                # Chrome browser may become unresponsive or crash from memory
+                # pressure.  Detect and replace it BEFORE Phase 2 starts so we
+                # don't waste time on a doomed attempt.
+                if not is_browser_alive(driver):
+                    logger.warning(
+                        "[%s] Browser died after Phase 1 - creating fresh Chrome instance for Phase 2",
+                        tenant.custom_domain,
+                    )
+                    try:
+                        cleanup_driver(driver)
+                    except Exception:
+                        pass
+                    driver = create_driver(headless=settings.step6_headless)
+                    if driver is None:
+                        raise Exception("Failed to create fresh Chrome browser for Phase 2")
+                    _login_with_mfa(
+                        driver=driver,
+                        admin_email=tenant.admin_email,
+                        admin_password=tenant.admin_password,
+                        totp_secret=tenant.totp_secret,
+                        domain=tenant.custom_domain,
+                    )
+                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
+                    logger.info("[%s] Fresh Chrome instance created for Phase 2", tenant.custom_domain)
+
                 try:
                     if not needs_admin_ui:
                         logger.info(
