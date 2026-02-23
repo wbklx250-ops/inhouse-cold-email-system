@@ -25,7 +25,7 @@ from uuid import UUID
 from sqlalchemy import select, update, func
 
 from app.core.config import get_settings
-from app.db.session import SessionLocal, async_session_factory
+from app.db.session import SessionLocal, async_session_factory, BackgroundSessionLocal
 from app.models.batch import SetupBatch, BatchStatus
 from app.models.mailbox import Mailbox, MailboxStatus
 from app.models.tenant import Tenant, TenantStatus
@@ -59,6 +59,55 @@ def get_progress(tenant_id: str) -> Dict[str, Any]:
 def get_all_progress() -> Dict[str, Dict[str, Any]]:
     """Get progress for all tenants."""
     return dict(_progress_store)
+
+
+def is_browser_alive(driver) -> bool:
+    """Check if the Selenium browser session is still responsive."""
+    if driver is None:
+        return False
+    try:
+        # Try to get the current URL - this will fail if browser is dead
+        _ = driver.current_url
+        return True
+    except Exception:
+        return False
+
+
+async def save_to_db_with_retry(operation, max_retries=3, description="DB operation"):
+    """
+    Execute a database write operation with retry on connection errors.
+    Creates a completely fresh session (via NullPool) for each attempt,
+    guaranteeing no stale connections from Neon idle timeout.
+    """
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with BackgroundSessionLocal() as db:
+                await operation(db)
+                await db.commit()
+                return True
+        except Exception as e:
+            error_str = str(e)
+            is_conn_error = any(phrase in error_str for phrase in [
+                "ConnectionDoesNotExistError",
+                "connection was closed",
+                "connection refused",
+                "SSL connection has been closed",
+                "server closed the connection",
+                "ConnectionResetError",
+                "InterfaceError",
+                "connection does not exist",
+            ])
+
+            if is_conn_error and attempt < max_retries:
+                logger.warning(
+                    "[%s] DB connection error on attempt %s/%s: %s - retrying in %ss",
+                    description, attempt, max_retries, error_str[:100], attempt * 2
+                )
+                await asyncio.sleep(attempt * 2)  # Exponential backoff
+            else:
+                logger.error("[%s] DB operation failed after %s attempts: %s", description, attempt, e)
+                raise
+    return False
 
 
 async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, Any]:
@@ -597,6 +646,26 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                     raise last_error
 
             if needs_powershell:
+                # CRITICAL: Verify browser is alive before PowerShell device code auth
+                if not is_browser_alive(driver):
+                    logger.warning("[%s] Browser died - creating fresh Chrome instance before PowerShell", tenant.custom_domain)
+                    try:
+                        cleanup_driver(driver)
+                    except Exception:
+                        pass
+                    driver = create_driver(headless=settings.step6_headless)
+                    if driver is None:
+                        raise Exception("Failed to create fresh Chrome browser for PowerShell auth")
+                    _login_with_mfa(
+                        driver=driver,
+                        admin_email=tenant.admin_email,
+                        admin_password=tenant.admin_password,
+                        totp_secret=tenant.totp_secret,
+                        domain=tenant.custom_domain,
+                    )
+                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
+                    logger.info("[%s] Fresh Chrome instance created successfully for PowerShell", tenant.custom_domain)
+
                 ps_service = PowerShellExchangeService(
                     driver=driver,
                     admin_email=tenant.admin_email,
@@ -678,7 +747,8 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             tenant.step6_delegations_done,
                             tenant.step6_upns_fixed,
                         )
-                        async with SessionLocal() as fresh_db:
+
+                        async def _save_powershell_progress(fresh_db):
                             tenant_to_update = await fresh_db.get(Tenant, tenant.id)
                             if tenant_to_update:
                                 tenant_to_update.step6_mailboxes_created = created_count
@@ -710,7 +780,10 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                     .values(upn_fixed=True)
                                 )
 
-                            await fresh_db.commit()
+                        await save_to_db_with_retry(
+                            _save_powershell_progress,
+                            description=f"{tenant.custom_domain} powershell progress",
+                        )
                         logger.info(
                             "[%s] PowerShell progress SAVED with fresh connection: mailboxes=%s, delegations=%s, upns=%s",
                             tenant.custom_domain,
@@ -721,7 +794,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
 
                         # FIXED: Check actual DB state instead of ps_results["created"] count
                         # This ensures Phase 2 runs even if mailboxes were created in a previous run
-                        async with SessionLocal() as check_db:
+                        async with BackgroundSessionLocal() as check_db:
                             ps_created_count = await check_db.scalar(
                                 select(func.count(Mailbox.id)).where(
                                     Mailbox.tenant_id == tenant.id,
@@ -886,7 +959,8 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             "[%s] Saving Admin UI progress to database...",
                             tenant.custom_domain,
                         )
-                        async with SessionLocal() as fresh_db:
+
+                        async def _save_admin_ui_progress(fresh_db):
                             tenant_to_update = await fresh_db.get(Tenant, tenant.id)
                             if tenant_to_update:
                                 tenant_to_update.step6_passwords_set = password_set_count
@@ -923,7 +997,10 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                     tenant.custom_domain,
                                 )
 
-                            await fresh_db.commit()
+                        await save_to_db_with_retry(
+                            _save_admin_ui_progress,
+                            description=f"{tenant.custom_domain} admin UI progress",
+                        )
                         logger.info(
                             "[%s] Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
                             tenant.custom_domain,
@@ -945,8 +1022,9 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             # Completion check (use DB mailbox state to avoid stale counts)
             step6_actually_complete = False
             missing_items = []
-            
-            async with SessionLocal() as fresh_db:
+
+            async def _save_completion_check(fresh_db):
+                nonlocal step6_actually_complete, missing_items
                 total_mailboxes = await fresh_db.scalar(
                     select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
                 ) or 0
@@ -1020,14 +1098,17 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             tenant_to_update.step6_error = error_msg
                             logger.warning("[%s] NOT marking complete - missing: %s", tenant.custom_domain, ", ".join(missing_items))
 
-                    await fresh_db.commit()
-
                 if tenant_to_update and tenant_to_update.step6_complete:
                     logger.info(
                         "[%s] Step 6 COMPLETE for %s",
                         str(tenant.id)[:8],
                         tenant.custom_domain,
                     )
+
+            await save_to_db_with_retry(
+                _save_completion_check,
+                description=f"{tenant.custom_domain} completion check",
+            )
 
             # CRITICAL FIX: Only report success if step 6 actually completed
             if step6_actually_complete:
@@ -1040,11 +1121,17 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         except Exception as exc:
             message = str(exc)
             logger.error("[%s] Step 6 failed: %s", tenant.custom_domain, message)
-            async with SessionLocal() as fresh_db:
-                tenant_to_update = await fresh_db.get(Tenant, tenant.id)
-                if tenant_to_update:
-                    tenant_to_update.step6_error = message
-                    await fresh_db.commit()
+            try:
+                async def _save_error(db):
+                    tenant_to_update = await db.get(Tenant, tenant.id)
+                    if tenant_to_update:
+                        tenant_to_update.step6_error = message
+                await save_to_db_with_retry(
+                    _save_error,
+                    description=f"{tenant.custom_domain} error save",
+                )
+            except Exception as db_err:
+                logger.error("[%s] CRITICAL: Could not save error to DB either: %s", tenant.custom_domain, db_err)
             update_progress(str(tenant.id), "error", "failed", message)
             return {"success": False, "error": message}
         finally:

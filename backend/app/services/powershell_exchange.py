@@ -73,6 +73,17 @@ class PowerShellExchangeService:
         """
         logger.info("Starting PowerShell Exchange connection with device code...")
 
+        # HEALTH CHECK: Verify browser is alive before attempting device code auth
+        if self.driver is None:
+            logger.error("No browser driver available for device code auth")
+            return False
+
+        try:
+            _ = self.driver.current_url
+        except Exception as e:
+            logger.error("Browser is dead, cannot perform device code auth: %s", e)
+            return False
+
         # Start PowerShell process
         self.ps_process = subprocess.Popen(
             ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "-"],

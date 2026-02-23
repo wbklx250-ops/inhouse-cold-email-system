@@ -84,10 +84,27 @@ engine = create_async_engine(
     pool_size=30,
     max_overflow=50,
     pool_timeout=60,
-    pool_recycle=1800,
-    pool_pre_ping=True,
+    pool_recycle=120,       # Neon kills idle connections at ~5 min; recycle at 2 min to stay safe
+    pool_pre_ping=True,     # Verify connection is alive before checkout
     echo=settings.debug,
     connect_args=connect_args,
+)
+
+# Dedicated engine for long-running background tasks (Step 6, etc.)
+# NullPool = every session gets a brand new connection, no pooling.
+# This avoids stale connections from Neon idle timeout during
+# 5-15+ minute Selenium/PowerShell operations.
+_background_engine = create_async_engine(
+    database_url,
+    poolclass=NullPool,     # No connection pooling — always fresh
+    echo=settings.debug,
+    connect_args=connect_args,
+)
+
+BackgroundSessionLocal = async_sessionmaker(
+    bind=_background_engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
 )
 
 
