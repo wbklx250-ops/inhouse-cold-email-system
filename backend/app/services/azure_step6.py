@@ -328,12 +328,23 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         )
         actual_password_set_count = password_set_count_result.scalar() or 0
         
-        # FORCE RETRY FIX: ALWAYS run PowerShell and Admin UI on retry
-        # The database may falsely show completion when M365 tenant was recreated
-        # Licensed user check happens separately and correctly skips if already created
-        # But mailbox creation/delegation/passwords must ALWAYS be re-attempted
-        needs_powershell = True  # ALWAYS attempt PowerShell operations
-        needs_admin_ui = True    # ALWAYS attempt Admin UI password reset
+        # SMART RETRY: Check actual state to determine what still needs to be done
+        # If ALL mailboxes are created AND delegated in DB, skip PowerShell
+        # If ALL mailboxes have passwords set, skip Admin UI
+        # This prevents re-running operations that already succeeded
+        
+        needs_powershell = (actual_created_count < total_mailbox_count) or (actual_delegated_count < total_mailbox_count)
+        needs_admin_ui = actual_password_set_count < total_mailbox_count
+        
+        # But if this is a retry (tenant has an error), be more aggressive
+        # Check if the "created" count seems wrong (e.g., delegations > created means DB is stale)
+        if tenant.step6_error:
+            if actual_delegated_count > actual_created_count:
+                # DB is inconsistent - delegations can't exceed creations
+                # Force PowerShell to reconcile state
+                logger.warning("[%s] DB inconsistency: delegated=%s > created=%s - forcing PowerShell reconciliation",
+                              tenant.custom_domain, actual_delegated_count, actual_created_count)
+                needs_powershell = True
         
         logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
                     tenant.custom_domain, total_mailbox_count, actual_created_count, 
@@ -706,12 +717,12 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                         "Creating shared mailboxes via PowerShell",
                     )
 
-                    # FORCE RETRY FIX: ALWAYS process ALL mailboxes on retry
-                    # The database may falsely show completion when M365 tenant was recreated
-                    # PowerShell handles "already exists" gracefully for creation and delegation
-                    mailboxes_to_process = mailbox_data_payload  # Process ALL mailboxes
+                    # SMART PROCESSING: Always send all mailboxes to PowerShell
+                    # PowerShell now does Get-Mailbox check first, so sending all is safe
+                    # EXISTS results will be treated as success and DB will be updated
+                    mailboxes_to_process = mailbox_data_payload
                     
-                    logger.info("[%s] FORCE RETRY: Processing ALL %s mailboxes (ignoring DB flags)", 
+                    logger.info("[%s] Processing %s mailboxes (PowerShell will check existence first)", 
                                 tenant.custom_domain, len(mailboxes_to_process))
 
                     try:
@@ -808,11 +819,19 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                                 )
                             ) or 0
                             
-                            ps_threshold = len(mailboxes) * 0.9
+                            # EXISTS counts as created, so threshold should be met on retry
+                            # Use 90% threshold to allow for a few genuine failures
+                            ps_threshold = int(len(mailboxes) * 0.9)
                             powershell_succeeded = (
                                 ps_created_count >= ps_threshold and 
                                 ps_delegated_count >= ps_threshold
                             )
+                            if not powershell_succeeded:
+                                logger.warning(
+                                    "[%s] PowerShell below threshold: created=%s/%s, delegated=%s/%s (threshold=%s)",
+                                    tenant.custom_domain, ps_created_count, len(mailboxes),
+                                    ps_delegated_count, len(mailboxes), ps_threshold
+                                )
                             logger.info(
                                 "[%s] PowerShell phase check: created=%s, delegated=%s, threshold=%s, succeeded=%s",
                                 tenant.custom_domain,

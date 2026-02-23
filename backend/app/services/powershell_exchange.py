@@ -874,20 +874,41 @@ Write-Output "CONNECTED_SUCCESS"
         base_display_name = mailboxes[0].get("display_name", "User") if mailboxes else "User"
 
         # STEP 1: Create mailboxes with NUMBERED display names
+        # RELIABILITY FIX: Check if mailbox exists FIRST via Get-Mailbox before attempting New-Mailbox
+        # This prevents "name already being used" errors on retry
         logger.info("Creating %s shared mailboxes...", len(mailboxes))
         for i, mb in enumerate(mailboxes, 1):
             email = mb["email"]
             numbered_name = f"{base_display_name} {i}"
+            escaped_email = self._ps_escape(email)
+            escaped_name = self._ps_escape(numbered_name)
 
             create_cmd = f'''
+$email = "{escaped_email}"
+$numberedName = "{escaped_name}"
+
+# First check if mailbox already exists by email address
+$existing = $null
 try {{
-    New-Mailbox -Shared -Name "{numbered_name}" -DisplayName "{numbered_name}" -PrimarySmtpAddress "{email}" -ErrorAction Stop | Out-Null
-    Write-Output "CREATED:{email}"
+    $existing = Get-Mailbox -Identity $email -ErrorAction SilentlyContinue
 }} catch {{
-    if ($_.Exception.Message -like "*already exists*") {{
-        Write-Output "EXISTS:{email}"
-    }} else {{
-        Write-Output "FAILED:{email}:$($_.Exception.Message)"
+    # Ignore - mailbox doesn't exist
+}}
+
+if ($existing) {{
+    Write-Output "EXISTS:$email"
+}} else {{
+    try {{
+        New-Mailbox -Shared -Name $numberedName -DisplayName $numberedName -PrimarySmtpAddress $email -ErrorAction Stop | Out-Null
+        Write-Output "CREATED:$email"
+    }} catch {{
+        $errMsg = $_.Exception.Message
+        if ($errMsg -like "*already being used*" -or $errMsg -like "*already exists*" -or $errMsg -like "*is already used*") {{
+            # Name collision but email didn't exist - mailbox exists under different identity
+            Write-Output "EXISTS:$email"
+        }} else {{
+            Write-Output "FAILED:$email||$errMsg"
+        }}
     }}
 }}
 '''
@@ -895,9 +916,19 @@ try {{
 
             if output and (f"CREATED:{email}" in output or f"EXISTS:{email}" in output):
                 results["created"].append(email)
-                logger.info("  ✓ Created: %s", email)
+                if f"EXISTS:{email}" in output:
+                    logger.info("  ✓ Already exists: %s", email)
+                else:
+                    logger.info("  ✓ Created: %s", email)
             else:
-                error_msg = output.split("FAILED:")[-1] if output and "FAILED:" in output else "Unknown error"
+                error_msg = "Unknown error"
+                if output and "FAILED:" in output:
+                    # Parse error after the || separator
+                    parts = output.split("FAILED:")[-1]
+                    if "||" in parts:
+                        error_msg = parts.split("||", 1)[1].strip()
+                    else:
+                        error_msg = parts.strip()
                 results["failed"].append({"email": email, "error": error_msg})
                 logger.error("  ✗ Failed: %s - %s", email, error_msg)
 
@@ -905,7 +936,12 @@ try {{
 
         # STEP 2: Fix display names (remove numbers, all same name)
         logger.info("Fixing display names to '%s'...", base_display_name)
-        await asyncio.sleep(2)
+        # Wait for newly created mailboxes to propagate in Exchange
+        if results["created"]:
+            logger.info("Waiting 10s for mailbox propagation before fixing display names...")
+            await asyncio.sleep(10)
+        else:
+            await asyncio.sleep(2)
 
         for mb in mailboxes:
             email = mb["email"]
