@@ -14,6 +14,7 @@ const navigation: NavItem[] = [
   { name: "Setup Wizard", href: "/setup", icon: "🚀" },
   { name: "Dashboard", href: "/", icon: "📊" },
   { name: "Domains", href: "/domains", icon: "🌐" },
+  { name: "Domain Lookup", href: "/domain-lookup", icon: "🔍" },
   { name: "Tenants", href: "/tenants", icon: "🏢" },
   { name: "Domain Removal", href: "/domain-removal", icon: "🗑️" },
   { name: "Sequencer Upload", href: "/instantly", icon: "📤" },

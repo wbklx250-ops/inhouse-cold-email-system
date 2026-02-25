@@ -7,6 +7,7 @@ from app.api.routes.webhooks import router as webhooks_router
 from app.api.routes.step8 import router as step8_router
 from app.api.routes.upload import router as upload_router
 from app.api.routes.domain_removal import router as domain_removal_router
+from app.api.routes.domain_lookup import router as domain_lookup_router
 
 __all__ = [
     "domains_router",
@@ -18,4 +19,5 @@ __all__ = [
     "step8_router",
     "upload_router",
     "domain_removal_router",
+    "domain_lookup_router",
 ]
