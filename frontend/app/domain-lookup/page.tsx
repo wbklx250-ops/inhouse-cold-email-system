@@ -20,6 +20,7 @@ interface LookupResult {
   db_domain_id: string | null;
   db_tenant_id: string | null;
   db_tenant_name: string | null;
+  match_method: string | null;
 }
 
 interface LookupResponse {
@@ -34,28 +35,55 @@ interface SyncResponse {
   total_checked: number;
   updated_links: number;
   already_linked: number;
+  tenant_ids_updated: number;
   no_tenant_match: number;
   not_in_db: number;
   not_connected: number;
   updates: {
     domain: string;
-    tenant_id: string;
     tenant_name: string;
-    microsoft_tenant_id: string;
-    previous_tenant_id: string | null;
+    match_method: string;
   }[];
-  already_linked_details: {
+  tenant_id_updated_details: {
     domain: string;
-    tenant_id: string;
     tenant_name: string;
+    old_microsoft_tenant_id: string;
+    new_microsoft_tenant_id: string;
+    match_method: string;
   }[];
   no_tenant_match_details: {
     domain: string;
     microsoft_tenant_id: string;
+    organization_name: string | null;
   }[];
 }
 
-type FilterMode = "all" | "connected" | "not_connected" | "errors" | "in_db";
+type FilterMode = "all" | "connected" | "not_connected" | "errors" | "in_db" | "matched";
+
+const MATCH_METHOD_LABELS: Record<string, string> = {
+  tenant_id: "MS Tenant ID",
+  custom_domain: "Custom Domain",
+  domain_fk: "Domain→Tenant FK",
+  tenant_domain_fk: "Tenant→Domain FK",
+  org_name: "Org Name",
+};
+
+function matchMethodBadge(method: string | null) {
+  if (!method) return null;
+  const label = MATCH_METHOD_LABELS[method] || method;
+  const colors: Record<string, string> = {
+    tenant_id: "bg-green-100 text-green-700",
+    custom_domain: "bg-blue-100 text-blue-700",
+    domain_fk: "bg-indigo-100 text-indigo-700",
+    tenant_domain_fk: "bg-indigo-100 text-indigo-700",
+    org_name: "bg-amber-100 text-amber-700",
+  };
+  return (
+    <span className={`text-xs px-1.5 py-0.5 rounded font-medium ${colors[method] || "bg-gray-100 text-gray-600"}`}>
+      {label}
+    </span>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Component
@@ -113,21 +141,25 @@ export default function DomainLookupPage() {
   const handleSync = async () => {
     if (!results) return;
 
-    const connectedDomains = results.results
-      .filter((r) => r.is_connected && r.found_in_db && r.microsoft_tenant_id)
+    const syncDomains = results.results
+      .filter((r) => r.is_connected && r.found_in_db)
       .map((r) => r.domain);
 
-    if (!connectedDomains.length) {
+    if (!syncDomains.length) {
       setError("No connected domains found in our database to sync");
       return;
     }
 
+    const matchedCount = results.results.filter(
+      (r) => r.is_connected && r.found_in_db && r.db_tenant_id
+    ).length;
+
     const confirmed = confirm(
-      `Sync ${connectedDomains.length} domain(s) to their matched tenants in the database?\n\n` +
-        "This will update the domain → tenant links for domains where:\n" +
-        "• The domain exists in our database\n" +
-        "• The Microsoft tenant ID matches a tenant in our database\n" +
-        "• The current link differs from the matched tenant"
+      `Sync ${syncDomains.length} connected domain(s) to the database?\n\n` +
+        `• ${matchedCount} already matched to tenants (via custom_domain, existing links, org name, etc.)\n` +
+        `• Will update domain→tenant links where needed\n` +
+        `• Will auto-update tenant Microsoft IDs where discovered\n\n` +
+        "Proceed?"
     );
     if (!confirmed) return;
 
@@ -139,7 +171,7 @@ export default function DomainLookupPage() {
       const res = await fetch(`${API_BASE}/api/v1/domain-lookup/sync-to-db`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ domains: connectedDomains }),
+        body: JSON.stringify({ domains: syncDomains }),
       });
 
       if (!res.ok) {
@@ -168,6 +200,7 @@ export default function DomainLookupPage() {
       "Namespace Type",
       "In Database",
       "DB Tenant Name",
+      "Match Method",
       "Error",
     ];
 
@@ -179,6 +212,7 @@ export default function DomainLookupPage() {
       r.namespace_type || "",
       r.found_in_db ? "Yes" : "No",
       r.db_tenant_name || "",
+      r.match_method || "",
       r.error || "",
     ]);
 
@@ -212,6 +246,8 @@ export default function DomainLookupPage() {
             return !!r.error;
           case "in_db":
             return r.found_in_db;
+          case "matched":
+            return !!r.db_tenant_id;
           default:
             return true;
         }
@@ -220,9 +256,10 @@ export default function DomainLookupPage() {
 
   const domainCount = parseDomains().length;
   const syncableCount = results
-    ? results.results.filter(
-        (r) => r.is_connected && r.found_in_db && r.microsoft_tenant_id
-      ).length
+    ? results.results.filter((r) => r.is_connected && r.found_in_db).length
+    : 0;
+  const matchedCount = results
+    ? results.results.filter((r) => !!r.db_tenant_id).length
     : 0;
 
   return (
@@ -261,7 +298,7 @@ export default function DomainLookupPage() {
               </p>
 
               {/* Summary grid */}
-              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-sm">
                 <div className="flex items-center gap-1.5">
                   <span className="text-green-600 font-bold">{syncResult.updated_links}</span>
                   <span className="text-gray-600">newly linked</span>
@@ -271,8 +308,12 @@ export default function DomainLookupPage() {
                   <span className="text-gray-600">already linked</span>
                 </div>
                 <div className="flex items-center gap-1.5">
+                  <span className="text-purple-600 font-bold">{syncResult.tenant_ids_updated}</span>
+                  <span className="text-gray-600">IDs updated</span>
+                </div>
+                <div className="flex items-center gap-1.5">
                   <span className="text-amber-600 font-bold">{syncResult.no_tenant_match}</span>
-                  <span className="text-gray-600">no tenant match</span>
+                  <span className="text-gray-600">no match</span>
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className="text-gray-500 font-bold">{syncResult.not_connected}</span>
@@ -286,28 +327,35 @@ export default function DomainLookupPage() {
                   <p className="text-xs font-medium text-green-700 mb-1">✅ Newly linked:</p>
                   <ul className="text-sm text-green-700 space-y-0.5">
                     {syncResult.updates.map((u, i) => (
-                      <li key={i}>
-                        <span className="font-mono">{u.domain}</span> → <span className="font-medium">{u.tenant_name}</span>
+                      <li key={i} className="flex items-center gap-2">
+                        <span className="font-mono">{u.domain}</span> →{" "}
+                        <span className="font-medium">{u.tenant_name}</span>
+                        {matchMethodBadge(u.match_method)}
                       </li>
                     ))}
                   </ul>
                 </div>
               )}
 
+              {/* Tenant IDs updated */}
+              {syncResult.tenant_ids_updated > 0 && (
+                <p className="text-xs text-purple-700">
+                  🔄 {syncResult.tenant_ids_updated} tenant Microsoft ID{syncResult.tenant_ids_updated !== 1 ? "s" : ""} auto-updated from lookup results.
+                </p>
+              )}
+
               {/* Already linked info */}
               {syncResult.already_linked > 0 && (
                 <p className="text-xs text-blue-600">
-                  ℹ️ {syncResult.already_linked} domain{syncResult.already_linked !== 1 ? "s" : ""} already correctly linked to their tenant — no update needed.
+                  ℹ️ {syncResult.already_linked} domain{syncResult.already_linked !== 1 ? "s" : ""} already correctly linked — no update needed.
                 </p>
               )}
 
               {/* No tenant match warning */}
               {syncResult.no_tenant_match > 0 && (
-                <div>
-                  <p className="text-xs text-amber-700">
-                    ⚠️ {syncResult.no_tenant_match} domain{syncResult.no_tenant_match !== 1 ? "s are" : " is"} connected to a Microsoft tenant, but that tenant ID is not in our database.
-                  </p>
-                </div>
+                <p className="text-xs text-amber-700">
+                  ⚠️ {syncResult.no_tenant_match} domain{syncResult.no_tenant_match !== 1 ? "s" : ""} connected to Microsoft but no matching tenant found in DB by any method.
+                </p>
               )}
             </div>
             <button
@@ -392,7 +440,7 @@ export default function DomainLookupPage() {
 
       {/* Summary Stats */}
       {results && (
-        <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div className="grid grid-cols-2 md:grid-cols-6 gap-4">
           <div className="bg-white rounded-lg border border-gray-200 p-4 text-center">
             <div className="text-2xl font-bold text-gray-900">
               {results.total}
@@ -410,6 +458,12 @@ export default function DomainLookupPage() {
               {results.not_connected}
             </div>
             <div className="text-sm text-gray-500">Not Connected</div>
+          </div>
+          <div className="bg-purple-50 rounded-lg border border-purple-200 p-4 text-center">
+            <div className="text-2xl font-bold text-purple-600">
+              {matchedCount}
+            </div>
+            <div className="text-sm text-gray-500">Tenant Matched</div>
           </div>
           <div className="bg-yellow-50 rounded-lg border border-yellow-200 p-4 text-center">
             <div className="text-2xl font-bold text-yellow-600">
@@ -434,12 +488,9 @@ export default function DomainLookupPage() {
               ["all", "All", results.total],
               ["connected", "Connected", results.connected],
               ["not_connected", "Not Connected", results.not_connected],
+              ["matched", "Tenant Matched", matchedCount],
               ["errors", "Errors", results.errors],
-              [
-                "in_db",
-                "In DB",
-                results.results.filter((r) => r.found_in_db).length,
-              ],
+              ["in_db", "In DB", results.results.filter((r) => r.found_in_db).length],
             ] as [FilterMode, string, number][]
           ).map(([key, label, count]) => (
             <button
@@ -479,11 +530,11 @@ export default function DomainLookupPage() {
                   <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Type
                   </th>
-                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
-                    In DB
-                  </th>
                   <th className="px-4 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                     Our Tenant
+                  </th>
+                  <th className="px-4 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">
+                    Match
                   </th>
                 </tr>
               </thead>
@@ -495,7 +546,9 @@ export default function DomainLookupPage() {
                       r.error
                         ? "bg-yellow-50"
                         : r.is_connected
-                          ? "bg-green-50/50"
+                          ? r.db_tenant_id
+                            ? "bg-green-50/50"
+                            : "bg-amber-50/30"
                           : "bg-red-50/50"
                     }
                   >
@@ -504,12 +557,7 @@ export default function DomainLookupPage() {
                     </td>
                     <td className="px-4 py-3 text-center whitespace-nowrap">
                       {r.error ? (
-                        <span
-                          className="text-yellow-500 cursor-help"
-                          title={r.error}
-                        >
-                          ⚠️
-                        </span>
+                        <span className="text-yellow-500 cursor-help" title={r.error}>⚠️</span>
                       ) : r.is_connected ? (
                         <span className="text-green-600">✅</span>
                       ) : (
@@ -520,12 +568,8 @@ export default function DomainLookupPage() {
                       {r.microsoft_tenant_id ? (
                         <span
                           className="cursor-pointer hover:text-blue-600"
-                          title="Click to copy"
-                          onClick={() => {
-                            navigator.clipboard.writeText(
-                              r.microsoft_tenant_id!
-                            );
-                          }}
+                          title={`Click to copy: ${r.microsoft_tenant_id}`}
+                          onClick={() => navigator.clipboard.writeText(r.microsoft_tenant_id!)}
                         >
                           {r.microsoft_tenant_id.slice(0, 8)}…
                         </span>
@@ -534,9 +578,7 @@ export default function DomainLookupPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-sm text-gray-700 max-w-[200px] truncate">
-                      {r.organization_name || (
-                        <span className="text-gray-400">—</span>
-                      )}
+                      {r.organization_name || <span className="text-gray-400">—</span>}
                     </td>
                     <td className="px-4 py-3 text-center whitespace-nowrap">
                       {r.namespace_type ? (
@@ -555,13 +597,6 @@ export default function DomainLookupPage() {
                         <span className="text-gray-400">—</span>
                       )}
                     </td>
-                    <td className="px-4 py-3 text-center whitespace-nowrap">
-                      {r.found_in_db ? (
-                        <span className="text-green-600">✅</span>
-                      ) : (
-                        <span className="text-gray-400">❌</span>
-                      )}
-                    </td>
                     <td className="px-4 py-3 text-sm whitespace-nowrap">
                       {r.db_tenant_id ? (
                         <Link
@@ -570,6 +605,15 @@ export default function DomainLookupPage() {
                         >
                           {r.db_tenant_name || "View Tenant"}
                         </Link>
+                      ) : r.found_in_db ? (
+                        <span className="text-amber-500 text-xs">In DB, no tenant match</span>
+                      ) : (
+                        <span className="text-gray-400">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-3 text-center whitespace-nowrap">
+                      {r.match_method ? (
+                        matchMethodBadge(r.match_method)
                       ) : (
                         <span className="text-gray-400">—</span>
                       )}
@@ -578,10 +622,7 @@ export default function DomainLookupPage() {
                 ))}
                 {filteredResults.length === 0 && (
                   <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-8 text-center text-sm text-gray-500"
-                    >
+                    <td colSpan={7} className="px-4 py-8 text-center text-sm text-gray-500">
                       No results match the selected filter
                     </td>
                   </tr>
