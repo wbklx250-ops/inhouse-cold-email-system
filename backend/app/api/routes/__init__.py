@@ -8,6 +8,7 @@ from app.api.routes.step8 import router as step8_router
 from app.api.routes.upload import router as upload_router
 from app.api.routes.domain_removal import router as domain_removal_router
 from app.api.routes.domain_lookup import router as domain_lookup_router
+from app.api.routes.pipeline import router as pipeline_router
 
 __all__ = [
     "domains_router",
@@ -20,4 +21,5 @@ __all__ = [
     "upload_router",
     "domain_removal_router",
     "domain_lookup_router",
+    "pipeline_router",
 ]

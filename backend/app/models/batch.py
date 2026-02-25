@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 class BatchStatus(str, Enum):
     """Status of a setup batch."""
     ACTIVE = "active"
+    IN_PROGRESS = "in_progress"
     PAUSED = "paused"
     COMPLETED = "completed"
 
@@ -79,7 +80,38 @@ class SetupBatch(TimestampUUIDMixin, Base):
     # Custom mailbox map: allows importing pre-existing email addresses from CSV
     # Format: {"domain.com": ["email1@domain.com", "email2@domain.com", ...], ...}
     custom_mailbox_map: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
-    
+
+    # === NEW: Upfront collection fields ===
+    new_admin_password: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Encrypted - password for all tenants
+
+    # === NEW: Sequencer fields ===
+    sequencer_platform: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # "plusvibe", "instantly", "smartlead"
+    sequencer_login_email: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    sequencer_login_password: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Encrypted
+    profile_photo_path: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Path to uploaded photo file on disk
+
+    # === NEW: Pipeline tracking ===
+    pipeline_status: Mapped[Optional[str]] = mapped_column(String, nullable=True, default="not_started")  # not_started, running, paused, completed, error
+    pipeline_step: Mapped[Optional[int]] = mapped_column(Integer, nullable=True, default=0)  # Current pipeline step (1-10)
+    pipeline_step_name: Mapped[Optional[str]] = mapped_column(String, nullable=True)  # Human-readable step name
+    pipeline_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    pipeline_completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    pipeline_paused_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    ns_confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)  # When user confirmed NS update
+
+    # === NEW: Aggregate progress counters (updated by pipeline) ===
+    total_domains: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_tenants: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    zones_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    ns_propagated_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    dns_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    first_login_completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    m365_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    mailboxes_completed_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    smtp_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    sequencer_uploaded_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
     # Relationships
     # NOTE: Using save-update/merge instead of delete-orphan to prevent
     # accidental mass deletion of domains/tenants/mailboxes when a batch is deleted.

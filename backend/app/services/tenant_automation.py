@@ -84,10 +84,72 @@ LONG_WAIT = 20     # seconds for slow operations
 CANT_SCAN_WAIT = 5  # seconds to wait after clicking "Can't scan" for secret to appear
 
 import os
+import psycopg2
 os.makedirs(SCREENSHOT_DIR, exist_ok=True)
 
 _progress = {"completed": 0, "failed": 0, "total": 0}
 _progress_lock = threading.Lock()
+
+
+# === BUG FIX 4.2: GUARANTEED TOTP save using raw psycopg2 ===
+def _save_totp_guaranteed(tenant_id: str, totp_secret: str, new_password: str = None, worker_id: int = 0) -> bool:
+    """
+    GUARANTEED TOTP save using raw psycopg2.
+    
+    Uses a brand new connection — completely bypasses SQLAlchemy.
+    Cannot be affected by stale sessions, event loop issues, or Neon timeouts.
+    This is the CRITICAL save that prevents tenant lockout after MFA enrollment.
+    """
+    db_url = os.environ.get("DATABASE_URL", "")
+    # Normalize to plain postgresql:// for psycopg2
+    for prefix in ["postgresql+asyncpg://", "postgresql+psycopg2://", "postgres://"]:
+        if db_url.startswith(prefix):
+            db_url = "postgresql://" + db_url[len(prefix):]
+            break
+    
+    conn = None
+    try:
+        conn = psycopg2.connect(db_url, sslmode="require", connect_timeout=15)
+        conn.autocommit = False
+        cur = conn.cursor()
+        
+        if new_password:
+            cur.execute(
+                """UPDATE tenants 
+                   SET totp_secret = %s, admin_password = %s, password_changed = true, updated_at = NOW() 
+                   WHERE id = %s::uuid""",
+                (totp_secret, new_password, tenant_id)
+            )
+        else:
+            cur.execute(
+                """UPDATE tenants SET totp_secret = %s, updated_at = NOW() WHERE id = %s::uuid""",
+                (totp_secret, tenant_id)
+            )
+        
+        conn.commit()
+        
+        # VERIFY the save
+        cur.execute("SELECT totp_secret FROM tenants WHERE id = %s::uuid", (tenant_id,))
+        row = cur.fetchone()
+        
+        cur.close()
+        conn.close()
+        
+        if row and row[0] == totp_secret:
+            logger.info(f"[W{worker_id}] ✅ GUARANTEED TOTP SAVE VERIFIED: {totp_secret[:4]}***")
+            return True
+        else:
+            logger.error(f"[W{worker_id}] ❌ TOTP save verification FAILED")
+            return False
+            
+    except Exception as e:
+        logger.error(f"[W{worker_id}] ❌ GUARANTEED TOTP save exception: {e}")
+        try:
+            if conn:
+                conn.close()
+        except:
+            pass
+        return False
 
 
 # === CRITICAL: Save TOTP immediately (sync helper for thread workers) ===
@@ -206,13 +268,27 @@ class BrowserWorker:
     def _create_driver(self):
         opts = Options()
         if self.headless:
-            # Use legacy headless flag for maximum compatibility on Windows
-            opts.add_argument("--headless")
+            # Use new headless flag for better compatibility
+            opts.add_argument("--headless=new")
         opts.add_argument("--no-sandbox")
         opts.add_argument("--disable-dev-shm-usage")
         opts.add_argument("--disable-gpu")
-        opts.add_argument("--window-size=1920,1080")
+        opts.add_argument("--window-size=1280,900")
         opts.add_argument("--disable-blink-features=AutomationControlled")
+        
+        # CRITICAL: Memory management for containerized environments (Railway ~1GB RAM)
+        opts.add_argument("--single-process")               # Reduces memory footprint
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-background-networking")
+        opts.add_argument("--disable-default-apps")
+        opts.add_argument("--disable-sync")
+        opts.add_argument("--disable-translate")
+        opts.add_argument("--js-flags=--max-old-space-size=256")  # Limit JS heap to 256MB
+        
+        # Reduce logging noise
+        opts.add_argument("--log-level=3")
+        opts.add_experimental_option("excludeSwitches", ["enable-logging"])
+        
         profile_dir = tempfile.mkdtemp(prefix=f"chrome-profile-{self.worker_id}-{uuid.uuid4()}-")
         opts.add_argument(f"--user-data-dir={profile_dir}")
         opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
@@ -1429,6 +1505,31 @@ class BrowserWorker:
         result = TenantResult(tenant_id=tenant_id, admin_email=admin_email)
         self.tenant_id = tenant_id  # Set for screenshot naming
         
+        # === BUG FIX 4.3: Check state before retry ===
+        # Load fresh state from DB to see if this tenant is already done
+        try:
+            from app.db.session import SyncSessionLocal
+            with SyncSessionLocal() as check_db:
+                from app.models.tenant import Tenant as TenantModel
+                existing = check_db.get(TenantModel, UUID(tenant_id))
+                if existing:
+                    if existing.password_changed and existing.totp_secret:
+                        logger.info(f"[W{self.worker_id}] ✅ Tenant already complete (pwd_changed + totp), SKIPPING")
+                        return TenantResult(
+                            tenant_id=tenant_id,
+                            admin_email=admin_email,
+                            success=True,
+                            new_password=existing.admin_password,
+                            totp_secret=existing.totp_secret,
+                        )
+                    elif existing.password_changed and not existing.totp_secret:
+                        logger.info(f"[W{self.worker_id}] Password already changed, only MFA needed")
+                        # Use the CHANGED password, not the initial one
+                        initial_pwd = existing.admin_password
+                        logger.info(f"[W{self.worker_id}] Using changed password for login")
+        except Exception as e:
+            logger.warning(f"[W{self.worker_id}] State check failed (proceeding anyway): {e}")
+        
         # === PASSWORD VALIDATION AND FALLBACK ===
         passwords_to_try = []
         
@@ -1940,7 +2041,8 @@ class BrowserWorker:
                     logger.info(f"[W{self.worker_id}] ✓ TOTP secret extracted successfully")
                     result.totp_secret = totp
                     # CRITICAL: Save immediately BEFORE completing MFA enrollment
-                    saved = _save_totp_immediately_sync(
+                    # BUG FIX 4.2: Use guaranteed psycopg2 save instead of SQLAlchemy
+                    saved = _save_totp_guaranteed(
                         tenant_id=tenant_id,
                         totp_secret=totp,
                         new_password=result.new_password,

@@ -2524,22 +2524,37 @@ async def start_automation(
             try:
                 results = await process_tenants_parallel(tenant_data, new_password, max_workers)
                 for r in results:
-                    async with AsyncSession(async_engine, expire_on_commit=False) as session:
-                        t = await session.get(Tenant, UUID(r["tenant_id"]))
-                        if t:
-                            t.first_login_completed = r["success"]
-                            t.totp_secret = r["totp_secret"]
-                            t.security_defaults_disabled = r["security_defaults_disabled"]
-                            t.setup_error = r["error"]
-                            if r["success"]:
-                                # Only update admin_password AFTER successful password change
-                                # This preserves the original TXT password until change is confirmed
-                                if r["new_password"]:  # Only update if we have a new password
-                                    t.admin_password = r["new_password"]
-                                    t.password_changed = True  # CRITICAL: Mark password as changed!
+                    try:
+                        async with AsyncSession(async_engine, expire_on_commit=False) as session:
+                            t = await session.get(Tenant, UUID(r["tenant_id"]))
+                            if not t:
+                                logger.error(f"Tenant {r['tenant_id']} not found for result save")
+                                continue
+                            
+                            if r.get("success"):
+                                # BUG FIX 4.1: ALWAYS use the form's new_password, not r["new_password"]
+                                # If first login succeeded, the password IS new_password now.
+                                t.admin_password = new_password
+                                t.password_changed = True
+                                t.first_login_completed = True
                                 t.first_login_at = datetime.utcnow()
+                                t.setup_error = None
+                                t.status = "first_login_complete"
+                                
+                                # TOTP: use worker result, but also double-check
+                                if r.get("totp_secret") and not t.totp_secret:
+                                    t.totp_secret = r["totp_secret"]
+                                
+                                t.security_defaults_disabled = r.get("security_defaults_disabled", False)
+                                
+                                logger.info(f"✅ Saved results for {t.admin_email}: pwd=changed, totp={bool(t.totp_secret)}")
+                            else:
+                                t.setup_error = r.get("error", "Unknown error")
+                                logger.warning(f"❌ Tenant {t.admin_email} failed: {r.get('error')}")
+                            
                             await session.commit()
-                            logger.info(" SAVED %s to DB", t.name)
+                    except Exception as e:
+                        logger.error(f"Failed to save result for tenant {r.get('tenant_id')}: {e}")
                 
                 # Mark job as completed
                 step4_jobs[job_id]["status"] = "completed"
@@ -2552,6 +2567,8 @@ async def start_automation(
                 step4_jobs[job_id]["error"] = str(e)
                 step4_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
                 logger.error(f"Step 4 automation failed for batch {batch_id}: {str(e)}")
+                import traceback
+                logger.error(traceback.format_exc())
         
         background_tasks.add_task(run)
         logger.info(f"=== STEP 4 BACKGROUND TASK ADDED ===")

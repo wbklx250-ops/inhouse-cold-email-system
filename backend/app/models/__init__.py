@@ -3,6 +3,7 @@ from app.models.batch import BatchStatus, SetupBatch
 from app.models.domain import Domain, DomainStatus
 from app.models.instantly_account import InstantlyAccount
 from app.models.mailbox import Mailbox, MailboxStatus, WarmupStage
+from app.models.pipeline_log import PipelineLog
 from app.models.tenant import Tenant, TenantStatus
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "Mailbox",
     "MailboxStatus",
     "WarmupStage",
+    "PipelineLog",
 ]

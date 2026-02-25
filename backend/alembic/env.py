@@ -18,7 +18,7 @@ sys.path.insert(0, backend_dir)
 load_dotenv(os.path.join(backend_dir, ".env"))
 
 # Import models to register them with Base.metadata
-from app.models import Base, Domain, Mailbox, Tenant  # noqa: E402
+from app.models import Base, Domain, Mailbox, Tenant, SetupBatch, PipelineLog  # noqa: E402
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

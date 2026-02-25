@@ -37,6 +37,7 @@ from app.api.routes import (
     upload_router,
     domain_removal_router,
     domain_lookup_router,
+    pipeline_router,
 )
 from app.db.session import get_db_session
 from app.core.config import get_settings
@@ -136,6 +137,7 @@ app.include_router(step8_router)
 app.include_router(upload_router)
 app.include_router(domain_removal_router)
 app.include_router(domain_lookup_router)
+app.include_router(pipeline_router)
 
 
 @app.get("/", tags=["root"])

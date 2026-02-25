@@ -143,11 +143,17 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         )
         await db.commit()
 
+        # BUG 6.3 FIX: Use != True to catch both False and NULL, include errored tenants
+        # Also accept step5_complete as alternative prerequisite
+        from sqlalchemy import or_
         result = await db.execute(
             select(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.domain_verified_in_m365 == True,
-                Tenant.step6_complete == False,
+                Tenant.step6_complete != True,  # Not yet complete (includes errored ones)
+                or_(
+                    Tenant.domain_verified_in_m365 == True,
+                    Tenant.step5_complete == True,
+                ),
             )
         )
         tenants = result.scalars().all()
@@ -156,9 +162,20 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             logger.warning("No eligible tenants found for batch %s", batch_id)
             return {"success": False, "error": "No eligible tenants"}
 
+        # BUG 6.3 FIX: Clear previous errors so errored tenants get retried
+        retry_count = 0
+        for t in tenants:
+            if t.step6_error:
+                logger.info("Clearing error for retry: %s (was: %s)", t.custom_domain, t.step6_error)
+                t.step6_error = None
+                retry_count += 1
+        if retry_count > 0:
+            await db.commit()
+
         # Extract plain IDs before closing the session
         tenant_ids = [t.id for t in tenants]
         total_tenants = len(tenant_ids)
+        logger.info("Step 6: %s eligible tenants (including %s retries)", total_tenants, retry_count)
     # --- Parent session is now CLOSED before parallel work begins ---
 
     results: List[Dict[str, Any]] = []
@@ -273,7 +290,20 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
 
 
 async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
-    """Run Step 6 for a single tenant using Selenium + PowerShell + Selenium UI."""
+    """Run Step 6 for a single tenant using Selenium + PowerShell + Selenium UI.
+    
+    BUG 6.1 FIX: Restructured to load→close→work→reopen→save pattern.
+    DB sessions are opened/closed around each phase to prevent Neon idle timeouts.
+    """
+    # ================================================================
+    # PHASE A: Load everything from DB into plain dicts (quick, ~1 second)
+    # ================================================================
+    tenant_data = None
+    batch_data = None
+    mailbox_list = []
+    needs_powershell = True
+    needs_admin_ui = True
+
     async with async_session_factory() as db:
         tenant = await db.get(Tenant, tenant_id)
         if not tenant:
@@ -297,59 +327,42 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             tenant.step6_error = None
             await db.commit()
 
-        # CRITICAL FIX: Check ACTUAL mailbox state in DB, not just counter fields
-        # Counter fields can be stale from previous partial runs
-        mailbox_count_result = await db.execute(
+        # BUG 6.4 FIX: Check ACTUAL mailbox state in DB, not just counter fields
+        total_mailbox_count = await db.scalar(
             select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
-        )
-        total_mailbox_count = mailbox_count_result.scalar() or 0
-        
-        created_count_result = await db.execute(
+        ) or 0
+        actual_created_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
                 Mailbox.tenant_id == tenant.id,
                 Mailbox.created_in_exchange == True,
             )
-        )
-        actual_created_count = created_count_result.scalar() or 0
-        
-        delegated_count_result = await db.execute(
+        ) or 0
+        actual_delegated_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
                 Mailbox.tenant_id == tenant.id,
                 Mailbox.delegated == True,
             )
-        )
-        actual_delegated_count = delegated_count_result.scalar() or 0
-        
-        password_set_count_result = await db.execute(
+        ) or 0
+        actual_password_set_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
                 Mailbox.tenant_id == tenant.id,
                 Mailbox.password_set == True,
             )
-        )
-        actual_password_set_count = password_set_count_result.scalar() or 0
-        
-        # SMART RETRY: Check actual state to determine what still needs to be done
-        # If ALL mailboxes are created AND delegated in DB, skip PowerShell
-        # If ALL mailboxes have passwords set, skip Admin UI
-        # This prevents re-running operations that already succeeded
-        
-        needs_powershell = (actual_created_count < total_mailbox_count) or (actual_delegated_count < total_mailbox_count)
-        needs_admin_ui = actual_password_set_count < total_mailbox_count
-        
-        # But if this is a retry (tenant has an error), be more aggressive
-        # Check if the "created" count seems wrong (e.g., delegations > created means DB is stale)
-        if tenant.step6_error:
-            if actual_delegated_count > actual_created_count:
-                # DB is inconsistent - delegations can't exceed creations
-                # Force PowerShell to reconcile state
-                logger.warning("[%s] DB inconsistency: delegated=%s > created=%s - forcing PowerShell reconciliation",
-                              tenant.custom_domain, actual_delegated_count, actual_created_count)
-                needs_powershell = True
-        
+        ) or 0
+
+        needs_powershell = (total_mailbox_count == 0) or (actual_created_count < total_mailbox_count) or (actual_delegated_count < total_mailbox_count)
+        needs_admin_ui = (total_mailbox_count == 0) or (actual_password_set_count < total_mailbox_count)
+
+        # DB inconsistency check
+        if actual_delegated_count > actual_created_count:
+            logger.warning("[%s] DB inconsistency: delegated=%s > created=%s - forcing PowerShell",
+                          tenant.custom_domain, actual_delegated_count, actual_created_count)
+            needs_powershell = True
+
         logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
-                    tenant.custom_domain, total_mailbox_count, actual_created_count, 
+                    tenant.custom_domain, total_mailbox_count, actual_created_count,
                     actual_delegated_count, actual_password_set_count)
-        logger.info("[%s] needs_powershell=%s, needs_admin_ui=%s", 
+        logger.info("[%s] needs_powershell=%s, needs_admin_ui=%s",
                     tenant.custom_domain, needs_powershell, needs_admin_ui)
 
         if needs_powershell:
@@ -361,8 +374,6 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             logger.info("[%s] RUNNING Admin UI password reset...", tenant.custom_domain)
         else:
             logger.info("[%s] SKIPPING Admin UI password reset - already done", tenant.custom_domain)
-
-        update_progress(str(tenant.id), "starting", "in_progress", "Initializing...")
 
         if not tenant.admin_email or not tenant.admin_password:
             message = "Missing admin credentials"
@@ -380,145 +391,197 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             update_progress(str(tenant.id), "error", "failed", message)
             return {"success": False, "error": message}
 
-        driver = None
-        ps_service = None
-        settings = get_settings()
-        try:
-            batch = None
-            if tenant.batch_id:
-                batch = await db.get(SetupBatch, tenant.batch_id)
+        # Serialize EVERYTHING we need into plain dicts/values
+        tenant_data = {
+            "id": tenant.id,
+            "batch_id": tenant.batch_id,
+            "name": tenant.name,
+            "custom_domain": tenant.custom_domain,
+            "admin_email": tenant.admin_email,
+            "admin_password": tenant.admin_password,
+            "totp_secret": tenant.totp_secret,
+            "microsoft_tenant_id": tenant.microsoft_tenant_id,
+            "onmicrosoft_domain": tenant.onmicrosoft_domain,
+            "licensed_user_upn": tenant.licensed_user_upn,
+            "licensed_user_password": tenant.licensed_user_password,
+            "licensed_user_created": tenant.licensed_user_created,
+            "step6_mailboxes_created": tenant.step6_mailboxes_created or 0,
+            "step6_passwords_set": tenant.step6_passwords_set or 0,
+            "step6_delegations_done": tenant.step6_delegations_done or 0,
+        }
 
-            # BROWSER RETRY LOGIC: Handle browser crashes with retry
-            MAX_BROWSER_RETRIES = 2
-            browser_retry_count = 0
-            login_successful = False
-            
-            while browser_retry_count < MAX_BROWSER_RETRIES and not login_successful:
-                try:
-                    browser_retry_count += 1
-                    # Step 1: Selenium login to Admin Portal
-                    update_progress(str(tenant.id), "login", "in_progress", 
-                        f"Logging into M365 Admin Portal... (attempt {browser_retry_count}/{MAX_BROWSER_RETRIES})")
-                    
-                    # Clean up any existing driver before creating new one
+        batch = None
+        if tenant.batch_id:
+            batch = await db.get(SetupBatch, tenant.batch_id)
+        if batch:
+            batch_data = {
+                "persona_first_name": batch.persona_first_name,
+                "persona_last_name": batch.persona_last_name,
+                "custom_mailbox_map": batch.custom_mailbox_map,
+            }
+
+        # Load existing mailboxes into plain dicts
+        existing_mailbox_result = await db.execute(
+            select(Mailbox).where(Mailbox.tenant_id == tenant.id)
+        )
+        existing_mailboxes = existing_mailbox_result.scalars().all()
+        mailbox_list = [
+            {
+                "id": mb.id,
+                "email": mb.email,
+                "local_part": mb.local_part,
+                "display_name": mb.display_name,
+                "password": mb.password,
+                "created_in_exchange": mb.created_in_exchange,
+                "password_set": mb.password_set,
+                "delegated": mb.delegated,
+                "upn_fixed": getattr(mb, 'upn_fixed', False),
+            }
+            for mb in existing_mailboxes
+        ]
+    # ================================================================
+    # DB session CLOSED here — safe for long Selenium/PowerShell operations
+    # ================================================================
+
+    tid_str = str(tenant_data["id"])
+    domain = tenant_data["custom_domain"]
+    update_progress(tid_str, "starting", "in_progress", "Initializing...")
+
+    driver = None
+    ps_service = None
+    settings = get_settings()
+    try:
+
+        # ================================================================
+        # PHASE B: Selenium login + Licensed user creation
+        # ================================================================
+        MAX_BROWSER_RETRIES = 2
+        browser_retry_count = 0
+        login_successful = False
+        
+        while browser_retry_count < MAX_BROWSER_RETRIES and not login_successful:
+            try:
+                browser_retry_count += 1
+                update_progress(tid_str, "login", "in_progress",
+                    f"Logging into M365 Admin Portal... (attempt {browser_retry_count}/{MAX_BROWSER_RETRIES})")
+                
+                if driver:
+                    try:
+                        cleanup_driver(driver)
+                    except Exception:
+                        pass
+                    driver = None
+                
+                driver = create_driver(headless=settings.step6_headless)
+                _login_with_mfa(
+                    driver=driver,
+                    admin_email=tenant_data["admin_email"],
+                    admin_password=tenant_data["admin_password"],
+                    totp_secret=tenant_data["totp_secret"],
+                    domain=domain,
+                )
+                login_successful = True
+                update_progress(tid_str, "login", "complete", "Logged in successfully")
+                
+            except Exception as browser_error:
+                error_str = str(browser_error)
+                is_connection_error = (
+                    "HTTPConnectionPool" in error_str or
+                    "NewConnectionError" in error_str or
+                    "target machine actively refused" in error_str or
+                    "session" in error_str.lower() and "delete" in error_str.lower()
+                )
+                
+                if is_connection_error and browser_retry_count < MAX_BROWSER_RETRIES:
+                    logger.warning(
+                        "[%s] Browser connection error (attempt %s/%s): %s - retrying in 5 seconds...",
+                        domain, browser_retry_count, MAX_BROWSER_RETRIES, error_str[:100]
+                    )
                     if driver:
                         try:
                             cleanup_driver(driver)
                         except Exception:
                             pass
                         driver = None
-                    
-                    driver = create_driver(headless=settings.step6_headless)
-                    _login_with_mfa(
-                        driver=driver,
-                        admin_email=tenant.admin_email,
-                        admin_password=tenant.admin_password,
-                        totp_secret=tenant.totp_secret,
-                        domain=tenant.custom_domain,
-                    )
-                    login_successful = True
-                    update_progress(str(tenant.id), "login", "complete", "Logged in successfully")
-                    
-                except Exception as browser_error:
-                    error_str = str(browser_error)
-                    is_connection_error = (
-                        "HTTPConnectionPool" in error_str or 
-                        "NewConnectionError" in error_str or
-                        "target machine actively refused" in error_str or
-                        "session" in error_str.lower() and "delete" in error_str.lower()
-                    )
-                    
-                    if is_connection_error and browser_retry_count < MAX_BROWSER_RETRIES:
-                        logger.warning(
-                            "[%s] Browser connection error (attempt %s/%s): %s - retrying in 5 seconds...",
-                            tenant.custom_domain, browser_retry_count, MAX_BROWSER_RETRIES, error_str[:100]
-                        )
-                        # Clean up crashed driver
-                        if driver:
-                            try:
-                                cleanup_driver(driver)
-                            except Exception:
-                                pass
-                            driver = None
-                        await asyncio.sleep(5)
-                    else:
-                        # Not a connection error or out of retries
-                        raise
-            
-            if not login_successful:
-                raise Exception(f"Failed to login after {MAX_BROWSER_RETRIES} attempts")
+                    await asyncio.sleep(5)
+                else:
+                    raise
+        
+        if not login_successful:
+            raise Exception(f"Failed to login after {MAX_BROWSER_RETRIES} attempts")
 
-            # Step 2 + 3: Selenium create licensed user + assign license
-            update_progress(
-                str(tenant.id),
-                "licensed_user",
-                "in_progress",
-                "Creating licensed user in M365 Admin UI",
+        # Step 2 + 3: Selenium create licensed user + assign license
+        update_progress(tid_str, "licensed_user", "in_progress", "Creating licensed user in M365 Admin UI")
+        user_ops = UserOpsSelenium(driver, domain)
+
+        licensed_user = None
+        if tenant_data["licensed_user_created"] and tenant_data["licensed_user_upn"]:
+            licensed_user = {
+                "success": True,
+                "email": tenant_data["licensed_user_upn"],
+                "password": tenant_data["licensed_user_password"],
+                "skipped": True,
+            }
+        else:
+            licensed_user = user_ops.create_licensed_user(
+                username="me1",
+                display_name="me1",
+                password=tenant_data["licensed_user_password"] or "#Sendemails1",
+                custom_domain=domain,
             )
-            user_ops = UserOpsSelenium(driver, tenant.custom_domain)
+            if not licensed_user.get("success"):
+                raise Exception(licensed_user.get("error") or "Failed to create licensed user")
 
-            licensed_user = None
-            if tenant.licensed_user_created and tenant.licensed_user_upn:
-                licensed_user = {
-                    "success": True,
-                    "email": tenant.licensed_user_upn,
-                    "password": tenant.licensed_user_password,
-                    "skipped": True,
-                }
-            else:
-                licensed_user = user_ops.create_licensed_user(
-                    username="me1",
-                    display_name="me1",
-                    password=tenant.licensed_user_password or "#Sendemails1",
-                    custom_domain=tenant.custom_domain,
-                )
-                if not licensed_user.get("success"):
-                    raise Exception(licensed_user.get("error") or "Failed to create licensed user")
+            # Save licensed user immediately with fresh session
+            async with BackgroundSessionLocal() as save_db:
+                t = await save_db.get(Tenant, tenant_data["id"])
+                if t:
+                    t.licensed_user_created = True
+                    t.licensed_user_upn = f"me1@{domain}"
+                    t.licensed_user_password = licensed_user.get("password")
+                    await save_db.commit()
+            # Update local data
+            tenant_data["licensed_user_created"] = True
+            tenant_data["licensed_user_upn"] = f"me1@{domain}"
+            tenant_data["licensed_user_password"] = licensed_user.get("password")
 
-                tenant.licensed_user_created = True
-                tenant.licensed_user_upn = f"me1@{tenant.custom_domain}"
-                tenant.licensed_user_password = licensed_user.get("password")
-                await db.commit()
+        update_progress(tid_str, "licensed_user", "complete", f"Licensed user ready: {licensed_user.get('email')}")
 
-            update_progress(
-                str(tenant.id),
-                "licensed_user",
-                "complete",
-                f"Licensed user ready: {licensed_user.get('email')}",
-            )
+        delegate_to = f"me1@{domain}"
+        tenant_data["licensed_user_upn"] = delegate_to
+        if licensed_user.get("password"):
+            tenant_data["licensed_user_password"] = licensed_user.get("password")
+        
+        # Save delegate_to with fresh session
+        async with BackgroundSessionLocal() as save_db:
+            t = await save_db.get(Tenant, tenant_data["id"])
+            if t:
+                t.licensed_user_upn = delegate_to
+                if licensed_user.get("password"):
+                    t.licensed_user_password = licensed_user.get("password")
+                await save_db.commit()
 
-            delegate_to = f"me1@{tenant.custom_domain}"
-            tenant.licensed_user_upn = delegate_to
-            if licensed_user.get("password"):
-                tenant.licensed_user_password = licensed_user.get("password")
-            await db.commit()
+        # ================================================================
+        # PHASE C: Generate mailboxes in DB if needed (quick fresh session)
+        # ================================================================
+        update_progress(tid_str, "generate_emails", "in_progress", "Generating email variations")
 
-            # Step 4: Generate mailboxes in DB (or use custom CSV emails)
-            update_progress(
-                str(tenant.id),
-                "generate_emails",
-                "in_progress",
-                "Generating email variations",
-            )
-            persona_display_name = None
-            if batch:
-                persona_display_name = f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
-            if not persona_display_name:
-                raise Exception("Missing persona display name for mailbox generation")
+        persona_display_name = None
+        if batch_data:
+            persona_display_name = f"{batch_data['persona_first_name'] or ''} {batch_data['persona_last_name'] or ''}".strip()
+        if not persona_display_name:
+            raise Exception("Missing persona display name for mailbox generation")
 
+        if not mailbox_list:
+            # Need to generate mailboxes
             # CHECK FOR CUSTOM MAILBOX MAP (CSV-imported emails for this domain)
             custom_emails_for_domain = None
-            if batch and batch.custom_mailbox_map:
-                domain_key = tenant.custom_domain.lower() if tenant.custom_domain else ""
-                custom_emails_for_domain = batch.custom_mailbox_map.get(domain_key)
+            if batch_data and batch_data.get("custom_mailbox_map"):
+                domain_key = domain.lower()
+                custom_emails_for_domain = batch_data["custom_mailbox_map"].get(domain_key)
 
             if custom_emails_for_domain:
-                # USE CUSTOM EMAILS from uploaded CSV
-                logger.info(
-                    "[%s] Using %d custom email addresses from CSV (instead of auto-generated)",
-                    tenant.custom_domain,
-                    len(custom_emails_for_domain),
-                )
+                logger.info("[%s] Using %d custom email addresses from CSV", domain, len(custom_emails_for_domain))
                 from app.services.email_generator import MAILBOX_PASSWORD
                 mailbox_data = []
                 for entry in custom_emails_for_domain:
@@ -529,663 +592,470 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                     display_name_val = entry.get("display_name", "").strip() or persona_display_name
                     password_val = entry.get("password", "").strip() or MAILBOX_PASSWORD
                     mailbox_data.append({
-                        "email": email,
-                        "local_part": local_part,
-                        "display_name": display_name_val,
-                        "password": password_val,
+                        "email": email, "local_part": local_part,
+                        "display_name": display_name_val, "password": password_val,
                     })
                 if not mailbox_data:
-                    logger.warning(
-                        "[%s] Custom mailbox map had entries but none were valid - falling back to auto-generate",
-                        tenant.custom_domain,
-                    )
+                    logger.warning("[%s] Custom mailbox map had no valid entries - falling back to auto-generate", domain)
                     mailbox_data = generate_emails_for_domain(
-                        display_name=persona_display_name,
-                        domain=tenant.custom_domain,
-                        count=50,
+                        display_name=persona_display_name, domain=domain, count=50,
                     )
             else:
-                # AUTO-GENERATE emails (original behavior)
                 mailbox_data = generate_emails_for_domain(
-                    display_name=persona_display_name,
-                    domain=tenant.custom_domain,
-                    count=50,
+                    display_name=persona_display_name, domain=domain, count=50,
                 )
 
-            existing_mailbox_result = await db.execute(
-                select(Mailbox).where(Mailbox.tenant_id == tenant.id)
-            )
-            existing_mailboxes = existing_mailbox_result.scalars().all()
-
-            if existing_mailboxes:
-                mailboxes = existing_mailboxes
-            else:
-                mailboxes = []
+            # Save new mailboxes with fresh session
+            async with BackgroundSessionLocal() as gen_db:
                 for mb in mailbox_data:
                     mailbox = Mailbox(
-                        email=mb["email"],
-                        local_part=mb["local_part"],
-                        display_name=mb["display_name"],
-                        password=mb["password"],
-                        tenant_id=tenant.id,
-                        batch_id=tenant.batch_id,
-                        status=MailboxStatus.PENDING,
-                        warmup_stage="none",
+                        email=mb["email"], local_part=mb["local_part"],
+                        display_name=mb["display_name"], password=mb["password"],
+                        tenant_id=tenant_data["id"], batch_id=tenant_data["batch_id"],
+                        status=MailboxStatus.PENDING, warmup_stage="none",
                     )
-                    db.add(mailbox)
-                    mailboxes.append(mailbox)
-                await db.commit()
+                    gen_db.add(mailbox)
+                await gen_db.commit()
 
-            update_progress(
-                str(tenant.id),
-                "generate_emails",
-                "complete",
-                f"Generated {len(mailboxes)} mailboxes",
-            )
-
-            mailbox_data_payload = [
-                {
-                    "email": mailbox.email,
-                    "display_name": mailbox.display_name,
-                    "password": mailbox.password,
-                }
-                for mailbox in mailboxes
-            ]
-
-            mailboxes_by_email = {mailbox.email: mailbox for mailbox in mailboxes}
-            all_created = all(mb.created_in_exchange for mb in mailboxes) if mailboxes else False
-            all_delegated = all(mb.delegated for mb in mailboxes) if mailboxes else False
-            all_passwords_set = all(mb.password_set for mb in mailboxes) if mailboxes else False
-
-            async def connect_powershell_with_retry(service: PowerShellExchangeService, max_attempts: int = 2) -> bool:
-                for attempt in range(1, max_attempts + 1):
-                    try:
-                        logger.info(
-                            "[%s] PowerShell connect attempt %s/%s",
-                            tenant.custom_domain,
-                            attempt,
-                            max_attempts,
-                        )
-                        connected = await service.connect()
-                        if connected:
-                            return True
-                    except Exception as exc:
-                        logger.warning(
-                            "[%s] PowerShell connect attempt %s failed: %s",
-                            tenant.custom_domain,
-                            attempt,
-                            exc,
-                        )
-                    try:
-                        await service.disconnect()
-                    except Exception:
-                        pass
-                    if attempt < max_attempts:
-                        await asyncio.sleep(5)
-                return False
-
-            async def run_with_powershell_retry(operation_name: str, operation):
-                last_error = None
-                for attempt in range(1, 3):
-                    try:
-                        logger.info(
-                            "[%s] %s attempt %s/2",
-                            tenant.custom_domain,
-                            operation_name,
-                            attempt,
-                        )
-                        return await operation()
-                    except Exception as exc:
-                        last_error = exc
-                        logger.warning(
-                            "[%s] %s attempt %s failed: %s",
-                            tenant.custom_domain,
-                            operation_name,
-                            attempt,
-                            exc,
-                        )
-                        if ps_service:
-                            try:
-                                await ps_service.disconnect()
-                            except Exception:
-                                pass
-                        if attempt < 2 and ps_service:
-                            connected = await connect_powershell_with_retry(ps_service)
-                            if not connected:
-                                break
-                if last_error:
-                    raise last_error
-
-            if needs_powershell:
-                # CRITICAL: Verify browser is alive before PowerShell device code auth
-                if not is_browser_alive(driver):
-                    logger.warning("[%s] Browser died - creating fresh Chrome instance before PowerShell", tenant.custom_domain)
-                    try:
-                        cleanup_driver(driver)
-                    except Exception:
-                        pass
-                    driver = create_driver(headless=settings.step6_headless)
-                    if driver is None:
-                        raise Exception("Failed to create fresh Chrome browser for PowerShell auth")
-                    _login_with_mfa(
-                        driver=driver,
-                        admin_email=tenant.admin_email,
-                        admin_password=tenant.admin_password,
-                        totp_secret=tenant.totp_secret,
-                        domain=tenant.custom_domain,
-                    )
-                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
-                    logger.info("[%s] Fresh Chrome instance created successfully for PowerShell", tenant.custom_domain)
-
-                ps_service = PowerShellExchangeService(
-                    driver=driver,
-                    admin_email=tenant.admin_email,
-                    admin_password=tenant.admin_password,
-                    totp_secret=tenant.totp_secret,
+                # Reload to get IDs
+                result = await gen_db.execute(
+                    select(Mailbox).where(Mailbox.tenant_id == tenant_data["id"])
                 )
-                connected = await connect_powershell_with_retry(ps_service)
-                if not connected:
-                    raise Exception("Failed to connect to Exchange Online")
-                logger.info("[%s] PowerShell connected - stabilizing browser session before continuing...", tenant.custom_domain)
-                await asyncio.sleep(5)
+                existing = result.scalars().all()
+                mailbox_list = [
+                    {
+                        "id": mb.id, "email": mb.email, "local_part": mb.local_part,
+                        "display_name": mb.display_name, "password": mb.password,
+                        "created_in_exchange": mb.created_in_exchange,
+                        "password_set": mb.password_set, "delegated": mb.delegated,
+                        "upn_fixed": getattr(mb, 'upn_fixed', False),
+                    }
+                    for mb in existing
+                ]
 
-            # ========================================
-            # PHASE 1: PowerShell - Create, fix names, delegate
-            # ========================================
-            powershell_succeeded = False
+        update_progress(tid_str, "generate_emails", "complete", f"Generated {len(mailbox_list)} mailboxes")
 
-            if not needs_powershell:
-                logger.info(
-                    "[%s] Mailboxes already created & delegated, skipping PowerShell",
-                    tenant.custom_domain,
-                )
-                update_progress(
-                    str(tenant.id),
-                    "create_mailboxes",
-                    "complete",
-                    "Mailboxes already created & delegated",
-                )
-                powershell_succeeded = True
-            else:
+        # Build payload for PowerShell from plain dicts
+        mailbox_data_payload = [
+            {"email": mb["email"], "display_name": mb["display_name"], "password": mb["password"]}
+            for mb in mailbox_list
+        ]
+
+        async def connect_powershell_with_retry(service: PowerShellExchangeService, max_attempts: int = 2) -> bool:
+            for attempt in range(1, max_attempts + 1):
                 try:
-                    logger.info("[%s] === PHASE 1: PowerShell STARTING ===", tenant.custom_domain)
-                    logger.info("[%s] Phase 1: PowerShell operations", str(tenant.id)[:8])
-                    update_progress(
-                        str(tenant.id),
-                        "create_mailboxes",
-                        "in_progress",
-                        "Creating shared mailboxes via PowerShell",
-                    )
-
-                    # SMART PROCESSING: Always send all mailboxes to PowerShell
-                    # PowerShell now does Get-Mailbox check first, so sending all is safe
-                    # EXISTS results will be treated as success and DB will be updated
-                    mailboxes_to_process = mailbox_data_payload
-                    
-                    logger.info("[%s] Processing %s mailboxes (PowerShell will check existence first)", 
-                                tenant.custom_domain, len(mailboxes_to_process))
-
-                    try:
-                        ps_results = await run_with_powershell_retry(
-                            "PowerShell mailbox creation",
-                            lambda: ps_service.create_shared_mailboxes(
-                                mailboxes=mailboxes_to_process,
-                                delegate_to=delegate_to,
-                            ),
-                        )
-
-                        created_count = sum(
-                            1 for mb in mailboxes if (mb.created_in_exchange or mb.email in ps_results["created"])
-                        )
-                        delegated_count = sum(
-                            1 for mb in mailboxes if (mb.delegated or mb.email in ps_results["delegated"])
-                        )
-                        upn_fixed_count = sum(
-                            1
-                            for mb in mailboxes
-                            if (getattr(mb, "upn_fixed", False) or mb.email in ps_results.get("upns_fixed", []))
-                        )
-                        tenant.step6_mailboxes_created = created_count
-                        tenant.step6_display_names_fixed = created_count
-                        tenant.step6_delegations_done = delegated_count
-                        tenant.step6_upns_fixed = upn_fixed_count
-
-                        logger.info("[%s] Saving PowerShell progress to database...", tenant.custom_domain)
-                        logger.info(
-                            "[%s] PowerShell flags: mailboxes=%s delegations=%s upns=%s",
-                            tenant.custom_domain,
-                            tenant.step6_mailboxes_created,
-                            tenant.step6_delegations_done,
-                            tenant.step6_upns_fixed,
-                        )
-
-                        async def _save_powershell_progress(fresh_db):
-                            tenant_to_update = await fresh_db.get(Tenant, tenant.id)
-                            if tenant_to_update:
-                                tenant_to_update.step6_mailboxes_created = created_count
-                                tenant_to_update.step6_display_names_fixed = created_count
-                                tenant_to_update.step6_delegations_done = delegated_count
-                                tenant_to_update.step6_upns_fixed = upn_fixed_count
-
-                            for email in ps_results["created"]:
-                                await fresh_db.execute(
-                                    update(Mailbox)
-                                    .where(Mailbox.email == email)
-                                    .values(
-                                        created_in_exchange=True,
-                                        display_name_fixed=True,
-                                    )
-                                )
-
-                            for email in ps_results["delegated"]:
-                                await fresh_db.execute(
-                                    update(Mailbox)
-                                    .where(Mailbox.email == email)
-                                    .values(delegated=True)
-                                )
-
-                            for email in ps_results.get("upns_fixed", []):
-                                await fresh_db.execute(
-                                    update(Mailbox)
-                                    .where(Mailbox.email == email)
-                                    .values(upn_fixed=True)
-                                )
-
-                        await save_to_db_with_retry(
-                            _save_powershell_progress,
-                            description=f"{tenant.custom_domain} powershell progress",
-                        )
-                        logger.info(
-                            "[%s] PowerShell progress SAVED with fresh connection: mailboxes=%s, delegations=%s, upns=%s",
-                            tenant.custom_domain,
-                            tenant.step6_mailboxes_created,
-                            tenant.step6_delegations_done,
-                            tenant.step6_upns_fixed,
-                        )
-
-                        # FIXED: Check actual DB state instead of ps_results["created"] count
-                        # This ensures Phase 2 runs even if mailboxes were created in a previous run
-                        async with BackgroundSessionLocal() as check_db:
-                            ps_created_count = await check_db.scalar(
-                                select(func.count(Mailbox.id)).where(
-                                    Mailbox.tenant_id == tenant.id,
-                                    Mailbox.created_in_exchange == True,
-                                )
-                            ) or 0
-                            ps_delegated_count = await check_db.scalar(
-                                select(func.count(Mailbox.id)).where(
-                                    Mailbox.tenant_id == tenant.id,
-                                    Mailbox.delegated == True,
-                                )
-                            ) or 0
-                            
-                            # EXISTS counts as created, so threshold should be met on retry
-                            # Use 90% threshold to allow for a few genuine failures
-                            ps_threshold = int(len(mailboxes) * 0.9)
-                            powershell_succeeded = (
-                                ps_created_count >= ps_threshold and 
-                                ps_delegated_count >= ps_threshold
-                            )
-                            if not powershell_succeeded:
-                                logger.warning(
-                                    "[%s] PowerShell below threshold: created=%s/%s, delegated=%s/%s (threshold=%s)",
-                                    tenant.custom_domain, ps_created_count, len(mailboxes),
-                                    ps_delegated_count, len(mailboxes), ps_threshold
-                                )
-                            logger.info(
-                                "[%s] PowerShell phase check: created=%s, delegated=%s, threshold=%s, succeeded=%s",
-                                tenant.custom_domain,
-                                ps_created_count,
-                                ps_delegated_count,
-                                ps_threshold,
-                                powershell_succeeded,
-                            )
-                        
-                        logger.info(
-                            "[%s] === PHASE 1: PowerShell DONE (success=%s) ===",
-                            tenant.custom_domain,
-                            powershell_succeeded,
-                        )
-
-                        update_progress(
-                            str(tenant.id),
-                            "create_mailboxes",
-                            "complete",
-                            f"Created {len(ps_results['created'])} mailboxes",
-                        )
-                    finally:
-                        pass
-                except Exception as e:
-                    logger.error("[%s] PHASE 1 FAILED: %s", tenant.custom_domain, e)
-                    import traceback
-
-                    logger.error(traceback.format_exc())
-                    raise
-
-            # ========================================
-            # PHASE 2: Admin UI (Selenium) - Set passwords, enable accounts
-            # ========================================
-            if not powershell_succeeded:
-                logger.info(
-                    "[%s] Phase 2: Skipped Admin UI - PowerShell did not succeed",
-                    tenant.custom_domain,
-                )
-                update_progress(
-                    str(tenant.id),
-                    "set_passwords",
-                    "complete",
-                    "Skipped Admin UI - PowerShell not successful",
-                )
-            else:
-                # PROACTIVE BROWSER HEALTH CHECK before Phase 2
-                # Phase 1 PowerShell can take 5-15+ minutes, during which the
-                # Chrome browser may become unresponsive or crash from memory
-                # pressure.  Detect and replace it BEFORE Phase 2 starts so we
-                # don't waste time on a doomed attempt.
-                if not is_browser_alive(driver):
-                    logger.warning(
-                        "[%s] Browser died after Phase 1 - creating fresh Chrome instance for Phase 2",
-                        tenant.custom_domain,
-                    )
-                    try:
-                        cleanup_driver(driver)
-                    except Exception:
-                        pass
-                    driver = create_driver(headless=settings.step6_headless)
-                    if driver is None:
-                        raise Exception("Failed to create fresh Chrome browser for Phase 2")
-                    _login_with_mfa(
-                        driver=driver,
-                        admin_email=tenant.admin_email,
-                        admin_password=tenant.admin_password,
-                        totp_secret=tenant.totp_secret,
-                        domain=tenant.custom_domain,
-                    )
-                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
-                    logger.info("[%s] Fresh Chrome instance created for Phase 2", tenant.custom_domain)
-
+                    logger.info("[%s] PowerShell connect attempt %s/%s", domain, attempt, max_attempts)
+                    connected = await service.connect()
+                    if connected:
+                        return True
+                except Exception as exc:
+                    logger.warning("[%s] PowerShell connect attempt %s failed: %s", domain, attempt, exc)
                 try:
-                    if not needs_admin_ui:
-                        logger.info(
-                            "[%s] Passwords already set, skipping Admin UI",
-                            tenant.custom_domain,
-                        )
-                        update_progress(
-                            str(tenant.id),
-                            "set_passwords",
-                            "complete",
-                            "Passwords already set",
-                        )
-                    else:
-                        logger.info(
-                            "[%s] === PHASE 2: Admin UI STARTING ===",
-                            tenant.custom_domain,
-                        )
-                        logger.info(
-                            "[%s] Phase 2: Admin UI operations",
-                            str(tenant.id)[:8],
-                        )
-                        logger.info("[%s] passwords_set=%s", tenant.custom_domain, tenant.step6_passwords_set)
-                        update_progress(
-                            str(tenant.id),
-                            "set_passwords",
-                            "in_progress",
-                            "Setting passwords via Admin UI",
-                        )
-
-                        # BROWSER RETRY LOGIC for Admin UI phase
-                        admin_ui_results = None
-                        admin_ui_retry_count = 0
-                        MAX_ADMIN_UI_RETRIES = 2
-                        
-                        while admin_ui_retry_count < MAX_ADMIN_UI_RETRIES and admin_ui_results is None:
-                            try:
-                                admin_ui_retry_count += 1
-                                if admin_ui_retry_count > 1:
-                                    update_progress(str(tenant.id), "set_passwords", "in_progress", 
-                                        f"Retrying Admin UI (attempt {admin_ui_retry_count}/{MAX_ADMIN_UI_RETRIES})")
-                                    
-                                    # Recreate browser if crashed
-                                    if driver:
-                                        try:
-                                            cleanup_driver(driver)
-                                        except Exception:
-                                            pass
-                                        driver = None
-                                    
-                                    driver = create_driver(headless=settings.step6_headless)
-                                    _login_with_mfa(
-                                        driver=driver,
-                                        admin_email=tenant.admin_email,
-                                        admin_password=tenant.admin_password,
-                                        totp_secret=tenant.totp_secret,
-                                        domain=tenant.custom_domain,
-                                    )
-                                    user_ops = UserOpsSelenium(driver, tenant.custom_domain)
-                                
-                                admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
-                                    password="#Sendemails1",
-                                    exclude_users=[f"me1@{tenant.custom_domain}"],
-                                    expected_count=len(mailboxes),
-                                )
-                            except Exception as admin_ui_error:
-                                error_str = str(admin_ui_error)
-                                is_connection_error = (
-                                    "HTTPConnectionPool" in error_str or 
-                                    "NewConnectionError" in error_str or
-                                    "target machine actively refused" in error_str or
-                                    "session" in error_str.lower() and "delete" in error_str.lower()
-                                )
-                                
-                                if is_connection_error and admin_ui_retry_count < MAX_ADMIN_UI_RETRIES:
-                                    logger.warning(
-                                        "[%s] Admin UI browser error (attempt %s/%s): %s - retrying...",
-                                        tenant.custom_domain, admin_ui_retry_count, MAX_ADMIN_UI_RETRIES, error_str[:100]
-                                    )
-                                    await asyncio.sleep(5)
-                                else:
-                                    raise
-                        
-                        if admin_ui_results is None:
-                            raise Exception(f"Admin UI failed after {MAX_ADMIN_UI_RETRIES} attempts")
-
-                        if admin_ui_results.get("errors"):
-                            logger.warning(
-                                "[%s] Admin UI errors: %s",
-                                tenant.custom_domain,
-                                "; ".join(admin_ui_results["errors"]),
-                            )
-
-                        password_set_count = admin_ui_results.get("passwords_set", 0)
-                        accounts_enabled_count = admin_ui_results.get("accounts_enabled", 0)
-                        tenant.step6_passwords_set = password_set_count
-                        tenant.step6_accounts_enabled = accounts_enabled_count
-
-                        logger.info(
-                            "[%s] Saving Admin UI progress to database...",
-                            tenant.custom_domain,
-                        )
-
-                        async def _save_admin_ui_progress(fresh_db):
-                            tenant_to_update = await fresh_db.get(Tenant, tenant.id)
-                            if tenant_to_update:
-                                tenant_to_update.step6_passwords_set = password_set_count
-                                tenant_to_update.step6_accounts_enabled = accounts_enabled_count
-
-                            # CRITICAL FIX: Always mark mailboxes with password_set and update to #Sendemails1
-                            # Since we always attempt to set #Sendemails1 in M365 via bulk UI,
-                            # and mailboxes are now generated with #Sendemails1 from the start,
-                            # we should always mark them as set when Admin UI completes
-                            # (Even if count is lower than expected, the ones that worked are set correctly)
-                            total_mailbox_count = len(mailboxes)
-                            
-                            if password_set_count > 0:
-                                logger.info(
-                                    "[%s] Marking all %s mailboxes as password_set=True (Admin UI reported %s successes)",
-                                    tenant.custom_domain,
-                                    total_mailbox_count,
-                                    password_set_count,
-                                )
-                                # Update ALL mailboxes - the password was already #Sendemails1 from generation
-                                # This ensures DB always matches M365 reality
-                                await fresh_db.execute(
-                                    update(Mailbox)
-                                    .where(Mailbox.tenant_id == tenant.id)
-                                    .values(
-                                        password_set=True,
-                                        account_enabled=True,
-                                        password="#Sendemails1",  # Ensure DB password matches M365
-                                    )
-                                )
-                            else:
-                                logger.warning(
-                                    "[%s] Admin UI reported 0 passwords set - mailboxes still have password=#Sendemails1 from generation",
-                                    tenant.custom_domain,
-                                )
-
-                        await save_to_db_with_retry(
-                            _save_admin_ui_progress,
-                            description=f"{tenant.custom_domain} admin UI progress",
-                        )
-                        logger.info(
-                            "[%s] Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
-                            tenant.custom_domain,
-                            password_set_count,
-                            accounts_enabled_count,
-                        )
-                        logger.info(
-                            "[%s] === PHASE 2: Admin UI DONE ===",
-                            tenant.custom_domain,
-                        )
-                except Exception as e:
-                    logger.error("[%s] PHASE 2 FAILED: %s", tenant.custom_domain, e)
-                    import traceback
-
-                    logger.error(traceback.format_exc())
-                    raise
-
-            # ========================================
-            # Completion check (use DB mailbox state to avoid stale counts)
-            step6_actually_complete = False
-            missing_items = []
-
-            async def _save_completion_check(fresh_db):
-                nonlocal step6_actually_complete, missing_items
-                total_mailboxes = await fresh_db.scalar(
-                    select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
-                ) or 0
-                created_count = await fresh_db.scalar(
-                    select(func.count(Mailbox.id)).where(
-                        Mailbox.tenant_id == tenant.id,
-                        Mailbox.created_in_exchange == True,
-                    )
-                ) or 0
-                delegated_count = await fresh_db.scalar(
-                    select(func.count(Mailbox.id)).where(
-                        Mailbox.tenant_id == tenant.id,
-                        Mailbox.delegated == True,
-                    )
-                ) or 0
-                passwords_set_count = await fresh_db.scalar(
-                    select(func.count(Mailbox.id)).where(
-                        Mailbox.tenant_id == tenant.id,
-                        Mailbox.password_set == True,
-                    )
-                ) or 0
-
-                tenant_to_update = await fresh_db.get(Tenant, tenant.id)
-                if tenant_to_update:
-                    tenant_to_update.step6_mailboxes_created = max(
-                        tenant_to_update.step6_mailboxes_created or 0,
-                        created_count,
-                    )
-                    tenant_to_update.step6_delegations_done = max(
-                        tenant_to_update.step6_delegations_done or 0,
-                        delegated_count,
-                    )
-                    tenant_to_update.step6_passwords_set = max(
-                        tenant_to_update.step6_passwords_set or 0,
-                        passwords_set_count,
-                    )
-
-                    # CRITICAL FIX: Require BOTH delegation AND passwords for completion
-                    # Previously used OR which allowed marking complete with just delegations
-                    completion_threshold = 0.9
-                    if total_mailboxes > 0:
-                        has_mailboxes = created_count >= total_mailboxes * completion_threshold
-                        has_delegation = delegated_count >= total_mailboxes * completion_threshold
-                        has_passwords = passwords_set_count >= total_mailboxes * completion_threshold
-                        
-                        logger.info(
-                            "[%s] Completion check: mailboxes=%s/%s, delegated=%s/%s, passwords=%s/%s (threshold=%s)",
-                            tenant.custom_domain,
-                            created_count, total_mailboxes,
-                            delegated_count, total_mailboxes,
-                            passwords_set_count, total_mailboxes,
-                            completion_threshold,
-                        )
-                        
-                        # MUST have mailboxes AND delegation AND passwords
-                        if has_mailboxes and has_delegation and has_passwords:
-                            tenant_to_update.step6_complete = True
-                            tenant_to_update.step6_completed_at = datetime.utcnow()
-                            tenant_to_update.status = TenantStatus.READY
-                            tenant_to_update.step6_error = None
-                            step6_actually_complete = True
-                            logger.info("[%s] All criteria met - marking Step 6 COMPLETE", tenant.custom_domain)
-                        else:
-                            if not has_mailboxes:
-                                missing_items.append(f"mailboxes ({created_count}/{total_mailboxes})")
-                            if not has_delegation:
-                                missing_items.append(f"delegation ({delegated_count}/{total_mailboxes})")
-                            if not has_passwords:
-                                missing_items.append(f"passwords ({passwords_set_count}/{total_mailboxes})")
-                            error_msg = f"Incomplete - missing: {', '.join(missing_items)}"
-                            tenant_to_update.step6_error = error_msg
-                            logger.warning("[%s] NOT marking complete - missing: %s", tenant.custom_domain, ", ".join(missing_items))
-
-                if tenant_to_update and tenant_to_update.step6_complete:
-                    logger.info(
-                        "[%s] Step 6 COMPLETE for %s",
-                        str(tenant.id)[:8],
-                        tenant.custom_domain,
-                    )
-
-            await save_to_db_with_retry(
-                _save_completion_check,
-                description=f"{tenant.custom_domain} completion check",
-            )
-
-            # CRITICAL FIX: Only report success if step 6 actually completed
-            if step6_actually_complete:
-                update_progress(str(tenant.id), "complete", "complete", "Step 6 complete!")
-                return {"success": True}
-            else:
-                error_detail = f"Step 6 incomplete - missing: {', '.join(missing_items)}" if missing_items else "Step 6 incomplete"
-                update_progress(str(tenant.id), "incomplete", "failed", error_detail)
-                return {"success": False, "error": error_detail}
-        except Exception as exc:
-            message = str(exc)
-            logger.error("[%s] Step 6 failed: %s", tenant.custom_domain, message)
-            try:
-                async def _save_error(db):
-                    tenant_to_update = await db.get(Tenant, tenant.id)
-                    if tenant_to_update:
-                        tenant_to_update.step6_error = message
-                await save_to_db_with_retry(
-                    _save_error,
-                    description=f"{tenant.custom_domain} error save",
-                )
-            except Exception as db_err:
-                logger.error("[%s] CRITICAL: Could not save error to DB either: %s", tenant.custom_domain, db_err)
-            update_progress(str(tenant.id), "error", "failed", message)
-            return {"success": False, "error": message}
-        finally:
-            if ps_service:
-                try:
-                    await ps_service.disconnect()
+                    await service.disconnect()
                 except Exception:
                     pass
-            if driver:
-                cleanup_driver(driver)
+                if attempt < max_attempts:
+                    await asyncio.sleep(5)
+            return False
+
+        async def run_with_powershell_retry(operation_name: str, operation):
+            last_error = None
+            for attempt in range(1, 3):
+                try:
+                    logger.info("[%s] %s attempt %s/2", domain, operation_name, attempt)
+                    return await operation()
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning("[%s] %s attempt %s failed: %s", domain, operation_name, attempt, exc)
+                    if ps_service:
+                        try:
+                            await ps_service.disconnect()
+                        except Exception:
+                            pass
+                    if attempt < 2 and ps_service:
+                        connected = await connect_powershell_with_retry(ps_service)
+                        if not connected:
+                            break
+            if last_error:
+                raise last_error
+
+        # ================================================================
+        # PHASE D: PowerShell mailbox creation + delegation (LONG, 10-30 min, NO DB)
+        # ================================================================
+        if needs_powershell:
+            if not is_browser_alive(driver):
+                logger.warning("[%s] Browser died - creating fresh Chrome instance before PowerShell", domain)
+                try:
+                    cleanup_driver(driver)
+                except Exception:
+                    pass
+                driver = create_driver(headless=settings.step6_headless)
+                if driver is None:
+                    raise Exception("Failed to create fresh Chrome browser for PowerShell auth")
+                _login_with_mfa(
+                    driver=driver,
+                    admin_email=tenant_data["admin_email"],
+                    admin_password=tenant_data["admin_password"],
+                    totp_secret=tenant_data["totp_secret"],
+                    domain=domain,
+                )
+                user_ops = UserOpsSelenium(driver, domain)
+                logger.info("[%s] Fresh Chrome instance created successfully for PowerShell", domain)
+
+            ps_service = PowerShellExchangeService(
+                driver=driver,
+                admin_email=tenant_data["admin_email"],
+                admin_password=tenant_data["admin_password"],
+                totp_secret=tenant_data["totp_secret"],
+            )
+            connected = await connect_powershell_with_retry(ps_service)
+            if not connected:
+                raise Exception("Failed to connect to Exchange Online")
+            logger.info("[%s] PowerShell connected - stabilizing browser session before continuing...", domain)
+            await asyncio.sleep(5)
+
+        # ========================================
+        # PHASE 1: PowerShell - Create, fix names, delegate
+        # ========================================
+        powershell_succeeded = False
+        tenant_id_val = tenant_data["id"]
+
+        if not needs_powershell:
+            logger.info("[%s] Mailboxes already created & delegated, skipping PowerShell", domain)
+            update_progress(tid_str, "create_mailboxes", "complete", "Mailboxes already created & delegated")
+            powershell_succeeded = True
+        else:
+            try:
+                logger.info("[%s] === PHASE 1: PowerShell STARTING ===", domain)
+                logger.info("[%s] Phase 1: PowerShell operations", tid_str[:8])
+                update_progress(tid_str, "create_mailboxes", "in_progress", "Creating shared mailboxes via PowerShell")
+
+                mailboxes_to_process = mailbox_data_payload
+                logger.info("[%s] Processing %s mailboxes (PowerShell will check existence first)",
+                            domain, len(mailboxes_to_process))
+
+                try:
+                    ps_results = await run_with_powershell_retry(
+                        "PowerShell mailbox creation",
+                        lambda: ps_service.create_shared_mailboxes(
+                            mailboxes=mailboxes_to_process,
+                            delegate_to=delegate_to,
+                        ),
+                    )
+
+                    # BUG 6.4 FIX: Count from mailbox_list dicts, not ORM objects
+                    created_count = sum(
+                        1 for mb in mailbox_list if (mb["created_in_exchange"] or mb["email"] in ps_results["created"])
+                    )
+                    delegated_count = sum(
+                        1 for mb in mailbox_list if (mb["delegated"] or mb["email"] in ps_results["delegated"])
+                    )
+                    upn_fixed_count = sum(
+                        1 for mb in mailbox_list
+                        if (mb.get("upn_fixed", False) or mb["email"] in ps_results.get("upns_fixed", []))
+                    )
+
+                    logger.info("[%s] Saving PowerShell progress to database...", domain)
+                    logger.info("[%s] PowerShell flags: mailboxes=%s delegations=%s upns=%s",
+                                domain, created_count, delegated_count, upn_fixed_count)
+
+                    async def _save_powershell_progress(fresh_db):
+                        tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
+                        if tenant_to_update:
+                            tenant_to_update.step6_mailboxes_created = created_count
+                            tenant_to_update.step6_display_names_fixed = created_count
+                            tenant_to_update.step6_delegations_done = delegated_count
+                            tenant_to_update.step6_upns_fixed = upn_fixed_count
+
+                        for email in ps_results["created"]:
+                            await fresh_db.execute(
+                                update(Mailbox).where(Mailbox.email == email)
+                                .values(created_in_exchange=True, display_name_fixed=True)
+                            )
+                        for email in ps_results["delegated"]:
+                            await fresh_db.execute(
+                                update(Mailbox).where(Mailbox.email == email)
+                                .values(delegated=True)
+                            )
+                        for email in ps_results.get("upns_fixed", []):
+                            await fresh_db.execute(
+                                update(Mailbox).where(Mailbox.email == email)
+                                .values(upn_fixed=True)
+                            )
+
+                    await save_to_db_with_retry(
+                        _save_powershell_progress,
+                        description=f"{domain} powershell progress",
+                    )
+                    logger.info("[%s] CHECKPOINT: PowerShell progress SAVED: mailboxes=%s, delegations=%s, upns=%s",
+                                domain, created_count, delegated_count, upn_fixed_count)
+
+                    # BUG 6.4 FIX: Check actual DB state instead of in-memory counters
+                    async with BackgroundSessionLocal() as check_db:
+                        ps_created_count = await check_db.scalar(
+                            select(func.count(Mailbox.id)).where(
+                                Mailbox.tenant_id == tenant_id_val,
+                                Mailbox.created_in_exchange == True,
+                            )
+                        ) or 0
+                        ps_delegated_count = await check_db.scalar(
+                            select(func.count(Mailbox.id)).where(
+                                Mailbox.tenant_id == tenant_id_val,
+                                Mailbox.delegated == True,
+                            )
+                        ) or 0
+
+                        ps_threshold = int(len(mailbox_list) * 0.9)
+                        powershell_succeeded = (
+                            ps_created_count >= ps_threshold and
+                            ps_delegated_count >= ps_threshold
+                        )
+                        if not powershell_succeeded:
+                            logger.warning("[%s] PowerShell below threshold: created=%s/%s, delegated=%s/%s (threshold=%s)",
+                                           domain, ps_created_count, len(mailbox_list),
+                                           ps_delegated_count, len(mailbox_list), ps_threshold)
+                        logger.info("[%s] PowerShell phase check: created=%s, delegated=%s, threshold=%s, succeeded=%s",
+                                    domain, ps_created_count, ps_delegated_count, ps_threshold, powershell_succeeded)
+
+                    logger.info("[%s] === PHASE 1: PowerShell DONE (success=%s) ===", domain, powershell_succeeded)
+                    update_progress(tid_str, "create_mailboxes", "complete",
+                                    f"Created {len(ps_results['created'])} mailboxes")
+                finally:
+                    pass
+            except Exception as e:
+                logger.error("[%s] PHASE 1 FAILED: %s", domain, e)
+                import traceback
+                logger.error(traceback.format_exc())
+                raise
+
+        # ========================================
+        # PHASE 2: Admin UI (Selenium) - Set passwords, enable accounts
+        # ========================================
+        if not powershell_succeeded:
+            logger.info("[%s] Phase 2: Skipped Admin UI - PowerShell did not succeed", domain)
+            update_progress(tid_str, "set_passwords", "complete", "Skipped Admin UI - PowerShell not successful")
+        else:
+            # PROACTIVE BROWSER HEALTH CHECK before Phase 2
+            if not is_browser_alive(driver):
+                logger.warning("[%s] Browser died after Phase 1 - creating fresh Chrome instance for Phase 2", domain)
+                try:
+                    cleanup_driver(driver)
+                except Exception:
+                    pass
+                driver = create_driver(headless=settings.step6_headless)
+                if driver is None:
+                    raise Exception("Failed to create fresh Chrome browser for Phase 2")
+                _login_with_mfa(
+                    driver=driver,
+                    admin_email=tenant_data["admin_email"],
+                    admin_password=tenant_data["admin_password"],
+                    totp_secret=tenant_data["totp_secret"],
+                    domain=domain,
+                )
+                user_ops = UserOpsSelenium(driver, domain)
+                logger.info("[%s] Fresh Chrome instance created for Phase 2", domain)
+
+            try:
+                if not needs_admin_ui:
+                    logger.info("[%s] Passwords already set, skipping Admin UI", domain)
+                    update_progress(tid_str, "set_passwords", "complete", "Passwords already set")
+                else:
+                    logger.info("[%s] === PHASE 2: Admin UI STARTING ===", domain)
+                    logger.info("[%s] Phase 2: Admin UI operations", tid_str[:8])
+                    logger.info("[%s] passwords_set=%s", domain, tenant_data["step6_passwords_set"])
+                    update_progress(tid_str, "set_passwords", "in_progress", "Setting passwords via Admin UI")
+
+                    admin_ui_results = None
+                    admin_ui_retry_count = 0
+                    MAX_ADMIN_UI_RETRIES = 2
+
+                    while admin_ui_retry_count < MAX_ADMIN_UI_RETRIES and admin_ui_results is None:
+                        try:
+                            admin_ui_retry_count += 1
+                            if admin_ui_retry_count > 1:
+                                update_progress(tid_str, "set_passwords", "in_progress",
+                                    f"Retrying Admin UI (attempt {admin_ui_retry_count}/{MAX_ADMIN_UI_RETRIES})")
+                                if driver:
+                                    try:
+                                        cleanup_driver(driver)
+                                    except Exception:
+                                        pass
+                                    driver = None
+                                driver = create_driver(headless=settings.step6_headless)
+                                _login_with_mfa(
+                                    driver=driver,
+                                    admin_email=tenant_data["admin_email"],
+                                    admin_password=tenant_data["admin_password"],
+                                    totp_secret=tenant_data["totp_secret"],
+                                    domain=domain,
+                                )
+                                user_ops = UserOpsSelenium(driver, domain)
+
+                            admin_ui_results = user_ops.set_passwords_and_enable_via_admin_ui(
+                                password="#Sendemails1",
+                                exclude_users=[f"me1@{domain}"],
+                                expected_count=len(mailbox_list),
+                            )
+                        except Exception as admin_ui_error:
+                            error_str = str(admin_ui_error)
+                            is_connection_error = (
+                                "HTTPConnectionPool" in error_str or
+                                "NewConnectionError" in error_str or
+                                "target machine actively refused" in error_str or
+                                "session" in error_str.lower() and "delete" in error_str.lower()
+                            )
+                            if is_connection_error and admin_ui_retry_count < MAX_ADMIN_UI_RETRIES:
+                                logger.warning("[%s] Admin UI browser error (attempt %s/%s): %s - retrying...",
+                                               domain, admin_ui_retry_count, MAX_ADMIN_UI_RETRIES, error_str[:100])
+                                await asyncio.sleep(5)
+                            else:
+                                raise
+
+                    if admin_ui_results is None:
+                        raise Exception(f"Admin UI failed after {MAX_ADMIN_UI_RETRIES} attempts")
+
+                    if admin_ui_results.get("errors"):
+                        logger.warning("[%s] Admin UI errors: %s", domain, "; ".join(admin_ui_results["errors"]))
+
+                    password_set_count = admin_ui_results.get("passwords_set", 0)
+                    accounts_enabled_count = admin_ui_results.get("accounts_enabled", 0)
+
+                    logger.info("[%s] Saving Admin UI progress to database...", domain)
+
+                    async def _save_admin_ui_progress(fresh_db):
+                        tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
+                        if tenant_to_update:
+                            tenant_to_update.step6_passwords_set = password_set_count
+                            tenant_to_update.step6_accounts_enabled = accounts_enabled_count
+
+                        total_mb_count = len(mailbox_list)
+                        if password_set_count > 0:
+                            logger.info("[%s] Marking all %s mailboxes as password_set=True (Admin UI reported %s successes)",
+                                        domain, total_mb_count, password_set_count)
+                            await fresh_db.execute(
+                                update(Mailbox).where(Mailbox.tenant_id == tenant_id_val)
+                                .values(password_set=True, account_enabled=True, password="#Sendemails1")
+                            )
+                        else:
+                            logger.warning("[%s] Admin UI reported 0 passwords set", domain)
+
+                    await save_to_db_with_retry(
+                        _save_admin_ui_progress, description=f"{domain} admin UI progress",
+                    )
+                    logger.info("[%s] CHECKPOINT: Admin UI progress saved: passwords_set=%s, accounts_enabled=%s",
+                                domain, password_set_count, accounts_enabled_count)
+                    logger.info("[%s] === PHASE 2: Admin UI DONE ===", domain)
+            except Exception as e:
+                logger.error("[%s] PHASE 2 FAILED: %s", domain, e)
+                import traceback
+                logger.error(traceback.format_exc())
+                # Don't fail the whole step — mailboxes are created, passwords can be retried
+                logger.warning("[%s] Continuing to completion check despite Phase 2 failure", domain)
+
+        # ========================================
+        # PHASE G: Final completion check (BUG 6.4 FIX: count from actual Mailbox table)
+        # ========================================
+        step6_actually_complete = False
+        missing_items = []
+
+        async def _save_completion_check(fresh_db):
+            nonlocal step6_actually_complete, missing_items
+            # BUG 6.4 FIX: Always count from source of truth (Mailbox table)
+            total_mailboxes = await fresh_db.scalar(
+                select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant_id_val)
+            ) or 0
+            created_count = await fresh_db.scalar(
+                select(func.count(Mailbox.id)).where(
+                    Mailbox.tenant_id == tenant_id_val, Mailbox.created_in_exchange == True,
+                )
+            ) or 0
+            delegated_count = await fresh_db.scalar(
+                select(func.count(Mailbox.id)).where(
+                    Mailbox.tenant_id == tenant_id_val, Mailbox.delegated == True,
+                )
+            ) or 0
+            passwords_set_count = await fresh_db.scalar(
+                select(func.count(Mailbox.id)).where(
+                    Mailbox.tenant_id == tenant_id_val, Mailbox.password_set == True,
+                )
+            ) or 0
+
+            tenant_to_update = await fresh_db.get(Tenant, tenant_id_val)
+            if tenant_to_update:
+                # Update counters from actual DB counts
+                tenant_to_update.step6_mailboxes_created = created_count
+                tenant_to_update.step6_delegations_done = delegated_count
+                tenant_to_update.step6_passwords_set = passwords_set_count
+
+                completion_threshold = 0.9
+                if total_mailboxes > 0:
+                    threshold = total_mailboxes * completion_threshold
+                    has_mailboxes = created_count >= threshold
+                    has_delegation = delegated_count >= threshold
+                    has_passwords = passwords_set_count >= threshold
+
+                    logger.info(
+                        "[%s] Completion check: mailboxes=%s/%s, delegated=%s/%s, passwords=%s/%s (threshold=%.0f)",
+                        domain, created_count, total_mailboxes,
+                        delegated_count, total_mailboxes,
+                        passwords_set_count, total_mailboxes, threshold,
+                    )
+
+                    if has_mailboxes and has_delegation and has_passwords:
+                        tenant_to_update.step6_complete = True
+                        tenant_to_update.step6_completed_at = datetime.utcnow()
+                        tenant_to_update.status = TenantStatus.READY
+                        tenant_to_update.step6_error = None
+                        step6_actually_complete = True
+                        logger.info("[%s] All criteria met - marking Step 6 COMPLETE", domain)
+                    else:
+                        if not has_mailboxes:
+                            missing_items.append(f"mailboxes ({created_count}/{total_mailboxes})")
+                        if not has_delegation:
+                            missing_items.append(f"delegation ({delegated_count}/{total_mailboxes})")
+                        if not has_passwords:
+                            missing_items.append(f"passwords ({passwords_set_count}/{total_mailboxes})")
+                        error_msg = f"Incomplete - missing: {', '.join(missing_items)}"
+                        tenant_to_update.step6_error = error_msg
+                        logger.warning("[%s] NOT marking complete - missing: %s", domain, ", ".join(missing_items))
+
+            if tenant_to_update and tenant_to_update.step6_complete:
+                logger.info("[%s] Step 6 COMPLETE for %s", tid_str[:8], domain)
+
+        await save_to_db_with_retry(
+            _save_completion_check, description=f"{domain} completion check",
+        )
+
+        logger.info("[%s] FINAL: complete=%s", domain, step6_actually_complete)
+
+        if step6_actually_complete:
+            update_progress(tid_str, "complete", "complete", "Step 6 complete!")
+            return {"success": True}
+        else:
+            error_detail = f"Step 6 incomplete - missing: {', '.join(missing_items)}" if missing_items else "Step 6 incomplete"
+            update_progress(tid_str, "incomplete", "failed", error_detail)
+            return {"success": False, "error": error_detail}
+    except Exception as exc:
+        message = str(exc)
+        logger.error("[%s] Step 6 failed: %s", domain, message)
+        try:
+            async def _save_error(err_db):
+                tenant_to_update = await err_db.get(Tenant, tenant_data["id"])
+                if tenant_to_update:
+                    tenant_to_update.step6_error = message
+            await save_to_db_with_retry(
+                _save_error, description=f"{domain} error save",
+            )
+        except Exception as db_err:
+            logger.error("[%s] CRITICAL: Could not save error to DB either: %s", domain, db_err)
+        update_progress(tid_str, "error", "failed", message)
+        return {"success": False, "error": message}
+    finally:
+        if ps_service:
+            try:
+                await ps_service.disconnect()
+            except Exception:
+                pass
+        if driver:
+            cleanup_driver(driver)
 
