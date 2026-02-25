@@ -33,10 +33,24 @@ interface LookupResponse {
 interface SyncResponse {
   total_checked: number;
   updated_links: number;
+  already_linked: number;
+  no_tenant_match: number;
+  not_in_db: number;
+  not_connected: number;
   updates: {
     domain: string;
     tenant_id: string;
     tenant_name: string;
+    microsoft_tenant_id: string;
+    previous_tenant_id: string | null;
+  }[];
+  already_linked_details: {
+    domain: string;
+    tenant_id: string;
+    tenant_name: string;
+  }[];
+  no_tenant_match_details: {
+    domain: string;
     microsoft_tenant_id: string;
   }[];
 }
@@ -237,29 +251,68 @@ export default function DomainLookupPage() {
         </div>
       )}
 
-      {/* Sync Success Banner */}
+      {/* Sync Result Banner */}
       {syncResult && (
-        <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm font-medium text-green-800">
-                Sync Complete — {syncResult.updated_links} domain
-                {syncResult.updated_links !== 1 ? "s" : ""} linked to tenants
+        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+          <div className="flex items-start justify-between">
+            <div className="space-y-3 flex-1">
+              <p className="text-sm font-semibold text-blue-900">
+                Sync Complete — {syncResult.total_checked} domains checked
               </p>
+
+              {/* Summary grid */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-sm">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-green-600 font-bold">{syncResult.updated_links}</span>
+                  <span className="text-gray-600">newly linked</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-blue-600 font-bold">{syncResult.already_linked}</span>
+                  <span className="text-gray-600">already linked</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-amber-600 font-bold">{syncResult.no_tenant_match}</span>
+                  <span className="text-gray-600">no tenant match</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-gray-500 font-bold">{syncResult.not_connected}</span>
+                  <span className="text-gray-600">not connected</span>
+                </div>
+              </div>
+
+              {/* Newly linked details */}
               {syncResult.updates.length > 0 && (
-                <ul className="mt-2 text-sm text-green-700 space-y-1">
-                  {syncResult.updates.map((u, i) => (
-                    <li key={i}>
-                      <span className="font-mono">{u.domain}</span> →{" "}
-                      <span className="font-medium">{u.tenant_name}</span>
-                    </li>
-                  ))}
-                </ul>
+                <div>
+                  <p className="text-xs font-medium text-green-700 mb-1">✅ Newly linked:</p>
+                  <ul className="text-sm text-green-700 space-y-0.5">
+                    {syncResult.updates.map((u, i) => (
+                      <li key={i}>
+                        <span className="font-mono">{u.domain}</span> → <span className="font-medium">{u.tenant_name}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Already linked info */}
+              {syncResult.already_linked > 0 && (
+                <p className="text-xs text-blue-600">
+                  ℹ️ {syncResult.already_linked} domain{syncResult.already_linked !== 1 ? "s" : ""} already correctly linked to their tenant — no update needed.
+                </p>
+              )}
+
+              {/* No tenant match warning */}
+              {syncResult.no_tenant_match > 0 && (
+                <div>
+                  <p className="text-xs text-amber-700">
+                    ⚠️ {syncResult.no_tenant_match} domain{syncResult.no_tenant_match !== 1 ? "s are" : " is"} connected to a Microsoft tenant, but that tenant ID is not in our database.
+                  </p>
+                </div>
               )}
             </div>
             <button
               onClick={() => setSyncResult(null)}
-              className="text-green-400 hover:text-green-600"
+              className="text-blue-400 hover:text-blue-600 ml-3"
             >
               ✕
             </button>

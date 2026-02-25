@@ -130,6 +130,9 @@ async def sync_lookup_to_database(
     - If domain exists in DB and is connected to a tenant, update the domain's tenant link.
     - If the tenant GUID is found in our DB, link them.
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     service = DomainLookupService()
     clean_domains = list(set([d.strip().lower() for d in request.domains if d.strip()]))
 
@@ -142,8 +145,14 @@ async def sync_lookup_to_database(
     ms_results = await service.check_domains_bulk(clean_domains)
 
     updated = []
+    already_linked = []
+    no_tenant_match = []
+    not_in_db = []
+    not_connected = []
+
     for ms_result in ms_results:
         if not ms_result.is_connected or not ms_result.microsoft_tenant_id:
+            not_connected.append(ms_result.domain)
             continue
 
         # Find domain in our DB
@@ -152,6 +161,8 @@ async def sync_lookup_to_database(
         )
         db_domain = domain_query.scalar_one_or_none()
         if not db_domain:
+            not_in_db.append(ms_result.domain)
+            logger.info(f"[sync] {ms_result.domain}: not in our DB")
             continue
 
         # Find tenant in our DB by Microsoft tenant ID
@@ -162,22 +173,56 @@ async def sync_lookup_to_database(
         )
         db_tenant = tenant_query.scalar_one_or_none()
 
-        if db_tenant and db_domain.tenant_id != db_tenant.id:
-            # Update the domain → tenant link
-            db_domain.tenant_id = db_tenant.id
-            updated.append(
-                {
-                    "domain": ms_result.domain,
-                    "tenant_id": str(db_tenant.id),
-                    "tenant_name": db_tenant.name,
-                    "microsoft_tenant_id": ms_result.microsoft_tenant_id,
-                }
+        if not db_tenant:
+            no_tenant_match.append({
+                "domain": ms_result.domain,
+                "microsoft_tenant_id": ms_result.microsoft_tenant_id,
+            })
+            logger.info(
+                f"[sync] {ms_result.domain}: connected to MS tenant "
+                f"{ms_result.microsoft_tenant_id} but no matching tenant in our DB"
             )
+            continue
+
+        if db_domain.tenant_id == db_tenant.id:
+            already_linked.append({
+                "domain": ms_result.domain,
+                "tenant_id": str(db_tenant.id),
+                "tenant_name": db_tenant.name,
+            })
+            logger.info(
+                f"[sync] {ms_result.domain}: already linked to tenant "
+                f"{db_tenant.name} ({db_tenant.id})"
+            )
+            continue
+
+        # Update the domain → tenant link
+        old_tenant_id = str(db_domain.tenant_id) if db_domain.tenant_id else None
+        db_domain.tenant_id = db_tenant.id
+        updated.append(
+            {
+                "domain": ms_result.domain,
+                "tenant_id": str(db_tenant.id),
+                "tenant_name": db_tenant.name,
+                "microsoft_tenant_id": ms_result.microsoft_tenant_id,
+                "previous_tenant_id": old_tenant_id,
+            }
+        )
+        logger.info(
+            f"[sync] {ms_result.domain}: linked to tenant "
+            f"{db_tenant.name} ({db_tenant.id}), was {old_tenant_id}"
+        )
 
     await db.commit()
 
     return {
         "total_checked": len(ms_results),
         "updated_links": len(updated),
+        "already_linked": len(already_linked),
+        "no_tenant_match": len(no_tenant_match),
+        "not_in_db": len(not_in_db),
+        "not_connected": len(not_connected),
         "updates": updated,
+        "already_linked_details": already_linked,
+        "no_tenant_match_details": no_tenant_match,
     }
