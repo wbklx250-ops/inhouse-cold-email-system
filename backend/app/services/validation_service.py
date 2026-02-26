@@ -166,7 +166,7 @@ def cross_validate(
     credentials: Dict[str, Dict],
     first_name: str,
     last_name: str,
-    mailboxes_per_tenant: int,
+    mailboxes_per_tenant: int = 50,
 ) -> Dict[str, Any]:
     """
     Cross-validate all inputs and return a complete preview.

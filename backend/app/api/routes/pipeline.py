@@ -56,7 +56,6 @@ async def validate_inputs(
     credentials_txt: UploadFile = File(...),
     first_name: str = Form(...),
     last_name: str = Form(...),
-    mailboxes_per_tenant: int = Form(50),
 ):
     """
     Validate all input files without creating anything.
@@ -85,8 +84,8 @@ async def validate_inputs(
             }
         }
 
-    # Cross-validate
-    result = cross_validate(domains, tenants, credentials, first_name, last_name, mailboxes_per_tenant)
+    # Cross-validate (mailboxes_per_tenant always 50)
+    result = cross_validate(domains, tenants, credentials, first_name, last_name, 50)
     return result
 
 
@@ -96,13 +95,11 @@ async def create_and_start(
     domains_csv: UploadFile = File(...),
     tenants_csv: UploadFile = File(...),
     credentials_txt: UploadFile = File(...),
-    new_admin_password: str = Form(...),
     first_name: str = Form(...),
     last_name: str = Form(...),
-    mailboxes_per_tenant: int = Form(50),
     sequencer_platform: str = Form(""),
-    sequencer_login_email: str = Form(""),
-    sequencer_login_password: str = Form(""),
+    sequencer_account_id: str = Form(""),
+    sequencer_api_key: str = Form(""),
     profile_photo: UploadFile = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: AsyncSession = Depends(get_db),
@@ -134,7 +131,7 @@ async def create_and_start(
     if all_errors:
         raise HTTPException(400, detail={"errors": all_errors})
 
-    validation = cross_validate(domains, tenants, credentials, first_name, last_name, mailboxes_per_tenant)
+    validation = cross_validate(domains, tenants, credentials, first_name, last_name, 50)
     if not validation["valid"]:
         raise HTTPException(400, detail={"errors": validation["errors"]})
 
@@ -152,13 +149,13 @@ async def create_and_start(
         name=batch_name,
         status=BatchStatus.IN_PROGRESS,
         current_step=1,
-        new_admin_password=new_admin_password,
+        new_admin_password="#Sendemails1",  # Always hardcoded
         persona_first_name=first_name,
         persona_last_name=last_name,
-        mailboxes_per_tenant=mailboxes_per_tenant,
+        mailboxes_per_tenant=50,  # Always 50
         sequencer_platform=sequencer_platform or None,
-        sequencer_login_email=sequencer_login_email or None,
-        sequencer_login_password=sequencer_login_password or None,
+        sequencer_login_email=None,  # No longer collected here
+        sequencer_login_password=None,  # No longer collected here
         profile_photo_path=photo_path,
         pipeline_status="running",
         pipeline_step=1,

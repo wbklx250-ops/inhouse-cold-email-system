@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { useRouter } from "next/navigation";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
@@ -19,6 +19,33 @@ interface ValidationResult {
   };
 }
 
+interface SavedAccount {
+  id: string;
+  label: string;
+  email?: string;
+  platform?: string;
+}
+
+// Platform-specific credential fields
+const PLATFORM_FIELDS: Record<string, { label: string; key: string; type: string }[]> = {
+  instantly: [
+    { label: "Label", key: "label", type: "text" },
+    { label: "Email", key: "email", type: "email" },
+    { label: "Password", key: "password", type: "password" },
+    { label: "API Key (optional)", key: "api_key", type: "text" },
+  ],
+  smartlead: [
+    { label: "Label", key: "label", type: "text" },
+    { label: "API Key", key: "api_key", type: "text" },
+    { label: "OAuth URL", key: "oauth_url", type: "text" },
+  ],
+  plusvibe: [
+    { label: "Label", key: "label", type: "text" },
+    { label: "Email", key: "email", type: "email" },
+    { label: "Password", key: "password", type: "password" },
+  ],
+};
+
 export default function NewPipelinePage() {
   const router = useRouter();
 
@@ -28,21 +55,42 @@ export default function NewPipelinePage() {
   const [tenantsCsv, setTenantsCsv] = useState<File | null>(null);
   const [credentialsTxt, setCredentialsTxt] = useState<File | null>(null);
   const [profilePhoto, setProfilePhoto] = useState<File | null>(null);
-  const [newAdminPassword, setNewAdminPassword] = useState("");
   const [firstName, setFirstName] = useState("");
   const [lastName, setLastName] = useState("");
-  const [mailboxesPerTenant, setMailboxesPerTenant] = useState(50);
+
+  // Sequencer state
   const [sequencerPlatform, setSequencerPlatform] = useState("");
-  const [sequencerEmail, setSequencerEmail] = useState("");
-  const [sequencerPassword, setSequencerPassword] = useState("");
+  const [savedAccounts, setSavedAccounts] = useState<SavedAccount[]>([]);
+  const [selectedAccountId, setSelectedAccountId] = useState("");
+  const [addNewAccount, setAddNewAccount] = useState(false);
+  const [newAccountFields, setNewAccountFields] = useState<Record<string, string>>({});
+  const [saveNewAccount, setSaveNewAccount] = useState(true);
+  const [sequencerApiKey, setSequencerApiKey] = useState("");
 
   // UI state
   const [validation, setValidation] = useState<ValidationResult | null>(null);
   const [isValidating, setIsValidating] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [isSavingAccount, setIsSavingAccount] = useState(false);
 
-  // Auto-validate when all 3 files + names are provided
+  // Fetch saved accounts when platform changes
+  useEffect(() => {
+    if (sequencerPlatform === "instantly" || sequencerPlatform === "smartlead" || sequencerPlatform === "plusvibe") {
+      fetch(`${API_BASE}/api/v1/step8/instantly/accounts`)
+        .then(res => res.json())
+        .then(data => setSavedAccounts(data.accounts || []))
+        .catch(() => setSavedAccounts([]));
+    } else {
+      setSavedAccounts([]);
+    }
+    setSelectedAccountId("");
+    setAddNewAccount(false);
+    setNewAccountFields({});
+    setSequencerApiKey("");
+  }, [sequencerPlatform]);
+
+  // Validate files
   const runValidation = useCallback(async () => {
     if (!domainsCsv || !tenantsCsv || !credentialsTxt || !firstName || !lastName) return;
 
@@ -56,7 +104,6 @@ export default function NewPipelinePage() {
       formData.append("credentials_txt", credentialsTxt);
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
-      formData.append("mailboxes_per_tenant", String(mailboxesPerTenant));
 
       const res = await fetch(`${API_BASE}/api/v1/pipeline/validate`, {
         method: "POST",
@@ -69,10 +116,40 @@ export default function NewPipelinePage() {
     } finally {
       setIsValidating(false);
     }
-  }, [domainsCsv, tenantsCsv, credentialsTxt, firstName, lastName, mailboxesPerTenant]);
+  }, [domainsCsv, tenantsCsv, credentialsTxt, firstName, lastName]);
+
+  // Save new sequencer account via API, return account ID
+  const saveSequencerAccount = async (): Promise<string> => {
+    if (!saveNewAccount || !newAccountFields.label) return "";
+
+    setIsSavingAccount(true);
+    try {
+      const res = await fetch(`${API_BASE}/api/v1/step8/instantly/accounts`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: sequencerPlatform,
+          label: newAccountFields.label || "",
+          email: newAccountFields.email || "",
+          password: newAccountFields.password || "",
+          api_key: newAccountFields.api_key || "",
+          oauth_url: newAccountFields.oauth_url || "",
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        return data.account_id || data.id || "";
+      }
+    } catch (e) {
+      console.error("Failed to save sequencer account:", e);
+    } finally {
+      setIsSavingAccount(false);
+    }
+    return "";
+  };
 
   const handleSubmit = async () => {
-    if (!batchName || !domainsCsv || !tenantsCsv || !credentialsTxt || !newAdminPassword || !firstName || !lastName) {
+    if (!batchName || !domainsCsv || !tenantsCsv || !credentialsTxt || !firstName || !lastName) {
       setError("Please fill in all required fields");
       return;
     }
@@ -81,18 +158,25 @@ export default function NewPipelinePage() {
     setError(null);
 
     try {
+      // If adding a new account and save is checked, save it first
+      let accountId = selectedAccountId || "";
+      let apiKey = sequencerApiKey || newAccountFields.api_key || "";
+
+      if (sequencerPlatform && addNewAccount && saveNewAccount && newAccountFields.label) {
+        const savedId = await saveSequencerAccount();
+        if (savedId) accountId = savedId;
+      }
+
       const formData = new FormData();
       formData.append("batch_name", batchName);
       formData.append("domains_csv", domainsCsv);
       formData.append("tenants_csv", tenantsCsv);
       formData.append("credentials_txt", credentialsTxt);
-      formData.append("new_admin_password", newAdminPassword);
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
-      formData.append("mailboxes_per_tenant", String(mailboxesPerTenant));
       formData.append("sequencer_platform", sequencerPlatform);
-      formData.append("sequencer_login_email", sequencerEmail);
-      formData.append("sequencer_login_password", sequencerPassword);
+      formData.append("sequencer_account_id", accountId);
+      formData.append("sequencer_api_key", apiKey);
       if (profilePhoto) {
         formData.append("profile_photo", profilePhoto);
       }
@@ -117,7 +201,7 @@ export default function NewPipelinePage() {
   };
 
   const allFilesUploaded = domainsCsv && tenantsCsv && credentialsTxt;
-  const canSubmit = batchName && allFilesUploaded && newAdminPassword && firstName && lastName && validation?.valid;
+  const canSubmit = batchName && allFilesUploaded && firstName && lastName && validation?.valid;
 
   return (
     <div className="max-w-3xl mx-auto py-8 px-4">
@@ -133,21 +217,26 @@ export default function NewPipelinePage() {
       )}
 
       <div className="space-y-8">
-        {/* Batch Name */}
+        {/* Section 1: Batch Info */}
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">Batch Name</label>
-          <input
-            type="text"
-            value={batchName}
-            onChange={(e) => setBatchName(e.target.value)}
-            placeholder="e.g., Client ABC - March 2026"
-            className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-          />
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">Batch Info</h2>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Batch Name <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="text"
+              value={batchName}
+              onChange={(e) => setBatchName(e.target.value)}
+              placeholder="e.g., Client ABC - March 2026"
+              className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+            />
+          </div>
         </div>
 
-        {/* Files Section */}
+        {/* Section 2: Upload Files */}
         <div>
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Files</h2>
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">Upload Files</h2>
           <div className="space-y-4">
             <FileUpload
               label="Domains CSV"
@@ -158,7 +247,7 @@ export default function NewPipelinePage() {
               hint="Columns: domain, redirect_url (optional)"
             />
             <FileUpload
-              label="Tenant CSV"
+              label="Tenants CSV"
               accept=".csv"
               required
               file={tenantsCsv}
@@ -183,30 +272,14 @@ export default function NewPipelinePage() {
           </div>
         </div>
 
-        {/* Tenant Configuration */}
-        <div>
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Tenant Configuration</h2>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">New Admin Password</label>
-            <input
-              type="password"
-              value={newAdminPassword}
-              onChange={(e) => setNewAdminPassword(e.target.value)}
-              placeholder="Min 12 chars, upper + lower + digit + special"
-              className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-            />
-            {newAdminPassword && newAdminPassword.length < 12 && (
-              <p className="mt-1 text-xs text-red-500">Password must be at least 12 characters</p>
-            )}
-          </div>
-        </div>
-
-        {/* Mailbox Configuration */}
+        {/* Section 3: Mailbox Configuration */}
         <div>
           <h2 className="text-lg font-semibold text-gray-900 mb-4">Mailbox Configuration</h2>
-          <div className="grid grid-cols-3 gap-4">
+          <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">First Name</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                First Name <span className="text-red-500">*</span>
+              </label>
               <input
                 type="text"
                 value={firstName}
@@ -216,7 +289,9 @@ export default function NewPipelinePage() {
               />
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Last Name</label>
+              <label className="block text-sm font-medium text-gray-700 mb-1">
+                Last Name <span className="text-red-500">*</span>
+              </label>
               <input
                 type="text"
                 value={lastName}
@@ -225,21 +300,10 @@ export default function NewPipelinePage() {
                 className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
               />
             </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Mailboxes/Tenant</label>
-              <input
-                type="number"
-                value={mailboxesPerTenant}
-                onChange={(e) => setMailboxesPerTenant(Number(e.target.value))}
-                min={1}
-                max={50}
-                className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-              />
-            </div>
           </div>
         </div>
 
-        {/* Sequencer Section */}
+        {/* Section 4: Sequencer (Optional) */}
         <div>
           <h2 className="text-lg font-semibold text-gray-900 mb-4">Sequencer (Optional)</h2>
           <div className="space-y-4">
@@ -251,31 +315,82 @@ export default function NewPipelinePage() {
                 className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
               >
                 <option value="">— Skip sequencer upload —</option>
-                <option value="plusvibe">PlusVibe</option>
                 <option value="instantly">Instantly</option>
                 <option value="smartlead">Smartlead</option>
+                <option value="plusvibe">PlusVibe</option>
               </select>
             </div>
+
             {sequencerPlatform && (
-              <div className="grid grid-cols-2 gap-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Login Email</label>
-                  <input
-                    type="email"
-                    value={sequencerEmail}
-                    onChange={(e) => setSequencerEmail(e.target.value)}
-                    className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">Login Password</label>
-                  <input
-                    type="password"
-                    value={sequencerPassword}
-                    onChange={(e) => setSequencerPassword(e.target.value)}
-                    className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
+              <div className="rounded-lg border border-gray-200 bg-gray-50 p-4 space-y-4">
+                {/* Saved accounts dropdown */}
+                {savedAccounts.length > 0 && !addNewAccount && (
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Saved Account</label>
+                    <select
+                      value={selectedAccountId}
+                      onChange={(e) => setSelectedAccountId(e.target.value)}
+                      className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500 bg-white"
+                    >
+                      <option value="">— Select a saved account —</option>
+                      {savedAccounts.map((acc) => (
+                        <option key={acc.id} value={acc.id}>
+                          {acc.label || acc.email || acc.id}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+
+                {/* Toggle: Add New Account */}
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAddNewAccount(!addNewAccount);
+                    if (!addNewAccount) setSelectedAccountId("");
+                  }}
+                  className="text-sm text-blue-600 hover:text-blue-800 font-medium"
+                >
+                  {addNewAccount ? "← Use saved account" : "+ Add New Account"}
+                </button>
+
+                {/* New account fields */}
+                {addNewAccount && (
+                  <div className="space-y-3">
+                    {(PLATFORM_FIELDS[sequencerPlatform] || []).map((field) => (
+                      <div key={field.key}>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">
+                          {field.label}
+                        </label>
+                        <input
+                          type={field.type}
+                          value={newAccountFields[field.key] || ""}
+                          onChange={(e) =>
+                            setNewAccountFields((prev) => ({ ...prev, [field.key]: e.target.value }))
+                          }
+                          className="w-full rounded-lg border border-gray-300 px-4 py-2.5 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                        />
+                      </div>
+                    ))}
+
+                    <label className="flex items-center gap-2 text-sm text-gray-600 mt-2">
+                      <input
+                        type="checkbox"
+                        checked={saveNewAccount}
+                        onChange={(e) => setSaveNewAccount(e.target.checked)}
+                        className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      />
+                      Save this account for future batches
+                    </label>
+                  </div>
+                )}
+
+                {/* No saved accounts message */}
+                {savedAccounts.length === 0 && !addNewAccount && (
+                  <p className="text-sm text-gray-500">
+                    No saved accounts found. Click &quot;Add New Account&quot; to add one.
+                  </p>
+                )}
               </div>
             )}
           </div>
@@ -343,10 +458,10 @@ export default function NewPipelinePage() {
         {/* Submit Button */}
         <button
           onClick={handleSubmit}
-          disabled={!canSubmit || isSubmitting}
+          disabled={!canSubmit || isSubmitting || isSavingAccount}
           className="w-full rounded-lg bg-blue-600 py-3.5 text-sm font-semibold text-white hover:bg-blue-700 disabled:bg-gray-300 disabled:cursor-not-allowed transition-colors"
         >
-          {isSubmitting ? "Starting Pipeline..." : "🚀 Start Batch Setup"}
+          {isSavingAccount ? "Saving Account..." : isSubmitting ? "Starting Pipeline..." : "🚀 Start Batch Setup"}
         </button>
       </div>
     </div>
