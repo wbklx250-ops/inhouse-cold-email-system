@@ -79,12 +79,12 @@ export default function Dashboard() {
           <p className="opacity-90 mb-4">
             Create a new batch to start setting up domains, tenants, and mailboxes.
           </p>
-          <Link
-            href="/setup"
-            className="inline-block px-6 py-3 bg-white text-blue-600 font-bold rounded-lg hover:bg-blue-50"
+          <a
+            href="/pipeline/new"
+            className="inline-flex items-center gap-2 rounded-lg bg-white px-6 py-3 text-blue-600 font-semibold hover:bg-blue-50 transition-colors"
           >
-            Open Setup Wizard
-          </Link>
+            🚀 Start New Batch
+          </a>
         </div>
 
         <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4 mb-8">
@@ -99,7 +99,7 @@ export default function Dashboard() {
         <div className="bg-white rounded-lg shadow p-6">
           <div className="flex justify-between items-center mb-4">
             <h2 className="text-lg font-bold text-gray-900">Recent Batches</h2>
-            <Link href="/setup" className="text-blue-600 hover:underline text-sm">
+            <Link href="/pipeline/new" className="text-blue-600 hover:underline text-sm">
               View All
             </Link>
           </div>
@@ -109,7 +109,7 @@ export default function Dashboard() {
               {stats.recent_batches.map((batch) => (
                 <Link
                   key={batch.id}
-                  href={"/setup/" + batch.id}
+                  href={"/pipeline/" + batch.id}
                   className="block p-4 border rounded-lg hover:border-blue-300 hover:bg-blue-50 transition-colors"
                 >
                   <div className="flex justify-between items-center">

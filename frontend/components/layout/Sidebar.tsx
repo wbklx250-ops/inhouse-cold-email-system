@@ -11,8 +11,7 @@ interface NavItem {
 }
 
 const navigation: NavItem[] = [
-  { name: "New Pipeline", href: "/pipeline/new", icon: "🚀" },
-  { name: "Setup Wizard", href: "/setup", icon: "⚙️" },
+  { name: "New Batch", href: "/pipeline/new", icon: "🚀" },
   { name: "Dashboard", href: "/", icon: "📊" },
   { name: "Domains", href: "/domains", icon: "🌐" },
   { name: "Domain Lookup", href: "/domain-lookup", icon: "🔍" },
