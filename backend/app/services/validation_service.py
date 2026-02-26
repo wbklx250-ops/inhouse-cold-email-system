@@ -104,8 +104,9 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
 
         for i, row in enumerate(reader, start=2):
             onmicrosoft = row.get(onmicrosoft_col, "").strip()
-            if not onmicrosoft:
+            if not onmicrosoft or not onmicrosoft.strip():
                 continue
+            onmicrosoft = onmicrosoft.strip()
 
             # Normalize: add .onmicrosoft.com if just the prefix
             if not onmicrosoft.endswith(".onmicrosoft.com"):
@@ -126,36 +127,101 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
 def parse_credentials_txt_content(content: str) -> Tuple[Dict[str, Dict], List[str]]:
     """
     Parse credentials TXT from reseller.
-    Format: Username: admin@xyz.onmicrosoft.com / Password: abc123
+    
+    Handles THREE formats:
+    
+    1. Tab-separated with header:
+       Username\tPassword
+       admin@xxx.onmicrosoft.com\tP@ssw0rd
+    
+    2. Line-pair with prefixes:
+       Username: admin@xxx.onmicrosoft.com
+       Password: P@ssw0rd
+    
+    3. Alternating lines (no prefix):
+       admin@xxx.onmicrosoft.com
+       P@ssw0rd
+    
     Returns (credentials_by_domain, errors).
     """
     errors = []
     credentials = {}
 
     try:
-        lines = content.strip().split("\n")
-        current_email = None
+        # Normalize line endings
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
+        lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
 
-        for i, line in enumerate(lines, start=1):
-            line = line.strip()
-            if not line:
-                continue
+        if not lines:
+            errors.append("Credentials file is empty")
+            return credentials, errors
 
-            if line.lower().startswith("username:"):
-                current_email = line.split(":", 1)[1].strip()
-            elif line.lower().startswith("password:") and current_email:
-                password = line.split(":", 1)[1].strip()
-                # Extract domain key
-                domain_key = current_email.split("@")[1].lower() if "@" in current_email else ""
-                if domain_key:
+        # Detect format by checking first non-empty line
+        first_line = lines[0]
+
+        # FORMAT 1: Tab-separated (with or without header)
+        if "\t" in first_line:
+            start_idx = 0
+            # Skip header row if present
+            first_lower = first_line.lower()
+            if "username" in first_lower or "email" in first_lower or "password" in first_lower:
+                start_idx = 1
+
+            for i, line in enumerate(lines[start_idx:], start=start_idx + 1):
+                if "\t" not in line:
+                    continue
+                parts = line.split("\t")
+                if len(parts) < 2:
+                    continue
+                email = parts[0].strip()
+                password = parts[1].strip()
+                if not email or not password:
+                    continue
+                if "@" not in email:
+                    continue
+                domain_key = email.split("@")[1].lower()
+                credentials[domain_key] = {
+                    "email": email,
+                    "password": password,
+                }
+
+        # FORMAT 2: "Username: xxx" / "Password: xxx" line pairs
+        elif first_line.lower().startswith("username:") or first_line.lower().startswith("password:"):
+            current_email = None
+            for line in lines:
+                if line.lower().startswith("username:"):
+                    current_email = line.split(":", 1)[1].strip()
+                elif line.lower().startswith("password:") and current_email:
+                    password = line.split(":", 1)[1].strip()
+                    if "@" in current_email:
+                        domain_key = current_email.split("@")[1].lower()
+                        credentials[domain_key] = {
+                            "email": current_email,
+                            "password": password,
+                        }
+                    current_email = None
+
+        # FORMAT 3: Alternating lines (email on odd lines, password on even lines)
+        else:
+            i = 0
+            while i < len(lines) - 1:
+                email = lines[i]
+                password = lines[i + 1]
+                if "@" in email and "onmicrosoft" in email.lower():
+                    domain_key = email.split("@")[1].lower()
                     credentials[domain_key] = {
-                        "email": current_email,
+                        "email": email,
                         "password": password,
                     }
-                current_email = None
+                    i += 2
+                else:
+                    i += 1  # Skip unrecognized lines
 
     except Exception as e:
         errors.append(f"Failed to parse credentials TXT: {str(e)}")
+
+    if not credentials and not errors:
+        errors.append("No valid credentials found. Expected tab-separated (Username\\tPassword) or line-pair (Username: xxx / Password: xxx) format.")
 
     return credentials, errors
 
