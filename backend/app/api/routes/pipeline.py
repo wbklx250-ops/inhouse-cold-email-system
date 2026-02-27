@@ -420,6 +420,51 @@ async def resume_pipeline(
     }
 
 
+@router.post("/{batch_id}/reset-progress")
+async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db)):
+    """Reset all step progress for tenants in a batch so the pipeline re-processes them."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    result = await db.execute(
+        update(Tenant).where(Tenant.batch_id == batch_id).values(
+            first_login_completed=False,
+            first_login_at=None,
+            password_changed=False,
+            domain_verified_in_m365=False,
+            step5_complete=False,
+            step6_complete=False,
+            step6_started=False,
+            step7_complete=False,
+            step7_smtp_auth_enabled=False,
+            setup_error=None,
+            step4_retry_count=0,
+            step5_retry_count=0,
+            step6_retry_count=0,
+            step7_retry_count=0,
+            step6_error=None,
+            step7_error=None,
+        )
+    )
+
+    # Also reset batch-level counters
+    batch.first_login_completed_count = 0
+    batch.domain_setup_completed_count = 0
+    batch.mailbox_completed_count = 0
+    batch.smtp_completed = 0
+    batch.pipeline_status = "paused"
+    batch.pipeline_step = 5  # Resume from Step 5 (Cloudflare steps already done)
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": f"Reset progress for all tenants in batch. Use Resume to restart from Step 5.",
+        "tenants_reset": result.rowcount,
+    }
+
+
 @router.get("/{batch_id}/activity-log")
 async def get_activity_log(batch_id: UUID, limit: int = 50, db: AsyncSession = Depends(get_db)):
     """Get recent activity log entries."""

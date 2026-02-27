@@ -313,9 +313,62 @@ class TenantImportService:
                         existing.initial_password = data["admin_password"]
                     existing.provider = provider or existing.provider
                     existing.status = TenantStatus.IMPORTED
+
+                    # === CRITICAL: Reset ALL step progress flags ===
+                    # When a tenant moves to a new batch, it must go through
+                    # ALL steps again from scratch.
+                    existing.first_login_completed = False
+                    existing.first_login_at = None
+                    existing.password_changed = False
+                    existing.setup_error = None
+                    existing.setup_step = None
+
+                    # Step 5 (M365 domain setup)
+                    existing.domain_verified_in_m365 = False
+                    if hasattr(existing, 'step5_complete'):
+                        existing.step5_complete = False
+                    if hasattr(existing, 'step5_retry_count'):
+                        existing.step5_retry_count = 0
+
+                    # Step 6 (Mailbox creation)
+                    if hasattr(existing, 'step6_complete'):
+                        existing.step6_complete = False
+                    if hasattr(existing, 'step6_started'):
+                        existing.step6_started = False
+                    if hasattr(existing, 'step6_error'):
+                        existing.step6_error = None
+                    if hasattr(existing, 'step6_retry_count'):
+                        existing.step6_retry_count = 0
+
+                    # Step 7 (SMTP Auth)
+                    if hasattr(existing, 'step7_complete'):
+                        existing.step7_complete = False
+                    if hasattr(existing, 'step7_smtp_auth_enabled'):
+                        existing.step7_smtp_auth_enabled = False
+                    if hasattr(existing, 'step7_error'):
+                        existing.step7_error = None
+                    if hasattr(existing, 'step7_retry_count'):
+                        existing.step7_retry_count = 0
+                    if hasattr(existing, 'step7_app_consent_granted'):
+                        existing.step7_app_consent_granted = False
+
+                    # Retry counts
+                    if hasattr(existing, 'step4_retry_count'):
+                        existing.step4_retry_count = 0
+
+                    # Licensed user (Step 6 creates this)
+                    if hasattr(existing, 'licensed_user_created'):
+                        existing.licensed_user_created = False
+                    if hasattr(existing, 'licensed_user_upn'):
+                        existing.licensed_user_upn = None
+
+                    # DO NOT reset these — they're permanent tenant properties:
+                    # - totp_secret (needed for all future logins)
+                    # - admin_password (keep the CURRENT working password)
+                    # - security_defaults_disabled (permanent M365 setting)
+
                     # Clear domain linkage since it's a new batch
                     if existing.domain_id:
-                        # Also clear the old domain's reference to this tenant
                         old_domain = await db.execute(
                             select(Domain).where(Domain.id == existing.domain_id)
                         )
@@ -325,7 +378,7 @@ class TenantImportService:
                     existing.domain_id = None
                     existing.custom_domain = None
                     reassigned += 1
-                    imported += 1  # Count reassigned as imported for the limit
+                    imported += 1
                     continue
 
             if not data["admin_password"]:
