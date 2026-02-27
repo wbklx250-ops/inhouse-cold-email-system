@@ -187,6 +187,8 @@ async def create_and_start(
         if existing:
             # Re-assign to this batch (domain may have been in a deleted/old batch)
             existing.batch_id = batch_id
+            # CRITICAL: Clear old tenant linkage so import_tenants can assign new tenants
+            existing.tenant_id = None
             existing.redirect_url = d.get("redirect_url", "") or existing.redirect_url
             existing.status = DomainStatus.PURCHASED
             existing.cloudflare_zone_status = existing.cloudflare_zone_status or "pending"

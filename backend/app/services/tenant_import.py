@@ -16,7 +16,7 @@ from uuid import UUID
 from dataclasses import dataclass
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.models.tenant import Tenant, TenantStatus
 from app.models.domain import Domain
@@ -249,14 +249,14 @@ class TenantImportService:
         in the system are skipped and do not count toward this limit.
         """
 
-        # Count how many domains in this batch still need a tenant
-        domains_needing_tenants = (await db.execute(
-            select(Domain).where(
-                Domain.batch_id == batch_id,
-                Domain.tenant_id == None
-            )
-        )).scalars().all()
-        needed_count = len(domains_needing_tenants)
+        # Count total domains in this batch (import all tenants up to domain count)
+        total_domains_in_batch = await db.scalar(
+            select(func.count(Domain.id)).where(Domain.batch_id == batch_id)
+        ) or 0
+        needed_count = total_domains_in_batch
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Batch {batch_id}: {needed_count} domains in batch, importing up to {needed_count} tenants")
 
         tenant_list = self.parse_tenant_csv(csv_content)
         credentials = self.parse_credentials_txt(credentials_content)
