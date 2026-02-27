@@ -38,6 +38,7 @@ from app.api.routes import (
     domain_removal_router,
     domain_lookup_router,
     pipeline_router,
+    step8_endpoints_router,
 )
 from app.db.session import get_db_session
 from app.core.config import get_settings
@@ -77,6 +78,10 @@ async def lifespan(app: FastAPI):
     # Startup: Start background job scheduler (DKIM retry, etc.)
     logger.info("Starting background job scheduler...")
     start_background_scheduler()
+
+    # Resume any pipelines that were running when container restarted
+    from app.api.routes.pipeline import resume_interrupted_pipelines
+    await resume_interrupted_pipelines()
 
     yield
 
@@ -138,6 +143,7 @@ app.include_router(upload_router)
 app.include_router(domain_removal_router)
 app.include_router(domain_lookup_router)
 app.include_router(pipeline_router)
+app.include_router(step8_endpoints_router)
 
 
 @app.get("/", tags=["root"])

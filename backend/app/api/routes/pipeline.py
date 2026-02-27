@@ -5,13 +5,14 @@ import asyncio
 import logging
 import os
 import random
+import time
 from datetime import datetime
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 
 from app.db.session import get_db_session as get_db, SessionLocal
 from app.models.batch import SetupBatch, BatchStatus
@@ -34,6 +35,9 @@ logger = logging.getLogger(__name__)
 
 # In-memory pipeline job tracking
 pipeline_jobs = {}
+
+MAX_PIPELINE_RETRIES = 4   # Max retries per tenant per step
+STEP5_MAX_WORKERS = 2      # Max parallel browsers for first login (Railway memory limit)
 
 STEP_NAMES = {
     1: "Create Cloudflare Zones",
@@ -169,22 +173,36 @@ async def create_and_start(
 
     batch_id = batch.id
 
-    # Import domains
+    # Import domains — handle duplicates by reusing existing domain records
+    imported_domain_count = 0
     for d in domains:
-        # Extract TLD from domain name
         parts = d["name"].rsplit(".", 1)
         tld = parts[-1] if len(parts) > 1 else ""
 
-        domain = Domain(
-            batch_id=batch_id,
-            name=d["name"],
-            tld=tld,
-            redirect_url=d.get("redirect_url", ""),
-            status=DomainStatus.PURCHASED,
-            cloudflare_zone_status="pending",
-            cloudflare_nameservers=[],
-        )
-        db.add(domain)
+        # Check if domain already exists
+        existing = (await db.execute(
+            select(Domain).where(Domain.name == d["name"])
+        )).scalar_one_or_none()
+
+        if existing:
+            # Re-assign to this batch (domain may have been in a deleted/old batch)
+            existing.batch_id = batch_id
+            existing.redirect_url = d.get("redirect_url", "") or existing.redirect_url
+            existing.status = DomainStatus.PURCHASED
+            existing.cloudflare_zone_status = existing.cloudflare_zone_status or "pending"
+            imported_domain_count += 1
+        else:
+            domain = Domain(
+                batch_id=batch_id,
+                name=d["name"],
+                tld=tld,
+                redirect_url=d.get("redirect_url", ""),
+                status=DomainStatus.PURCHASED,
+                cloudflare_zone_status="pending",
+                cloudflare_nameservers=[],
+            )
+            db.add(domain)
+            imported_domain_count += 1
 
     await db.flush()
 
@@ -222,7 +240,7 @@ async def create_and_start(
         "success": True,
         "batch_id": str(batch_id),
         "batch_name": batch_name,
-        "domains_imported": len(domains),
+        "domains_imported": imported_domain_count,
         "tenants_imported": result.get("imported", 0),
         "tenants_linked": link_result.get("linked", 0),
         "pipeline_started": True,
@@ -468,6 +486,19 @@ async def run_pipeline(batch_id: UUID):
     logger.info(f"🚀 Pipeline started for batch {batch_id}")
 
     try:
+        # Reset retry counts for fresh pipeline run
+        async with SessionLocal() as db:
+            await db.execute(
+                update(Tenant).where(Tenant.batch_id == batch_id).values(
+                    step4_retry_count=0,
+                    step5_retry_count=0,
+                    step6_retry_count=0,
+                    step7_retry_count=0,
+                )
+            )
+            await db.commit()
+        logger.info(f"Reset retry counts for batch {batch_id}")
+
         # ================================================================
         # STEP 1: Create Cloudflare Zones
         # ================================================================
@@ -505,7 +536,12 @@ async def run_pipeline(batch_id: UUID):
                             domain.phase1_cname_added = True
                             domain.phase1_dmarc_added = True
                         except Exception as dns_e:
-                            logger.warning(f"Phase 1 DNS failed for {domain.name}: {dns_e}")
+                            if "already exists" in str(dns_e).lower():
+                                logger.info(f"Phase 1 DNS already exists for {domain.name} — skipping")
+                                domain.phase1_cname_added = True
+                                domain.phase1_dmarc_added = True
+                            else:
+                                logger.warning(f"Phase 1 DNS failed for {domain.name}: {dns_e}")
 
                         # Track NS groups
                         ns_key = ",".join(sorted(domain.cloudflare_nameservers or []))
@@ -526,10 +562,39 @@ async def run_pipeline(batch_id: UUID):
 
                 await db.commit()
 
-            # Update batch counters
+            # Update batch counters — count ALL domains with zones (including re-used)
+            total_with_zones = await db.scalar(
+                select(func.count(Domain.id)).where(
+                    Domain.batch_id == batch_id,
+                    Domain.cloudflare_zone_id.isnot(None),
+                )
+            ) or 0
             batch = await db.get(SetupBatch, batch_id)
             if batch:
-                batch.zones_completed = zones_created
+                batch.zones_completed = total_with_zones
+                await db.commit()
+
+        # Handle re-used domains that already have zone_id but no Phase 1 DNS flags
+        async with SessionLocal() as db:
+            reused_domains = (await db.execute(
+                select(Domain).where(
+                    Domain.batch_id == batch_id,
+                    Domain.cloudflare_zone_id.isnot(None),
+                    Domain.phase1_cname_added != True,
+                )
+            )).scalars().all()
+
+            for domain in reused_domains:
+                try:
+                    await cloudflare_service.create_phase1_dns(domain.cloudflare_zone_id, domain.name)
+                    domain.phase1_cname_added = True
+                    domain.phase1_dmarc_added = True
+                except Exception as e:
+                    if "already exists" in str(e).lower():
+                        domain.phase1_cname_added = True
+                        domain.phase1_dmarc_added = True
+                    else:
+                        logger.warning(f"Phase 1 DNS for re-used domain {domain.name}: {e}")
                 await db.commit()
 
         # Store NS groups in job for frontend display
@@ -539,111 +604,141 @@ async def run_pipeline(batch_id: UUID):
                 for ns, doms in ns_groups.items()
             ]
             pipeline_jobs[job_id]["steps"]["1"]["status"] = "completed"
-            pipeline_jobs[job_id]["steps"]["1"]["completed"] = zones_created
+            pipeline_jobs[job_id]["steps"]["1"]["completed"] = total_with_zones
             pipeline_jobs[job_id]["steps"]["1"]["failed"] = zones_failed
 
-        logger.info(f"Step 1 complete: {zones_created} zones created, {zones_failed} failed")
+        logger.info(f"Step 1: {zones_created} new zones created, {total_with_zones} total zones ready")
 
         # ================================================================
-        # STEP 2: Pause for Nameserver Update (ONLY MANUAL STEP)
+        # STEP 2-3: NS Update + Propagation (auto-skip if already done)
         # ================================================================
-        await _update_pipeline(batch_id, 2, "paused", "Waiting for nameserver update confirmation...")
-        await log_activity(batch_id, 2, STEP_NAMES[2], status="started", message="Waiting for user to update nameservers at Porkbun")
+        # Check if NS already confirmed (re-used domains)
+        async with SessionLocal() as db:
+            already_propagated = await db.scalar(
+                select(func.count(Domain.id)).where(
+                    Domain.batch_id == batch_id,
+                    Domain.ns_propagated_at.isnot(None),
+                )
+            ) or 0
+            total_domains = await db.scalar(
+                select(func.count(Domain.id)).where(Domain.batch_id == batch_id)
+            ) or 0
 
-        if job_id in pipeline_jobs:
-            pipeline_jobs[job_id]["steps"]["2"]["status"] = "waiting_for_user"
+        skip_ns_wait = (total_domains > 0 and already_propagated >= total_domains * 0.95)
 
-        # Poll for NS confirmation (user clicks "Confirm Nameservers" in UI)
-        while True:
-            if await _check_paused_or_stopped(batch_id):
-                return
-
-            # Check if user confirmed
-            async with SessionLocal() as db:
-                batch = await db.get(SetupBatch, batch_id)
-                if batch and batch.ns_confirmed_at:
-                    break
-
-            # Also check in-memory flag
-            if job_id in pipeline_jobs and pipeline_jobs[job_id].get("ns_confirmed"):
-                break
-
-            await asyncio.sleep(5)  # Poll every 5 seconds
-
-        await log_activity(batch_id, 2, STEP_NAMES[2], status="completed", message="Nameservers confirmed by user")
-        if job_id in pipeline_jobs:
-            pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
-
-        # ================================================================
-        # STEP 3: Verify NS Propagation
-        # ================================================================
-        await _update_pipeline(batch_id, 3, "running", "Checking nameserver propagation...")
-        await log_activity(batch_id, 3, STEP_NAMES[3], status="started")
-
-        total_zones = 0
-        total_propagated = 0
-        max_propagation_checks = 60  # 60 checks * 30s = 30 minutes max
-
-        for check_round in range(max_propagation_checks):
-            if await _check_paused_or_stopped(batch_id):
-                return
-
-            async with SessionLocal() as db:
-                # Find domains with zones that haven't propagated yet
-                # (status is not NS_PROPAGATED and ns_propagated_at is None)
-                domains = (await db.execute(
-                    select(Domain).where(
-                        Domain.batch_id == batch_id,
-                        Domain.cloudflare_zone_id != None,
-                        Domain.ns_propagated_at == None,
-                    )
-                )).scalars().all()
-
-                if not domains:
-                    break  # All propagated
-
-                for domain in domains:
-                    try:
-                        # Use get_zone_status which returns "active" or "pending"
-                        zone_status = await cloudflare_service.get_zone_status(domain.cloudflare_zone_id)
-                        if zone_status == "active":
-                            domain.status = DomainStatus.NS_PROPAGATED
-                            domain.ns_propagated_at = datetime.utcnow()
-                            domain.nameservers_updated = True
-                            await log_activity(batch_id, 3, STEP_NAMES[3], "domain", str(domain.id), domain.name, "completed", "NS propagated")
-                    except Exception as e:
-                        logger.warning(f"Propagation check failed for {domain.name}: {e}")
-
-                await db.commit()
-
-                # Update counters
-                total_zones = await db.scalar(
-                    select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.cloudflare_zone_id != None)
-                ) or 0
-                total_propagated = await db.scalar(
-                    select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.ns_propagated_at != None)
-                ) or 0
-
-                batch = await db.get(SetupBatch, batch_id)
-                if batch:
-                    batch.ns_propagated_count = total_propagated
-                    await db.commit()
+        if skip_ns_wait:
+            logger.info(f"Step 2-3: {already_propagated}/{total_domains} domains already have NS propagated — skipping NS wait")
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
+                pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
+                pipeline_jobs[job_id]["steps"]["3"]["completed"] = already_propagated
+                pipeline_jobs[job_id]["steps"]["3"]["total"] = total_domains
+            await log_activity(batch_id, 2, STEP_NAMES[2], status="completed", message=f"Skipped — {already_propagated}/{total_domains} already propagated")
+            await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"Skipped — {already_propagated}/{total_domains} already propagated")
+            total_propagated = already_propagated
+            total_zones = total_domains
+        else:
+            # STEP 2: Pause for Nameserver Update (ONLY MANUAL STEP)
+            await _update_pipeline(batch_id, 2, "paused", "Waiting for nameserver update confirmation...")
+            await log_activity(batch_id, 2, STEP_NAMES[2], status="started", message="Waiting for user to update nameservers at Porkbun")
 
             if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["3"]["completed"] = total_propagated
-                pipeline_jobs[job_id]["steps"]["3"]["total"] = total_zones
-                pipeline_jobs[job_id]["message"] = f"NS propagation: {total_propagated}/{total_zones}"
+                pipeline_jobs[job_id]["steps"]["2"]["status"] = "waiting_for_user"
 
-            # Proceed if 95%+ propagated
-            if total_zones and total_propagated and total_propagated >= total_zones * 0.95:
-                logger.info(f"Step 3: {total_propagated}/{total_zones} propagated (≥95%), proceeding")
-                break
+            # Poll for NS confirmation (user clicks "Confirm Nameservers" in UI)
+            while True:
+                if await _check_paused_or_stopped(batch_id):
+                    return
 
-            await asyncio.sleep(30)  # Check every 30 seconds
+                # Check if user confirmed
+                async with SessionLocal() as db:
+                    batch = await db.get(SetupBatch, batch_id)
+                    if batch and batch.ns_confirmed_at:
+                        break
 
-        if job_id in pipeline_jobs:
-            pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
-        await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
+                # Also check in-memory flag
+                if job_id in pipeline_jobs and pipeline_jobs[job_id].get("ns_confirmed"):
+                    break
+
+                await asyncio.sleep(5)  # Poll every 5 seconds
+
+            await log_activity(batch_id, 2, STEP_NAMES[2], status="completed", message="Nameservers confirmed by user")
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["steps"]["2"]["status"] = "completed"
+
+            # ================================================================
+            # STEP 3: Verify NS Propagation
+            # ================================================================
+            await _update_pipeline(batch_id, 3, "running", "Checking nameserver propagation...")
+            await log_activity(batch_id, 3, STEP_NAMES[3], status="started")
+
+            total_zones = 0
+            total_propagated = 0
+            NS_PROPAGATION_TIMEOUT = 3600 * 4  # 4 hours max
+            ns_start_time = time.time()
+
+            while True:
+                if await _check_paused_or_stopped(batch_id):
+                    return
+
+                if time.time() - ns_start_time > NS_PROPAGATION_TIMEOUT:
+                    logger.error(f"Step 3: NS propagation timed out after 4 hours")
+                    await log_activity(batch_id, 3, STEP_NAMES[3], status="warning",
+                        message=f"Timed out — {total_propagated}/{total_zones} propagated. Proceeding anyway.")
+                    break
+
+                async with SessionLocal() as db:
+                    # Find domains with zones that haven't propagated yet
+                    domains = (await db.execute(
+                        select(Domain).where(
+                            Domain.batch_id == batch_id,
+                            Domain.cloudflare_zone_id != None,
+                            Domain.ns_propagated_at == None,
+                        )
+                    )).scalars().all()
+
+                    if not domains:
+                        break  # All propagated
+
+                    for domain in domains:
+                        try:
+                            zone_status = await cloudflare_service.get_zone_status(domain.cloudflare_zone_id)
+                            if zone_status == "active":
+                                domain.status = DomainStatus.NS_PROPAGATED
+                                domain.ns_propagated_at = datetime.utcnow()
+                                domain.nameservers_updated = True
+                                await log_activity(batch_id, 3, STEP_NAMES[3], "domain", str(domain.id), domain.name, "completed", "NS propagated")
+                        except Exception as e:
+                            logger.warning(f"Propagation check failed for {domain.name}: {e}")
+
+                    await db.commit()
+
+                    total_zones = await db.scalar(
+                        select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.cloudflare_zone_id != None)
+                    ) or 0
+                    total_propagated = await db.scalar(
+                        select(func.count(Domain.id)).where(Domain.batch_id == batch_id, Domain.ns_propagated_at != None)
+                    ) or 0
+
+                    batch = await db.get(SetupBatch, batch_id)
+                    if batch:
+                        batch.ns_propagated_count = total_propagated
+                        await db.commit()
+
+                if job_id in pipeline_jobs:
+                    pipeline_jobs[job_id]["steps"]["3"]["completed"] = total_propagated
+                    pipeline_jobs[job_id]["steps"]["3"]["total"] = total_zones
+                    pipeline_jobs[job_id]["message"] = f"NS propagation: {total_propagated}/{total_zones}"
+
+                if total_zones and total_propagated and total_propagated >= total_zones * 0.95:
+                    logger.info(f"Step 3: {total_propagated}/{total_zones} propagated (≥95%), proceeding")
+                    break
+
+                await asyncio.sleep(30)
+
+            if job_id in pipeline_jobs:
+                pipeline_jobs[job_id]["steps"]["3"]["status"] = "completed"
+            await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
 
         # ================================================================
         # STEP 4: Create DNS Records + Redirects
@@ -652,10 +747,12 @@ async def run_pipeline(batch_id: UUID):
         await log_activity(batch_id, 4, STEP_NAMES[4], status="started")
 
         async with SessionLocal() as db:
+            # Only process domains that need DNS (skip already-configured re-used domains)
             domains = (await db.execute(
                 select(Domain).where(
                     Domain.batch_id == batch_id,
-                    Domain.ns_propagated_at != None,
+                    Domain.cloudflare_zone_id.isnot(None),
+                    Domain.dns_records_created != True,  # Skip already-configured
                 )
             )).scalars().all()
 
@@ -669,29 +766,21 @@ async def run_pipeline(batch_id: UUID):
                     if not zone_id:
                         continue
 
-                    # MX record
-                    await cloudflare_service.create_dns_record(
-                        zone_id, "MX", domain.name,
-                        f"{domain.name.replace('.', '-')}.mail.protection.outlook.com",
-                        priority=0, proxied=False
-                    )
+                    # Use idempotent function that handles existing records
+                    dns_result = await cloudflare_service.ensure_email_dns_records(zone_id, domain.name)
 
-                    # SPF record
-                    await cloudflare_service.create_dns_record(
-                        zone_id, "TXT", domain.name,
-                        "v=spf1 include:spf.protection.outlook.com -all",
-                        proxied=False
-                    )
-
-                    # Autodiscover CNAME
-                    await cloudflare_service.create_dns_record(
-                        zone_id, "CNAME", f"autodiscover.{domain.name}",
-                        "autodiscover.outlook.com",
-                        proxied=False
-                    )
+                    all_ok = all(r["success"] for r in dns_result.values())
+                    if all_ok:
+                        domain.dns_records_created = True
+                        dns_done += 1
+                        await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "completed", "DNS records ensured")
+                    else:
+                        errors = [f"{k}: {v['error']}" for k, v in dns_result.items() if v.get("error")]
+                        domain.error_message = "; ".join(errors)
+                        await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "failed", domain.error_message)
 
                     # Redirect rule (if redirect_url provided)
-                    if domain.redirect_url:
+                    if domain.redirect_url and not getattr(domain, 'redirect_configured', False):
                         try:
                             await cloudflare_service.create_redirect_rule(
                                 zone_id, domain.name, domain.redirect_url
@@ -700,124 +789,210 @@ async def run_pipeline(batch_id: UUID):
                         except Exception as re:
                             logger.warning(f"Redirect failed for {domain.name}: {re}")
 
-                    domain.dns_records_created = True
-                    dns_done += 1
-                    await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "completed", "DNS records created")
-
                 except Exception as e:
                     domain.error_message = str(e)
                     await log_activity(batch_id, 4, STEP_NAMES[4], "domain", str(domain.id), domain.name, "failed", str(e))
 
                 await db.commit()
 
+            # Count ALL domains with DNS done (including re-used)
+            total_dns_done = await db.scalar(
+                select(func.count(Domain.id)).where(
+                    Domain.batch_id == batch_id,
+                    Domain.dns_records_created == True,
+                )
+            ) or 0
+
             batch = await db.get(SetupBatch, batch_id)
             if batch:
-                batch.dns_completed = dns_done
+                batch.dns_completed = total_dns_done
                 await db.commit()
 
         if job_id in pipeline_jobs:
             pipeline_jobs[job_id]["steps"]["4"]["status"] = "completed"
-            pipeline_jobs[job_id]["steps"]["4"]["completed"] = dns_done
+            pipeline_jobs[job_id]["steps"]["4"]["completed"] = total_dns_done
+
+        logger.info(f"Step 4: {dns_done} new DNS configured, {total_dns_done} total ready")
 
         # ================================================================
-        # STEP 5: First Login Automation
+        # STEP 5: First Login Automation (WITH AUTO-RETRY)
         # ================================================================
         await _update_pipeline(batch_id, 5, "running", "Running first login automation...")
         await log_activity(batch_id, 5, STEP_NAMES[5], status="started")
 
         async with SessionLocal() as db:
             batch = await db.get(SetupBatch, batch_id)
-            new_password = batch.new_admin_password if batch else None
+            new_password = batch.new_admin_password if batch else "#Sendemails1"
 
-        if new_password:
-            # Import the existing Step 4 processing function
-            from app.services.tenant_automation import process_tenants_parallel
+        from app.services.tenant_automation import process_tenants_parallel
 
+        for attempt in range(MAX_PIPELINE_RETRIES + 1):
+            if await _check_paused_or_stopped(batch_id):
+                return
+
+            # Query for tenants that still need first login
             async with SessionLocal() as db:
                 tenants = (await db.execute(
                     select(Tenant).where(
                         Tenant.batch_id == batch_id,
                         Tenant.first_login_completed != True,
+                        Tenant.step4_retry_count <= MAX_PIPELINE_RETRIES,
                     )
                 )).scalars().all()
+
+                if not tenants:
+                    logger.info(f"Step 5: All tenants completed first login")
+                    break
+
+                remaining = len(tenants)
+                logger.info(f"Step 5: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {remaining} tenants remaining")
+                await _update_pipeline(batch_id, 5, "running",
+                    f"First login attempt {attempt + 1} — {remaining} tenants remaining...")
 
                 tenant_data = [
                     {
                         "tenant_id": str(t.id),
                         "admin_email": t.admin_email,
-                        "admin_password": t.admin_password,
+                        "initial_password": t.admin_password,  # KEY MUST BE initial_password
                     }
                     for t in tenants
                 ]
 
             if tenant_data:
-                results = await process_tenants_parallel(tenant_data, new_password, max_workers=2)
+                try:
+                    results = await process_tenants_parallel(tenant_data, new_password, max_workers=STEP5_MAX_WORKERS)
 
-                # Save results
-                async with SessionLocal() as db:
-                    login_ok = 0
-                    login_fail = 0
-                    for r in results:
-                        try:
-                            t = await db.get(Tenant, UUID(r["tenant_id"]))
-                            if t and r.get("success"):
-                                t.admin_password = new_password
-                                t.password_changed = True
-                                t.first_login_completed = True
-                                t.first_login_at = datetime.utcnow()
-                                t.setup_error = None
-                                if r.get("totp_secret") and not t.totp_secret:
-                                    t.totp_secret = r["totp_secret"]
-                                login_ok += 1
-                                await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id), t.custom_domain or t.name, "completed")
-                            elif t:
-                                t.setup_error = r.get("error", "Unknown")
-                                login_fail += 1
-                                await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id), t.custom_domain or t.name, "failed", r.get("error"))
-                            await db.commit()
-                        except Exception as e:
-                            logger.error(f"Failed to save Step 5 result: {e}")
+                    async with SessionLocal() as db:
+                        for r in results:
+                            try:
+                                t = await db.get(Tenant, UUID(r["tenant_id"]))
+                                if not t:
+                                    continue
+                                if r.get("success"):
+                                    t.admin_password = new_password
+                                    t.password_changed = True
+                                    t.first_login_completed = True
+                                    t.first_login_at = datetime.utcnow()
+                                    t.setup_error = None
+                                    if r.get("totp_secret") and not t.totp_secret:
+                                        t.totp_secret = r["totp_secret"]
+                                    await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id),
+                                        t.custom_domain or t.name, "completed")
+                                else:
+                                    t.step4_retry_count = (t.step4_retry_count or 0) + 1
+                                    t.setup_error = r.get("error", "Unknown")
+                                    if t.step4_retry_count > MAX_PIPELINE_RETRIES:
+                                        t.first_login_completed = True  # Mark as skipped
+                                        t.setup_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries: {r.get('error')}"
+                                        await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id),
+                                            t.custom_domain or t.name, "skipped", t.setup_error)
+                                    else:
+                                        await log_activity(batch_id, 5, STEP_NAMES[5], "tenant", str(t.id),
+                                            t.custom_domain or t.name, "failed", r.get("error"))
+                                await db.commit()
+                            except Exception as e:
+                                logger.error(f"Failed to save Step 5 result: {e}")
+                except Exception as e:
+                    logger.error(f"Step 5 attempt {attempt + 1} failed: {e}")
 
-                    batch = await db.get(SetupBatch, batch_id)
-                    if batch:
-                        batch.first_login_completed_count = login_ok
-                        await db.commit()
+            # Brief pause before retry
+            if attempt < MAX_PIPELINE_RETRIES:
+                await asyncio.sleep(10)
 
-                if job_id in pipeline_jobs:
-                    pipeline_jobs[job_id]["steps"]["5"]["completed"] = login_ok
-                    pipeline_jobs[job_id]["steps"]["5"]["failed"] = login_fail
+        # Final count
+        async with SessionLocal() as db:
+            login_ok = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id, Tenant.first_login_completed == True
+                )
+            ) or 0
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.first_login_completed_count = login_ok
+                await db.commit()
 
         if job_id in pipeline_jobs:
+            pipeline_jobs[job_id]["steps"]["5"]["completed"] = login_ok
             pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
+        logger.info(f"Step 5 complete: {login_ok} tenants logged in successfully")
 
         # ================================================================
-        # STEP 6: M365 Domain Setup + DKIM
+        # STEP 6: M365 Domain Setup + DKIM (WITH AUTO-RETRY)
         # ================================================================
         await _update_pipeline(batch_id, 6, "running", "Adding domains to M365 and configuring DKIM...")
         await log_activity(batch_id, 6, STEP_NAMES[6], status="started")
 
         from app.services.m365_setup import run_step5_for_batch as run_m365_setup
 
-        try:
-            m365_result = await run_m365_setup(batch_id)
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["6"]["completed"] = m365_result.get("processed", 0)
-                pipeline_jobs[job_id]["steps"]["6"]["failed"] = m365_result.get("failed", 0)
-                pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
+        for attempt in range(MAX_PIPELINE_RETRIES + 1):
+            if await _check_paused_or_stopped(batch_id):
+                return
 
+            # Check how many still need M365 setup
             async with SessionLocal() as db:
-                batch = await db.get(SetupBatch, batch_id)
-                if batch:
-                    batch.m365_completed = m365_result.get("processed", 0)
-                    await db.commit()
-        except Exception as e:
-            logger.error(f"Step 6 failed: {e}")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["6"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 6, "error": str(e)})
+                pending_m365 = await db.scalar(
+                    select(func.count(Tenant.id)).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.first_login_completed == True,
+                        Tenant.domain_verified_in_m365 != True,
+                        Tenant.step5_retry_count <= MAX_PIPELINE_RETRIES,
+                    )
+                ) or 0
+
+            if pending_m365 == 0:
+                logger.info("Step 6: All tenants have M365 domains configured")
+                break
+
+            logger.info(f"Step 6: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_m365} tenants remaining")
+            await _update_pipeline(batch_id, 6, "running",
+                f"M365 setup attempt {attempt + 1} — {pending_m365} tenants remaining...")
+
+            try:
+                m365_result = await run_m365_setup(batch_id)
+                logger.info(f"Step 6 attempt {attempt + 1} result: {m365_result.get('processed', 0)} processed, {m365_result.get('failed', 0)} failed")
+            except Exception as e:
+                logger.error(f"Step 6 attempt {attempt + 1} failed: {e}")
+
+            # Increment retry counts for failed tenants
+            async with SessionLocal() as db:
+                failed_tenants = (await db.execute(
+                    select(Tenant).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.first_login_completed == True,
+                        Tenant.domain_verified_in_m365 != True,
+                    )
+                )).scalars().all()
+                for t in failed_tenants:
+                    t.step5_retry_count = (t.step5_retry_count or 0) + 1
+                    if t.step5_retry_count > MAX_PIPELINE_RETRIES:
+                        t.domain_verified_in_m365 = True  # Skip
+                        t.setup_error = f"SKIPPED M365 setup after {MAX_PIPELINE_RETRIES} retries"
+                        await log_activity(batch_id, 6, STEP_NAMES[6], "tenant", str(t.id),
+                            t.custom_domain or t.name, "skipped", t.setup_error)
+                await db.commit()
+
+            if attempt < MAX_PIPELINE_RETRIES:
+                await asyncio.sleep(10)
+
+        # Final count
+        async with SessionLocal() as db:
+            m365_ok = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id, Tenant.domain_verified_in_m365 == True
+                )
+            ) or 0
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.m365_completed = m365_ok
+                await db.commit()
+
+        if job_id in pipeline_jobs:
+            pipeline_jobs[job_id]["steps"]["6"]["completed"] = m365_ok
+            pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
+        logger.info(f"Step 6 complete: {m365_ok} tenants M365 configured")
 
         # ================================================================
-        # STEP 7: Create Mailboxes + Delegate
+        # STEP 7: Create Mailboxes + Delegate (WITH AUTO-RETRY)
         # ================================================================
         await _update_pipeline(batch_id, 7, "running", "Creating mailboxes and delegation...")
         await log_activity(batch_id, 7, STEP_NAMES[7], status="started")
@@ -828,73 +1003,162 @@ async def run_pipeline(batch_id: UUID):
 
         from app.services.azure_step6 import run_step6_for_batch as run_mailbox_creation
 
-        try:
-            await run_mailbox_creation(batch_id, display_name)
+        for attempt in range(MAX_PIPELINE_RETRIES + 1):
+            if await _check_paused_or_stopped(batch_id):
+                return
 
-            # Count actual completions
+            # Check how many still need mailbox creation
             async with SessionLocal() as db:
-                mb_complete = await db.scalar(
+                pending_mb = await db.scalar(
                     select(func.count(Tenant.id)).where(
-                        Tenant.batch_id == batch_id, Tenant.step6_complete == True
+                        Tenant.batch_id == batch_id,
+                        Tenant.domain_verified_in_m365 == True,
+                        Tenant.step6_complete != True,
+                        Tenant.step6_retry_count <= MAX_PIPELINE_RETRIES,
                     )
                 ) or 0
-                batch = await db.get(SetupBatch, batch_id)
-                if batch:
-                    batch.mailboxes_completed_count = mb_complete
-                    await db.commit()
 
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["7"]["completed"] = mb_complete
-                pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
-        except Exception as e:
-            logger.error(f"Step 7 failed: {e}")
-            if job_id in pipeline_jobs:
-                pipeline_jobs[job_id]["steps"]["7"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 7, "error": str(e)})
+            if pending_mb == 0:
+                logger.info("Step 7: All tenants have mailboxes created")
+                break
+
+            logger.info(f"Step 7: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_mb} tenants remaining")
+            await _update_pipeline(batch_id, 7, "running",
+                f"Mailbox creation attempt {attempt + 1} — {pending_mb} tenants remaining...")
+
+            try:
+                await run_mailbox_creation(batch_id, display_name)
+            except Exception as e:
+                logger.error(f"Step 7 attempt {attempt + 1} failed: {e}")
+
+            # Increment retry counts for failed tenants
+            async with SessionLocal() as db:
+                failed_tenants = (await db.execute(
+                    select(Tenant).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.domain_verified_in_m365 == True,
+                        Tenant.step6_complete != True,
+                    )
+                )).scalars().all()
+                for t in failed_tenants:
+                    t.step6_retry_count = (t.step6_retry_count or 0) + 1
+                    if t.step6_retry_count > MAX_PIPELINE_RETRIES:
+                        t.step6_complete = True  # Skip
+                        t.step6_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries"
+                        await log_activity(batch_id, 7, STEP_NAMES[7], "tenant", str(t.id),
+                            t.custom_domain or t.name, "skipped", t.step6_error)
+                await db.commit()
+
+            if attempt < MAX_PIPELINE_RETRIES:
+                await asyncio.sleep(15)
+
+        # Final count
+        async with SessionLocal() as db:
+            mb_complete = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id, Tenant.step6_complete == True
+                )
+            ) or 0
+            batch = await db.get(SetupBatch, batch_id)
+            if batch:
+                batch.mailboxes_completed_count = mb_complete
+                await db.commit()
+
+        if job_id in pipeline_jobs:
+            pipeline_jobs[job_id]["steps"]["7"]["completed"] = mb_complete
+            pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
+        logger.info(f"Step 7 complete: {mb_complete} tenants mailboxes created")
 
         # ================================================================
-        # STEP 8: Enable SMTP Auth
+        # STEP 8: Enable SMTP Auth (WITH AUTO-RETRY)
         # ================================================================
         await _update_pipeline(batch_id, 8, "running", "Enabling SMTP authentication...")
         await log_activity(batch_id, 8, STEP_NAMES[8], status="started")
 
-        async with SessionLocal() as db:
-            tenants = (await db.execute(
-                select(Tenant).where(
-                    Tenant.batch_id == batch_id,
-                    Tenant.step6_complete == True,
-                    Tenant.step7_complete != True,
-                )
-            )).scalars().all()
+        for attempt in range(MAX_PIPELINE_RETRIES + 1):
+            if await _check_paused_or_stopped(batch_id):
+                return
 
-            smtp_ok = 0
-            smtp_fail = 0
-
-            for tenant in tenants:
-                try:
-                    # Call existing SMTP auth function
-                    result = await enable_org_smtp_auth(
-                        admin_email=tenant.admin_email,
-                        admin_password=tenant.admin_password,
-                        totp_secret=tenant.totp_secret,
-                        domain=tenant.custom_domain or tenant.name,
+            # Query tenant list in short-lived session, extract data, then close
+            tenant_list = []
+            async with SessionLocal() as db:
+                tenants = (await db.execute(
+                    select(Tenant).where(
+                        Tenant.batch_id == batch_id,
+                        Tenant.step6_complete == True,
+                        Tenant.step7_complete != True,
+                        Tenant.step7_retry_count <= MAX_PIPELINE_RETRIES,
                     )
+                )).scalars().all()
 
+                if not tenants:
+                    logger.info("Step 8: All tenants have SMTP auth enabled")
+                    break
+
+                # Extract data so we can close the session before long work
+                for t in tenants:
+                    tenant_list.append({
+                        "id": t.id,
+                        "admin_email": t.admin_email,
+                        "admin_password": t.admin_password,
+                        "totp_secret": t.totp_secret,
+                        "domain": t.custom_domain or t.name,
+                    })
+
+            remaining = len(tenant_list)
+            logger.info(f"Step 8: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {remaining} tenants remaining")
+            await _update_pipeline(batch_id, 8, "running",
+                f"SMTP auth attempt {attempt + 1} — {remaining} tenants remaining...")
+
+            # Process each tenant with per-tenant sessions (avoids Neon idle timeout)
+            for td in tenant_list:
+                if await _check_paused_or_stopped(batch_id):
+                    return
+
+                # Do Selenium/PowerShell work OUTSIDE any DB session
+                try:
+                    result = await enable_org_smtp_auth(
+                        admin_email=td["admin_email"],
+                        admin_password=td["admin_password"],
+                        totp_secret=td["totp_secret"],
+                        domain=td["domain"],
+                    )
+                except Exception as e:
+                    result = {"success": False, "error": str(e)}
+
+                # Save result in fresh short-lived session
+                async with SessionLocal() as db:
+                    tenant = await db.get(Tenant, td["id"])
+                    if not tenant:
+                        continue
                     if result.get("success"):
                         tenant.step7_complete = True
-                        smtp_ok += 1
-                        await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id), tenant.custom_domain, "completed")
+                        tenant.step7_smtp_auth_enabled = True
+                        await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
+                            td["domain"], "completed")
                     else:
+                        tenant.step7_retry_count = (tenant.step7_retry_count or 0) + 1
                         tenant.step7_error = result.get("error")
-                        smtp_fail += 1
-                        await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id), tenant.custom_domain, "failed", result.get("error"))
-
+                        if tenant.step7_retry_count > MAX_PIPELINE_RETRIES:
+                            tenant.step7_complete = True  # Skip
+                            tenant.step7_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries: {result.get('error')}"
+                            await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
+                                td["domain"], "skipped", tenant.step7_error)
+                        else:
+                            await log_activity(batch_id, 8, STEP_NAMES[8], "tenant", str(tenant.id),
+                                td["domain"], "failed", result.get("error"))
                     await db.commit()
-                except Exception as e:
-                    tenant.step7_error = str(e)
-                    smtp_fail += 1
-                    await db.commit()
 
+            if attempt < MAX_PIPELINE_RETRIES:
+                await asyncio.sleep(10)
+
+        # Final count
+        async with SessionLocal() as db:
+            smtp_ok = await db.scalar(
+                select(func.count(Tenant.id)).where(
+                    Tenant.batch_id == batch_id, Tenant.step7_complete == True
+                )
+            ) or 0
             batch = await db.get(SetupBatch, batch_id)
             if batch:
                 batch.smtp_completed = smtp_ok
@@ -902,8 +1166,8 @@ async def run_pipeline(batch_id: UUID):
 
         if job_id in pipeline_jobs:
             pipeline_jobs[job_id]["steps"]["8"]["completed"] = smtp_ok
-            pipeline_jobs[job_id]["steps"]["8"]["failed"] = smtp_fail
             pipeline_jobs[job_id]["steps"]["8"]["status"] = "completed"
+        logger.info(f"Step 8 complete: {smtp_ok} tenants SMTP auth enabled")
 
         # ================================================================
         # STEP 9: Export Credentials (auto-generated)
@@ -1025,3 +1289,24 @@ async def log_activity(
         })
         # Keep only last 50 entries in memory
         pipeline_jobs[job_id]["activity_log"] = pipeline_jobs[job_id]["activity_log"][:50]
+
+
+async def resume_interrupted_pipelines():
+    """Resume pipelines that were running when the container restarted."""
+    try:
+        async with SessionLocal() as db:
+            running_batches = (await db.execute(
+                select(SetupBatch).where(
+                    SetupBatch.pipeline_status == "running"
+                )
+            )).scalars().all()
+
+            for batch in running_batches:
+                logger.warning(f"Found interrupted pipeline for batch {batch.id} (was on step {batch.pipeline_step})")
+                # Don't auto-resume — mark as paused so user can manually resume
+                batch.pipeline_status = "paused"
+                batch.pipeline_step_name = f"Interrupted at: {batch.pipeline_step_name or 'Unknown'}"
+                await db.commit()
+                logger.info(f"Marked batch {batch.id} as paused — user can resume from dashboard")
+    except Exception as e:
+        logger.error(f"Failed to check for interrupted pipelines: {e}")
