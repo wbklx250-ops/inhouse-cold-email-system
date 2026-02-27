@@ -164,6 +164,29 @@ export default function PipelineDashboard() {
         </div>
       </div>
 
+      {/* Resume Button — shows when pipeline is stuck/crashed/paused */}
+      {pipelineStatus && (
+        pipelineStatus.status === "error" ||
+        pipelineStatus.status === "paused" ||
+        pipelineStatus.status === "unknown"
+      ) && (
+        <button
+          onClick={async () => {
+            try {
+              const res = await fetch(`${API_BASE}/api/v1/pipeline/${batchId}/resume`, { method: "POST" });
+              const data = await res.json();
+              alert(data.message || "Pipeline resumed!");
+              fetchStatus();
+            } catch (e) {
+              alert("Failed to resume pipeline");
+            }
+          }}
+          className="w-full rounded-lg bg-blue-600 py-3 text-sm font-semibold text-white hover:bg-blue-700 mb-4"
+        >
+          ▶ Resume Pipeline from Step {pipelineStatus.current_step}
+        </button>
+      )}
+
       {/* Overall Status Banner */}
       <div className={`rounded-lg p-4 mb-6 text-sm font-medium ${
         isComplete ? "bg-green-50 text-green-800 border border-green-200" :
