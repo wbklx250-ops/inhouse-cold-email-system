@@ -29,6 +29,7 @@ from app.services.validation_service import (
 from app.services.tenant_import import tenant_import_service
 from app.services.cloudflare import cloudflare_service
 from app.services.selenium.admin_portal import enable_org_smtp_auth
+from app.services.selenium.browser import kill_all_browsers
 
 router = APIRouter(prefix="/api/v1/pipeline", tags=["pipeline"])
 logger = logging.getLogger(__name__)
@@ -1168,6 +1169,12 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
             logger.info(f"Step 5 complete: {login_ok} tenants logged in successfully")
 
+            # === CRITICAL: Clean up all Chrome processes before Step 6 ===
+            logger.info("Cleaning up browser processes between Step 5 and Step 6...")
+            kill_all_browsers()
+            await asyncio.sleep(10)  # Extra cooldown for memory reclamation
+            logger.info("Browser cleanup complete, proceeding to Step 6")
+
           except Exception as step_error:
             logger.error(f"Step 5 CRASHED (continuing to next step): {step_error}")
             import traceback
@@ -1237,7 +1244,9 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
-                    await asyncio.sleep(10)
+                    logger.info(f"Step 6: Cleaning up browsers before retry attempt {attempt + 2}...")
+                    kill_all_browsers()
+                    await asyncio.sleep(15)  # Extra time for memory recovery
 
             async with SessionLocal() as db:
                 m365_ok = await db.scalar(
@@ -1254,6 +1263,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["6"]["completed"] = m365_ok
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
             logger.info(f"Step 6 complete: {m365_ok} tenants M365 configured")
+
+            # === Clean up all Chrome processes before Step 7 ===
+            logger.info("Cleaning up browser processes between Step 6 and Step 7...")
+            kill_all_browsers()
+            await asyncio.sleep(5)
 
           except Exception as step_error:
             logger.error(f"Step 6 CRASHED (continuing to next step): {step_error}")
@@ -1344,6 +1358,11 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["7"]["completed"] = mb_complete
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
             logger.info(f"Step 7 complete: {mb_complete} tenants mailboxes created")
+
+            # === Clean up all Chrome processes before Step 8 ===
+            logger.info("Cleaning up browser processes between Step 7 and Step 8...")
+            kill_all_browsers()
+            await asyncio.sleep(5)
 
           except Exception as step_error:
             logger.error(f"Step 7 CRASHED (continuing to next step): {step_error}")

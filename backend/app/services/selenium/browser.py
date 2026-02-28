@@ -74,10 +74,8 @@ def cleanup_driver(driver: webdriver.Chrome) -> None:
     # Give it a moment to clean up
     time.sleep(2)
 
-    # Force kill orphaned Chrome processes on Windows
     if platform.system() == "Windows":
         try:
-            # Kill ChromeDriver processes
             subprocess.run(
                 ["taskkill", "/F", "/IM", "chromedriver.exe"],
                 capture_output=True,
@@ -86,7 +84,6 @@ def cleanup_driver(driver: webdriver.Chrome) -> None:
         except Exception as e:
             logger.debug("ChromeDriver kill: %s", e)
         
-        # Kill zombie Chrome processes (only our automation ones with specific profile pattern)
         try:
             result = subprocess.run(
                 ["wmic", "process", "where", "name='chrome.exe'", "get", "commandline,processid"],
@@ -94,10 +91,8 @@ def cleanup_driver(driver: webdriver.Chrome) -> None:
                 text=True,
                 timeout=10
             )
-            # Look for our temp profile pattern and kill those
             for line in result.stdout.split('\n'):
                 if 'chrome_profile_' in line and 'user-data-dir' in line:
-                    # Extract PID and kill
                     parts = line.strip().split()
                     if parts:
                         try:
@@ -112,11 +107,77 @@ def cleanup_driver(driver: webdriver.Chrome) -> None:
         except Exception as e:
             logger.debug("Chrome cleanup: %s", e)
     else:
-        # Linux/Mac - use pkill
+        # Linux — kill BOTH chromedriver AND chrome processes
         try:
             subprocess.run(["pkill", "-f", "chromedriver"], capture_output=True, timeout=5)
         except Exception:
             pass
+        try:
+            subprocess.run(["pkill", "-f", "chrome"], capture_output=True, timeout=5)
+        except Exception:
+            pass
+        
+        # Clean up temp profile directories to free disk space
+        try:
+            import glob
+            import shutil
+            for d in glob.glob("/tmp/chrome_profile_*"):
+                try:
+                    shutil.rmtree(d, ignore_errors=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+
+def kill_all_browsers() -> None:
+    """
+    Force kill ALL Chrome and ChromeDriver processes. 
+    Call between pipeline steps to ensure clean slate.
+    """
+    import subprocess
+    import platform
+    import time
+
+    logger.info("BROWSER CLEANUP: Killing all Chrome/ChromeDriver processes...")
+
+    if platform.system() == "Windows":
+        for proc_name in ["chromedriver.exe", "chrome.exe"]:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", proc_name],
+                    capture_output=True,
+                    timeout=10
+                )
+            except Exception:
+                pass
+    else:
+        # Linux — kill everything Chrome-related
+        for pattern in ["chromedriver", "chrome --", "chrome_crashpad", "headless"]:
+            try:
+                subprocess.run(["pkill", "-9", "-f", pattern], capture_output=True, timeout=5)
+            except Exception:
+                pass
+
+    # Clean up ALL temp Chrome profile directories
+    try:
+        import glob
+        import shutil
+        cleaned = 0
+        for d in glob.glob("/tmp/chrome_profile_*"):
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+                cleaned += 1
+            except Exception:
+                pass
+        if cleaned:
+            logger.info(f"BROWSER CLEANUP: Removed {cleaned} temp Chrome profiles")
+    except Exception:
+        pass
+
+    # Wait for OS to reclaim memory
+    time.sleep(5)
+    logger.info("BROWSER CLEANUP: Complete")
 
 
 def take_screenshot(driver: webdriver.Chrome, name: str) -> str:
