@@ -1068,7 +1068,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["4"]["status"] = "completed"
 
         # ================================================================
-        # STEP 5: First Login Automation (WITH AUTO-RETRY)
+        # STEP 5: First Login Automation (BATCHED WITH CLEANUP)
         # ================================================================
         if start_from_step <= 5:
           try:
@@ -1081,10 +1081,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
 
             from app.services.tenant_automation import process_tenants_parallel
 
+            CHUNK_SIZE = 20  # Process 20 tenants at a time, then full cleanup
+
             for attempt in range(MAX_PIPELINE_RETRIES + 1):
                 if await _check_paused_or_stopped(batch_id):
                     return
 
+                # Get all tenants still needing first login
                 async with SessionLocal() as db:
                     tenants = (await db.execute(
                         select(Tenant).where(
@@ -1103,19 +1106,32 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     await _update_pipeline(batch_id, 5, "running",
                         f"First login attempt {attempt + 1} — {remaining} tenants remaining...")
 
-                    tenant_data = [
+                    all_tenant_data = [
                         {
                             "tenant_id": str(t.id),
                             "admin_email": t.admin_email,
-                            "initial_password": t.admin_password,  # KEY MUST BE initial_password
+                            "initial_password": t.admin_password,
                         }
                         for t in tenants
                     ]
 
-                if tenant_data:
-                    try:
-                        results = await process_tenants_parallel(tenant_data, new_password, max_workers=STEP5_MAX_WORKERS)
+                # Process in chunks with cleanup between each
+                for chunk_idx in range(0, len(all_tenant_data), CHUNK_SIZE):
+                    if await _check_paused_or_stopped(batch_id):
+                        return
 
+                    chunk = all_tenant_data[chunk_idx:chunk_idx + CHUNK_SIZE]
+                    chunk_num = (chunk_idx // CHUNK_SIZE) + 1
+                    total_chunks = (len(all_tenant_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
+
+                    logger.info(f"Step 5: Processing chunk {chunk_num}/{total_chunks} ({len(chunk)} tenants)")
+                    await _update_pipeline(batch_id, 5, "running",
+                        f"First login — chunk {chunk_num}/{total_chunks} ({len(chunk)} tenants)...")
+
+                    try:
+                        results = await process_tenants_parallel(chunk, new_password, max_workers=STEP5_MAX_WORKERS)
+
+                        # Save results immediately after each chunk
                         async with SessionLocal() as db:
                             for r in results:
                                 try:
@@ -1145,10 +1161,20 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                                                 t.custom_domain or t.name, "failed", r.get("error"))
                                     await db.commit()
                                 except Exception as e:
-                                    logger.error(f"Failed to save Step 5 result: {e}")
-                    except Exception as e:
-                        logger.error(f"Step 5 attempt {attempt + 1} failed: {e}")
+                                    logger.error(f"Failed to save Step 5 result for {r.get('tenant_id')}: {e}")
 
+                    except Exception as e:
+                        logger.error(f"Step 5 chunk {chunk_num} crashed: {e}")
+                        import traceback
+                        logger.error(traceback.format_exc())
+
+                    # === CRITICAL: Kill ALL Chrome between chunks ===
+                    logger.info(f"Step 5: Cleaning up browsers after chunk {chunk_num}/{total_chunks}...")
+                    kill_all_browsers()
+                    await asyncio.sleep(5)
+
+                # After all chunks, cleanup + wait before potential retry
+                kill_all_browsers()
                 if attempt < MAX_PIPELINE_RETRIES:
                     await asyncio.sleep(10)
 
@@ -1169,20 +1195,20 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "completed"
             logger.info(f"Step 5 complete: {login_ok} tenants logged in successfully")
 
-            # === CRITICAL: Clean up all Chrome processes before Step 6 ===
-            logger.info("Cleaning up browser processes between Step 5 and Step 6...")
+            # === FINAL CLEANUP before Step 6 ===
+            logger.info("Step 5 done — full browser cleanup before Step 6...")
             kill_all_browsers()
-            await asyncio.sleep(10)  # Extra cooldown for memory reclamation
-            logger.info("Browser cleanup complete, proceeding to Step 6")
+            await asyncio.sleep(10)
 
           except Exception as step_error:
-            logger.error(f"Step 5 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 5 CRASHED: {step_error}")
             import traceback
             logger.error(traceback.format_exc())
             await log_activity(batch_id, 5, STEP_NAMES[5], status="error", message=str(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "error"
                 pipeline_jobs[job_id]["errors"].append({"step": 5, "error": str(step_error)})
+            kill_all_browsers()
         else:
             logger.info(f"Skipping Step 5 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1193,6 +1219,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         # ================================================================
         if start_from_step <= 6:
           try:
+            kill_all_browsers()
+            await asyncio.sleep(3)
             await _update_pipeline(batch_id, 6, "running", "Adding domains to M365 and configuring DKIM...")
             await log_activity(batch_id, 6, STEP_NAMES[6], status="started")
 
@@ -1287,6 +1315,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         # ================================================================
         if start_from_step <= 7:
           try:
+            kill_all_browsers()
+            await asyncio.sleep(3)
             await _update_pipeline(batch_id, 7, "running", "Creating mailboxes and delegation...")
             await log_activity(batch_id, 7, STEP_NAMES[7], status="started")
 
@@ -1341,6 +1371,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
+                    kill_all_browsers()
                     await asyncio.sleep(15)
 
             async with SessionLocal() as db:
@@ -1382,6 +1413,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         # ================================================================
         if start_from_step <= 8:
           try:
+            kill_all_browsers()
+            await asyncio.sleep(3)
             await _update_pipeline(batch_id, 8, "running", "Enabling SMTP authentication...")
             await log_activity(batch_id, 8, STEP_NAMES[8], status="started")
 
@@ -1455,7 +1488,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
-                    await asyncio.sleep(10)
+                    kill_all_browsers()
+                    await asyncio.sleep(15)
 
             async with SessionLocal() as db:
                 smtp_ok = await db.scalar(
@@ -1472,6 +1506,9 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["8"]["completed"] = smtp_ok
                 pipeline_jobs[job_id]["steps"]["8"]["status"] = "completed"
             logger.info(f"Step 8 complete: {smtp_ok} tenants SMTP auth enabled")
+
+            kill_all_browsers()
+            await asyncio.sleep(5)
 
           except Exception as step_error:
             logger.error(f"Step 8 CRASHED (continuing to next step): {step_error}")
