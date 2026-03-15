@@ -44,6 +44,28 @@ class TenantUpdate(BaseModel):
     setup_error: str | None = None
 
 
+class DomainBrief(BaseModel):
+    """Lightweight domain info for embedding in tenant responses."""
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    name: str
+    status: str
+    domain_index_in_tenant: int = 0
+    # M365 / DNS / DKIM status
+    domain_verified_in_m365: bool = False
+    dkim_enabled: bool = False
+    dns_records_created: bool = False
+    mx_configured: bool = False
+    spf_configured: bool = False
+    dmarc_configured: bool = False
+    # Mailbox tracking (per-domain)
+    step6_complete: bool = False
+    step6_mailboxes_created: int = 0
+    # Error
+    error_message: str | None = None
+
+
 class TenantRead(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
@@ -77,7 +99,7 @@ class TenantRead(BaseModel):
     dkim_selector1_cname: str | None = None
     dkim_selector2_cname: str | None = None
     dkim_cnames_added: bool = False
-    dkim_enabled: bool = False
+    dkim_enabled: bool = False  # TODO: Deprecate in future migration — read from domains instead
     
     # Mailbox tracking
     mailbox_count: int = 0
@@ -95,6 +117,9 @@ class TenantRead(BaseModel):
     
     # Batch relationship
     batch_id: UUID | None = None
+    
+    # All domains linked to this tenant (multi-domain support)
+    domains: List[DomainBrief] = []
     
     # Timestamps
     created_at: datetime

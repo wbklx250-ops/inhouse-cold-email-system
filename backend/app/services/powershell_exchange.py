@@ -851,6 +851,7 @@ Write-Output "CONNECTED_SUCCESS"
         self,
         mailboxes: List[Dict[str, str]],
         delegate_to: str,
+        start_index: int = 1,
     ) -> Dict[str, Any]:
         """
         Create shared mailboxes with numbered names, fix display names, add delegation.
@@ -858,6 +859,7 @@ Write-Output "CONNECTED_SUCCESS"
         Args:
             mailboxes: List of {"email": "...", "display_name": "...", "password": "..."}
             delegate_to: Licensed user email (me1@domain)
+            start_index: Starting index for numbered display names (e.g., 51 for second domain)
         """
 
         if not self.connected:
@@ -876,8 +878,8 @@ Write-Output "CONNECTED_SUCCESS"
         # STEP 1: Create mailboxes with NUMBERED display names
         # RELIABILITY FIX: Check if mailbox exists FIRST via Get-Mailbox before attempting New-Mailbox
         # This prevents "name already being used" errors on retry
-        logger.info("Creating %s shared mailboxes...", len(mailboxes))
-        for i, mb in enumerate(mailboxes, 1):
+        logger.info("Creating %s shared mailboxes (start_index=%s)...", len(mailboxes), start_index)
+        for i, mb in enumerate(mailboxes, start_index):
             email = mb["email"]
             numbered_name = f"{base_display_name} {i}"
             escaped_email = self._ps_escape(email)

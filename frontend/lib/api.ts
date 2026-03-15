@@ -335,8 +335,25 @@ export interface TenantUpdate {
   domain_id?: string;
 }
 
+export interface DomainBrief {
+  id: string;
+  name: string;
+  status: string;
+  domain_index_in_tenant: number;
+  domain_verified_in_m365: boolean;
+  dkim_enabled: boolean;
+  dns_records_created: boolean;
+  mx_configured: boolean;
+  spf_configured: boolean;
+  dmarc_configured: boolean;
+  step6_complete: boolean;
+  step6_mailboxes_created: number;
+  error_message: string | null;
+}
+
 export interface TenantWithDomain extends Tenant {
   domain: Domain | null;
+  domains: DomainBrief[];
 }
 
 // ============================================================================

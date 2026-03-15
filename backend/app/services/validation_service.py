@@ -233,6 +233,7 @@ def cross_validate(
     first_name: str,
     last_name: str,
     mailboxes_per_tenant: int = 50,
+    domains_per_tenant: int = 1,
 ) -> Dict[str, Any]:
     """
     Cross-validate all inputs and return a complete preview.
@@ -255,19 +256,25 @@ def cross_validate(
     if unmatched_tenants:
         warnings.append(f"{len(unmatched_tenants)} tenant(s) have no matching credentials")
 
-    # 2. Check domain-tenant count alignment
-    if len(domains) < len(tenants):
-        warnings.append(f"More tenants ({len(tenants)}) than domains ({len(domains)}) — {len(tenants) - len(domains)} tenants won't get a domain")
-    elif len(domains) > len(tenants):
-        warnings.append(f"More domains ({len(domains)}) than tenants ({len(tenants)}) — {len(domains) - len(tenants)} extra domains")
+    # 2. Check domain-tenant count alignment (N:1 check)
+    expected_domain_count = len(tenants) * domains_per_tenant
+    if len(domains) != expected_domain_count:
+        errors.append(
+            f"With {domains_per_tenant} domain(s) per tenant and {len(tenants)} tenants, "
+            f"expected {expected_domain_count} domains but got {len(domains)}. "
+            f"Domain count must be exactly tenants × {domains_per_tenant}."
+        )
+    elif len(domains) % domains_per_tenant != 0:
+        errors.append(
+            f"Domain count ({len(domains)}) is not evenly divisible by domains_per_tenant ({domains_per_tenant})."
+        )
 
     # 3. Check name generates enough patterns
     if len(first_name) < 2 or len(last_name) < 2:
         errors.append("First and last name must each be at least 2 characters for email generation")
 
     # 4. Calculate expected mailboxes
-    linked_count = min(len(domains), len(tenants))
-    expected_mailboxes = linked_count * mailboxes_per_tenant
+    expected_mailboxes = len(tenants) * domains_per_tenant * mailboxes_per_tenant
 
     return {
         "valid": len(errors) == 0,
@@ -276,9 +283,9 @@ def cross_validate(
         "summary": {
             "domains_count": len(domains),
             "tenants_count": len(tenants),
+            "domains_per_tenant": domains_per_tenant,
             "credentials_matched": matched_count,
-            "credentials_unmatched": len(unmatched_tenants),
-            "domains_linked": linked_count,
+            "domains_linked": len(tenants) * domains_per_tenant,
             "expected_mailboxes": expected_mailboxes,
         }
     }

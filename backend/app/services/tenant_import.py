@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
 from app.models.tenant import Tenant, TenantStatus
-from app.models.domain import Domain
+from app.models.domain import Domain, DomainStatus
 
 
 @dataclass
@@ -426,57 +426,51 @@ class TenantImportService:
     async def auto_link_domains(
         self,
         db: AsyncSession,
-        batch_id: UUID
+        batch_id: UUID,
+        domains_per_tenant: int = 1,
     ) -> Dict[str, Any]:
-        """Auto-link tenants to domains (1:1 in order).
+        """Auto-link domains to tenants (N:1 grouping).
         
-        FIXED: Now correctly filters domains by checking ALL tenants in the batch
-        (not just unlinked tenants) to avoid double-linking domains that are
-        already assigned to other tenants.
+        Assigns `domains_per_tenant` domains to each tenant in creation order.
+        Each domain gets a `domain_index_in_tenant` (0, 1, 2...) and the
+        tenant's primary `domain_id` is set to the first domain in its group.
         """
         
-        # Get unlinked tenants
-        tenants = (await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.domain_id == None
-            ).order_by(Tenant.created_at)
-        )).scalars().all()
-        
-        # Get domains that don't have ANY tenant linked to them
-        # Query ALL tenants in the batch to build proper exclusion set
-        all_tenants = (await db.execute(
-            select(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.domain_id.isnot(None)
-            )
-        )).scalars().all()
-        
-        linked_domain_ids = {t.domain_id for t in all_tenants}
-        
-        # Get all domains in the batch, filtering out already-linked ones
-        domains = (await db.execute(
-            select(Domain).where(
-                Domain.batch_id == batch_id
-            ).order_by(Domain.created_at)
-        )).scalars().all()
-        
-        available_domains = [d for d in domains if d.id not in linked_domain_ids]
-        
+        # Get unlinked domains for this batch, ordered by creation time
+        domains_result = await db.execute(
+            select(Domain)
+            .where(Domain.batch_id == batch_id, Domain.tenant_id.is_(None))
+            .order_by(Domain.created_at)
+        )
+        domains = domains_result.scalars().all()
+
+        # Get tenants for this batch, ordered by creation time
+        tenants_result = await db.execute(
+            select(Tenant)
+            .where(Tenant.batch_id == batch_id)
+            .order_by(Tenant.created_at)
+        )
+        tenants = tenants_result.scalars().all()
+
         linked = 0
-        for tenant, domain in zip(tenants, available_domains):
-            tenant.domain_id = domain.id
-            tenant.custom_domain = domain.name
-            domain.tenant_id = tenant.id  # Set both sides of the relationship
-            linked += 1
-        
-        await db.commit()
-        
-        return {
-            "tenants_available": len(tenants),
-            "domains_available": len(available_domains),
-            "linked": linked
-        }
+        # Assign domains in groups of domains_per_tenant to each tenant
+        for tenant_idx, tenant in enumerate(tenants):
+            group_start = tenant_idx * domains_per_tenant
+            group_end = group_start + domains_per_tenant
+            tenant_domains = domains[group_start:group_end]
+
+            for domain_position, domain in enumerate(tenant_domains):
+                domain.tenant_id = tenant.id
+                domain.domain_index_in_tenant = domain_position  # 0, 1, 2...
+                domain.status = DomainStatus.TENANT_LINKED
+                linked += 1
+
+            # Set tenant's primary domain_id to the first domain in the group
+            if tenant_domains:
+                tenant.domain_id = tenant_domains[0].id
+
+        await db.flush()
+        return {"linked": linked, "domains_per_tenant": domains_per_tenant}
 
 
 tenant_import_service = TenantImportService()

@@ -100,9 +100,23 @@ async def create_tenant(
 async def get_tenant(
     tenant_id: UUID,
     db: AsyncSession = Depends(get_db),
-) -> Tenant:
-    """Get a single tenant by ID."""
-    return await get_tenant_or_404(tenant_id, db)
+):
+    """Get a single tenant by ID, including all linked domains."""
+    tenant = await get_tenant_or_404(tenant_id, db)
+
+    # Fetch ALL domains linked to this tenant (multi-domain support)
+    linked_domains_result = await db.execute(
+        select(Domain)
+        .where(Domain.tenant_id == tenant_id)
+        .order_by(Domain.domain_index_in_tenant)
+    )
+    linked_domains = linked_domains_result.scalars().all()
+
+    # Convert tenant ORM -> dict, then inject domains list
+    from app.schemas.tenant import TenantRead as TenantReadSchema, DomainBrief
+    tenant_data = TenantReadSchema.model_validate(tenant)
+    tenant_data.domains = [DomainBrief.model_validate(d) for d in linked_domains]
+    return tenant_data
 
 
 @router.patch("/{tenant_id}", response_model=TenantRead)

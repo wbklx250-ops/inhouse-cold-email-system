@@ -27,6 +27,7 @@ interface PipelineStatus {
   message: string;
   total_domains: number;
   total_tenants: number;
+  domains_per_tenant?: number;
   nameserver_groups?: Array<{ nameservers: string[]; domains: string[]; count: number }>;
   steps: Record<string, { status: string; completed: number; failed: number; total: number }>;
   errors: Array<{ step: number; error: string }>;
@@ -138,6 +139,11 @@ export default function PipelineDashboard() {
           <h1 className="text-2xl font-bold text-gray-900">{pipelineStatus.batch_name}</h1>
           <p className="text-sm text-gray-500">
             {pipelineStatus.total_domains} domains · {pipelineStatus.total_tenants} tenants
+            {(pipelineStatus.domains_per_tenant ?? 1) > 1 && (
+              <span className="ml-1 text-blue-600 font-medium">
+                · {pipelineStatus.domains_per_tenant} domains/tenant
+              </span>
+            )}
           </p>
         </div>
         <div className="flex gap-2">

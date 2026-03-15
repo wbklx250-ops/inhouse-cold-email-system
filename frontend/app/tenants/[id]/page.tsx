@@ -6,6 +6,7 @@ import {
   TenantWithDomain,
   TenantStatus,
   Domain,
+  DomainBrief,
   getTenant,
   linkDomainToTenant,
   generateMailboxesLegacy,
@@ -231,16 +232,94 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
       </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        {/* Linked Domain Card */}
+        {/* Linked Domains Card — supports multi-domain per tenant */}
         <div className="bg-white rounded-lg border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Linked Domain</h2>
+          <h2 className="text-lg font-semibold text-gray-900 mb-4">
+            Linked Domains
+            {/* Show count badge when multiple domains */}
+            {((tenant.domains && tenant.domains.length > 0) ? tenant.domains.length : (tenant.domain ? 1 : 0)) > 0 && (
+              <span className="ml-2 text-xs font-normal bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">
+                {(tenant.domains && tenant.domains.length > 0) ? tenant.domains.length : (tenant.domain ? 1 : 0)}
+              </span>
+            )}
+          </h2>
 
-          {tenant.domain ? (
+          {/* Multi-domain display: use tenant.domains if available, fall back to tenant.domain for backwards compat */}
+          {(tenant.domains && tenant.domains.length > 0) ? (
+            <div className="space-y-3">
+              {tenant.domains.map((d: DomainBrief, idx: number) => (
+                <div key={d.id} className="border border-gray-100 rounded-lg p-4 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-blue-100 text-blue-600 text-sm font-bold">
+                        {d.domain_index_in_tenant !== undefined && d.domain_index_in_tenant !== null
+                          ? `D${d.domain_index_in_tenant}`
+                          : `D${idx}`}
+                      </div>
+                      <div>
+                        <p className="font-medium text-gray-900">{d.name}</p>
+                        <div className="flex items-center gap-2 mt-0.5">
+                          <span className={`text-xs px-1.5 py-0.5 rounded ${
+                            d.status === "active" ? "bg-green-100 text-green-700" :
+                            d.status === "error" ? "bg-red-100 text-red-700" :
+                            "bg-gray-100 text-gray-600"
+                          }`}>
+                            {d.status}
+                          </span>
+                          {d.domain_verified_in_m365 && (
+                            <span className="text-xs text-green-600">✓ M365 Verified</span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                    <Link
+                      href={`/domains/${d.id}`}
+                      className="text-sm text-blue-600 hover:text-blue-800"
+                    >
+                      View
+                    </Link>
+                  </div>
+
+                  {/* DNS configuration badges */}
+                  <div className="flex flex-wrap gap-1.5">
+                    <span className={`px-2 py-0.5 text-xs rounded ${d.mx_configured ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                      MX {d.mx_configured ? "✓" : "✗"}
+                    </span>
+                    <span className={`px-2 py-0.5 text-xs rounded ${d.spf_configured ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                      SPF {d.spf_configured ? "✓" : "✗"}
+                    </span>
+                    <span className={`px-2 py-0.5 text-xs rounded ${d.dkim_enabled ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                      DKIM {d.dkim_enabled ? "✓" : "✗"}
+                    </span>
+                    <span className={`px-2 py-0.5 text-xs rounded ${d.dmarc_configured ? "bg-green-100 text-green-700" : "bg-gray-100 text-gray-400"}`}>
+                      DMARC {d.dmarc_configured ? "✓" : "✗"}
+                    </span>
+                  </div>
+
+                  {/* Mailbox & step6 info */}
+                  <div className="flex items-center gap-4 text-xs text-gray-500">
+                    <span>
+                      Mailboxes: <span className="font-medium text-gray-700">{d.step6_mailboxes_created ?? 0}</span>
+                    </span>
+                    {d.step6_complete && (
+                      <span className="text-green-600">Step 6 Complete ✓</span>
+                    )}
+                    {d.error_message && (
+                      <span className="text-red-500 truncate max-w-[200px]" title={d.error_message}>
+                        ⚠ {d.error_message}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : tenant.domain ? (
+            /* Backwards compatibility: single domain fallback */
             <div className="space-y-4">
               <div className="flex items-center justify-between p-4 bg-gray-50 rounded-lg">
                 <div className="flex items-center gap-3">
                   <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-blue-100 text-blue-600">
-                    G
+                    D0
                   </div>
                   <div>
                     <p className="font-medium text-gray-900">{tenant.domain.name}</p>
@@ -263,6 +342,7 @@ export default function TenantDetailPage({ params }: TenantDetailPageProps) {
                 {tenant.domain.spf_configured && (
                   <span className="px-2 py-1 bg-green-100 text-green-700 text-xs rounded">SPF</span>
                 )}
+                {/* TODO: Deprecate tenant.domain.dkim_enabled — read from domains instead */}
                 {tenant.domain.dkim_enabled && (
                   <span className="px-2 py-1 bg-green-100 text-green-700 text-xs rounded">DKIM</span>
                 )}

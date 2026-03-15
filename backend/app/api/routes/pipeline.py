@@ -61,6 +61,7 @@ async def validate_inputs(
     credentials_txt: UploadFile = File(...),
     first_name: str = Form(...),
     last_name: str = Form(...),
+    domains_per_tenant: int = Form(1),
 ):
     """
     Validate all input files without creating anything.
@@ -90,7 +91,7 @@ async def validate_inputs(
         }
 
     # Cross-validate (mailboxes_per_tenant always 50)
-    result = cross_validate(domains, tenants, credentials, first_name, last_name, 50)
+    result = cross_validate(domains, tenants, credentials, first_name, last_name, 50, domains_per_tenant)
     return result
 
 
@@ -104,6 +105,7 @@ async def create_and_start(
     last_name: str = Form(...),
     sequencer_platform: str = Form(""),
     sequencer_account_id: str = Form(""),
+    domains_per_tenant: int = Form(1),
     sequencer_api_key: str = Form(""),
     profile_photo: UploadFile = File(None),
     background_tasks: BackgroundTasks = BackgroundTasks(),
@@ -136,7 +138,7 @@ async def create_and_start(
     if all_errors:
         raise HTTPException(400, detail={"errors": all_errors})
 
-    validation = cross_validate(domains, tenants, credentials, first_name, last_name, 50)
+    validation = cross_validate(domains, tenants, credentials, first_name, last_name, 50, domains_per_tenant)
     if not validation["valid"]:
         raise HTTPException(400, detail={"errors": validation["errors"]})
 
@@ -158,6 +160,7 @@ async def create_and_start(
         persona_first_name=first_name,
         persona_last_name=last_name,
         mailboxes_per_tenant=50,  # Always 50
+        domains_per_tenant=domains_per_tenant,
         sequencer_platform=sequencer_platform or None,
         sequencer_login_email=None,  # No longer collected here
         sequencer_login_password=None,  # No longer collected here
@@ -214,8 +217,8 @@ async def create_and_start(
         db, batch_id, tenants_content, creds_content, provider="reseller"
     )
 
-    # Auto-link domains to tenants (1:1 in order)
-    link_result = await tenant_import_service.auto_link_domains(db, batch_id)
+    # Auto-link domains to tenants (N:1 in order)
+    link_result = await tenant_import_service.auto_link_domains(db, batch_id, domains_per_tenant)
 
     await db.commit()
 
@@ -272,6 +275,7 @@ async def get_pipeline_status(batch_id: UUID, db: AsyncSession = Depends(get_db)
         "current_step_name": STEP_NAMES.get(batch.pipeline_step, "Unknown"),
         "total_domains": batch.total_domains or 0,
         "total_tenants": batch.total_tenants or 0,
+        "domains_per_tenant": batch.domains_per_tenant or 1,
     }
 
 
@@ -335,12 +339,22 @@ async def retry_failed(
         )
     if step == 6 or step is None:
         await db.execute(
-            sql_update(Tenant).where(
-                Tenant.batch_id == batch_id,
-                Tenant.domain_verified_in_m365 != True,
-            ).values(step5_retry_count=0, setup_error=None)
+            sql_update(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365 != True,
+            ).values(step5_retry_count=0, error_message=None)
         )
     if step == 7 or step is None:
+        # Reset Domain-level step6 completion (domain-based iteration)
+        await db.execute(
+            sql_update(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.step6_complete != True,
+            ).values(step6_complete=False, step6_mailboxes_created=0, error_message=None)
+        )
+        # Also reset Tenant-level for backward compatibility
         await db.execute(
             sql_update(Tenant).where(
                 Tenant.batch_id == batch_id,
@@ -1230,23 +1244,24 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 if await _check_paused_or_stopped(batch_id):
                     return
 
+                # Count domains still needing M365 setup
                 async with SessionLocal() as db:
                     pending_m365 = await db.scalar(
-                        select(func.count(Tenant.id)).where(
-                            Tenant.batch_id == batch_id,
-                            Tenant.first_login_completed == True,
-                            Tenant.domain_verified_in_m365 != True,
-                            Tenant.step5_retry_count <= MAX_PIPELINE_RETRIES,
+                        select(func.count(Domain.id)).where(
+                            Domain.batch_id == batch_id,
+                            Domain.tenant_id.isnot(None),
+                            Domain.domain_verified_in_m365 != True,
+                            Domain.step5_retry_count <= MAX_PIPELINE_RETRIES,
                         )
                     ) or 0
 
                 if pending_m365 == 0:
-                    logger.info("Step 6: All tenants have M365 domains configured")
+                    logger.info("Step 6: All domains have M365 setup configured")
                     break
 
-                logger.info(f"Step 6: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_m365} tenants remaining")
+                logger.info(f"Step 6: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_m365} domains remaining")
                 await _update_pipeline(batch_id, 6, "running",
-                    f"M365 setup attempt {attempt + 1} — {pending_m365} tenants remaining...")
+                    f"M365 setup attempt {attempt + 1} — {pending_m365} domains remaining...")
 
                 try:
                     m365_result = await run_m365_setup(batch_id)
@@ -1254,21 +1269,23 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 except Exception as e:
                     logger.error(f"Step 6 attempt {attempt + 1} failed: {e}")
 
+                # Increment retry counts on failed domains and skip if exceeded
                 async with SessionLocal() as db:
-                    failed_tenants = (await db.execute(
-                        select(Tenant).where(
-                            Tenant.batch_id == batch_id,
-                            Tenant.first_login_completed == True,
-                            Tenant.domain_verified_in_m365 != True,
+                    failed_domains = (await db.execute(
+                        select(Domain).where(
+                            Domain.batch_id == batch_id,
+                            Domain.tenant_id.isnot(None),
+                            Domain.domain_verified_in_m365 != True,
                         )
                     )).scalars().all()
-                    for t in failed_tenants:
-                        t.step5_retry_count = (t.step5_retry_count or 0) + 1
-                        if t.step5_retry_count > MAX_PIPELINE_RETRIES:
-                            t.domain_verified_in_m365 = True
-                            t.setup_error = f"SKIPPED M365 setup after {MAX_PIPELINE_RETRIES} retries"
-                            await log_activity(batch_id, 6, STEP_NAMES[6], "tenant", str(t.id),
-                                t.custom_domain or t.name, "skipped", t.setup_error)
+                    for d in failed_domains:
+                        d.step5_retry_count = (d.step5_retry_count or 0) + 1
+                        if d.step5_retry_count > MAX_PIPELINE_RETRIES:
+                            d.domain_verified_in_m365 = True
+                            d.dkim_enabled = True
+                            d.error_message = f"SKIPPED M365 setup after {MAX_PIPELINE_RETRIES} retries"
+                            await log_activity(batch_id, 6, STEP_NAMES[6], "domain", str(d.id),
+                                d.name, "skipped", d.error_message)
                     await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
@@ -1276,10 +1293,14 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     kill_all_browsers()
                     await asyncio.sleep(15)  # Extra time for memory recovery
 
+            # Step 6 is complete when ALL domains have domain_verified_in_m365=True AND dkim_enabled=True
             async with SessionLocal() as db:
                 m365_ok = await db.scalar(
-                    select(func.count(Tenant.id)).where(
-                        Tenant.batch_id == batch_id, Tenant.domain_verified_in_m365 == True
+                    select(func.count(Domain.id)).where(
+                        Domain.batch_id == batch_id,
+                        Domain.tenant_id.isnot(None),
+                        Domain.domain_verified_in_m365 == True,
+                        Domain.dkim_enabled == True,
                     )
                 ) or 0
                 batch = await db.get(SetupBatch, batch_id)
@@ -1290,7 +1311,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["6"]["completed"] = m365_ok
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
-            logger.info(f"Step 6 complete: {m365_ok} tenants M365 configured")
+            logger.info(f"Step 6 complete: {m365_ok} domains M365 configured")
 
             # === Clean up all Chrome processes before Step 7 ===
             logger.info("Cleaning up browser processes between Step 6 and Step 7...")
@@ -1311,7 +1332,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
 
         # ================================================================
-        # STEP 7: Create Mailboxes + Delegate (WITH AUTO-RETRY)
+        # STEP 7: Create Mailboxes + Delegate (WITH AUTO-RETRY, DOMAIN-BASED)
         # ================================================================
         if start_from_step <= 7:
           try:
@@ -1330,54 +1351,74 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 if await _check_paused_or_stopped(batch_id):
                     return
 
+                # Count DOMAINS still needing mailbox creation (domain-based iteration)
                 async with SessionLocal() as db:
                     pending_mb = await db.scalar(
-                        select(func.count(Tenant.id)).where(
-                            Tenant.batch_id == batch_id,
-                            Tenant.domain_verified_in_m365 == True,
-                            Tenant.step6_complete != True,
-                            Tenant.step6_retry_count <= MAX_PIPELINE_RETRIES,
+                        select(func.count(Domain.id)).where(
+                            Domain.batch_id == batch_id,
+                            Domain.tenant_id.isnot(None),
+                            Domain.domain_verified_in_m365 == True,
+                            Domain.dkim_enabled == True,
+                            Domain.step6_complete != True,
                         )
                     ) or 0
 
                 if pending_mb == 0:
-                    logger.info("Step 7: All tenants have mailboxes created")
+                    logger.info("Step 7: All domains have mailboxes created")
                     break
 
-                logger.info(f"Step 7: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_mb} tenants remaining")
+                logger.info(f"Step 7: Attempt {attempt + 1}/{MAX_PIPELINE_RETRIES + 1} — {pending_mb} domains remaining")
                 await _update_pipeline(batch_id, 7, "running",
-                    f"Mailbox creation attempt {attempt + 1} — {pending_mb} tenants remaining...")
+                    f"Mailbox creation attempt {attempt + 1} — {pending_mb} domains remaining...")
 
                 try:
                     await run_mailbox_creation(batch_id, display_name)
                 except Exception as e:
                     logger.error(f"Step 7 attempt {attempt + 1} failed: {e}")
 
-                async with SessionLocal() as db:
-                    failed_tenants = (await db.execute(
-                        select(Tenant).where(
-                            Tenant.batch_id == batch_id,
-                            Tenant.domain_verified_in_m365 == True,
-                            Tenant.step6_complete != True,
-                        )
-                    )).scalars().all()
-                    for t in failed_tenants:
-                        t.step6_retry_count = (t.step6_retry_count or 0) + 1
-                        if t.step6_retry_count > MAX_PIPELINE_RETRIES:
-                            t.step6_complete = True
-                            t.step6_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries"
-                            await log_activity(batch_id, 7, STEP_NAMES[7], "tenant", str(t.id),
-                                t.custom_domain or t.name, "skipped", t.step6_error)
-                    await db.commit()
+                # On final attempt, force-complete any remaining failed domains
+                if attempt >= MAX_PIPELINE_RETRIES:
+                    async with SessionLocal() as db:
+                        failed_domains = (await db.execute(
+                            select(Domain).where(
+                                Domain.batch_id == batch_id,
+                                Domain.tenant_id.isnot(None),
+                                Domain.domain_verified_in_m365 == True,
+                                Domain.dkim_enabled == True,
+                                Domain.step6_complete != True,
+                            )
+                        )).scalars().all()
+                        for d in failed_domains:
+                            d.step6_complete = True
+                            d.error_message = f"SKIPPED mailbox creation after {MAX_PIPELINE_RETRIES} retries"
+                            await log_activity(batch_id, 7, STEP_NAMES[7], "domain", str(d.id),
+                                d.name, "skipped", d.error_message)
+                            # Also mark the parent tenant as complete if all its domains are done
+                            if d.tenant_id:
+                                remaining = await db.scalar(
+                                    select(func.count(Domain.id)).where(
+                                        Domain.tenant_id == d.tenant_id,
+                                        Domain.step6_complete != True,
+                                    )
+                                ) or 0
+                                if remaining == 0:
+                                    t = await db.get(Tenant, d.tenant_id)
+                                    if t and not t.step6_complete:
+                                        t.step6_complete = True
+                                        t.step6_error = f"SKIPPED after {MAX_PIPELINE_RETRIES} retries"
+                        await db.commit()
 
                 if attempt < MAX_PIPELINE_RETRIES:
                     kill_all_browsers()
                     await asyncio.sleep(15)
 
+            # Count completed domains for progress tracking
             async with SessionLocal() as db:
                 mb_complete = await db.scalar(
-                    select(func.count(Tenant.id)).where(
-                        Tenant.batch_id == batch_id, Tenant.step6_complete == True
+                    select(func.count(Domain.id)).where(
+                        Domain.batch_id == batch_id,
+                        Domain.tenant_id.isnot(None),
+                        Domain.step6_complete == True,
                     )
                 ) or 0
                 batch = await db.get(SetupBatch, batch_id)
@@ -1388,7 +1429,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["completed"] = mb_complete
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "completed"
-            logger.info(f"Step 7 complete: {mb_complete} tenants mailboxes created")
+            logger.info(f"Step 7 complete: {mb_complete} domains mailboxes created")
 
             # === Clean up all Chrome processes before Step 8 ===
             logger.info("Cleaning up browser processes between Step 7 and Step 8...")

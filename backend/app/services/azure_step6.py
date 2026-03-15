@@ -27,6 +27,7 @@ from sqlalchemy import select, update, func
 from app.core.config import get_settings
 from app.db.session import SessionLocal, async_session_factory, BackgroundSessionLocal
 from app.models.batch import SetupBatch, BatchStatus
+from app.models.domain import Domain
 from app.models.mailbox import Mailbox, MailboxStatus
 from app.models.tenant import Tenant, TenantStatus
 from app.services.email_generator import generate_emails_for_domain
@@ -111,16 +112,20 @@ async def save_to_db_with_retry(operation, max_retries=3, description="DB operat
 
 
 async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, Any]:
-    """Run Step 6 for all eligible tenants in a batch."""
+    """Run Step 6 (mailbox creation) for all eligible domains in a batch.
+    
+    Iterates over DOMAINS (not tenants) so each domain within a multi-domain
+    tenant gets its own mailbox range (1-50, 51-100, 101-150, etc.).
+    """
     logger.info(
         "Starting Step 6 for batch %s with display name: %s",
         batch_id,
         display_name,
     )
 
-    # --- Phase 1: Use a DB session to set up batch and collect tenant IDs ---
-    tenant_ids: List[UUID] = []
-    total_tenants = 0
+    # --- Phase 1: Use a DB session to set up batch and collect domain info ---
+    domain_work_items: List[Dict[str, Any]] = []  # List of {domain_id, tenant_id, domain_index, domain_name}
+    total_domains = 0
 
     async with async_session_factory() as db:
         batch = await db.get(SetupBatch, batch_id)
@@ -143,39 +148,36 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         )
         await db.commit()
 
-        # BUG 6.3 FIX: Use != True to catch both False and NULL, include errored tenants
-        # Also accept step5_complete as alternative prerequisite
-        from sqlalchemy import or_
+        # Get all DOMAINS needing mailbox creation for this batch
+        # (domain-based iteration instead of tenant-based)
         result = await db.execute(
-            select(Tenant).where(
+            select(Domain)
+            .join(Tenant, Domain.tenant_id == Tenant.id)
+            .where(
                 Tenant.batch_id == batch_id,
-                Tenant.step6_complete != True,  # Not yet complete (includes errored ones)
-                or_(
-                    Tenant.domain_verified_in_m365 == True,
-                    Tenant.step5_complete == True,
-                ),
+                Domain.domain_verified_in_m365 == True,
+                Domain.dkim_enabled == True,
+                Domain.step6_complete != True,
             )
+            .order_by(Tenant.created_at, Domain.domain_index_in_tenant)
         )
-        tenants = result.scalars().all()
+        domains = result.scalars().all()
 
-        if not tenants:
-            logger.warning("No eligible tenants found for batch %s", batch_id)
-            return {"success": False, "error": "No eligible tenants"}
+        if not domains:
+            logger.warning("No eligible domains found for batch %s", batch_id)
+            return {"success": False, "error": "No eligible domains"}
 
-        # BUG 6.3 FIX: Clear previous errors so errored tenants get retried
-        retry_count = 0
-        for t in tenants:
-            if t.step6_error:
-                logger.info("Clearing error for retry: %s (was: %s)", t.custom_domain, t.step6_error)
-                t.step6_error = None
-                retry_count += 1
-        if retry_count > 0:
-            await db.commit()
+        # Build work items from domains
+        for d in domains:
+            domain_work_items.append({
+                "domain_id": d.id,
+                "domain_name": d.name,
+                "tenant_id": d.tenant_id,
+                "domain_index": d.domain_index_in_tenant,
+            })
 
-        # Extract plain IDs before closing the session
-        tenant_ids = [t.id for t in tenants]
-        total_tenants = len(tenant_ids)
-        logger.info("Step 6: %s eligible tenants (including %s retries)", total_tenants, retry_count)
+        total_domains = len(domain_work_items)
+        logger.info("Step 6: %s eligible domains for mailbox creation", total_domains)
     # --- Parent session is now CLOSED before parallel work begins ---
 
     results: List[Dict[str, Any]] = []
@@ -189,48 +191,58 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
     semaphore = asyncio.Semaphore(max_parallel)
 
     logger.info(
-        "Processing %s tenants with max_parallel=%s",
-        total_tenants,
+        "Processing %s domains with max_parallel=%s",
+        total_domains,
         max_parallel,
     )
 
-    async def _process_one(idx: int, tenant_id: UUID):
-        """Each parallel task gets its own DB session to avoid asyncpg conflicts."""
+    async def _process_one(idx: int, work_item: Dict[str, Any]):
+        """Each parallel task processes one domain and gets its own DB session."""
         async with semaphore:
-            # Load tenant info in an independent session (read-only, closed quickly)
-            async with async_session_factory() as own_db:
-                tenant = await own_db.get(Tenant, tenant_id)
-                domain = tenant.custom_domain if tenant else "unknown"
+            domain_name = work_item["domain_name"]
+            domain_id = work_item["domain_id"]
+            tenant_id = work_item["tenant_id"]
+            domain_index = work_item["domain_index"]
 
             logger.info("=" * 80)
             logger.info(
-                "BATCH PROGRESS: Tenant %s/%s - %s",
+                "BATCH PROGRESS: Domain %s/%s - %s (tenant domain_index=%s)",
                 idx,
-                total_tenants,
-                domain,
+                total_domains,
+                domain_name,
+                domain_index,
             )
             logger.info("=" * 80)
 
             try:
-                tenant_result = await run_step6_for_tenant(tenant_id)
+                # Pass domain_id and domain_index to the per-tenant processor
+                domain_result = await run_step6_for_tenant(
+                    tenant_id,
+                    domain_id=domain_id,
+                    domain_index=domain_index,
+                )
                 return {
+                    "domain_id": str(domain_id),
                     "tenant_id": str(tenant_id),
-                    "result": tenant_result,
+                    "domain_name": domain_name,
+                    "result": domain_result,
                 }
             except Exception as e:
                 logger.error(
-                    "[%s] Tenant exception: %s",
-                    domain,
+                    "[%s] Domain exception: %s",
+                    domain_name,
                     str(e),
                 )
                 return {
+                    "domain_id": str(domain_id),
                     "tenant_id": str(tenant_id),
+                    "domain_name": domain_name,
                     "result": {"success": False, "error": str(e)},
                 }
 
     tasks = [
-        _process_one(i, tid)
-        for i, tid in enumerate(tenant_ids, 1)
+        _process_one(i, item)
+        for i, item in enumerate(domain_work_items, 1)
     ]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -238,7 +250,7 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         if isinstance(item, Exception):
             failed += 1
             results.append(
-                {"tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
+                {"domain_id": "unknown", "tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
             )
         else:
             results.append(item)
@@ -247,22 +259,19 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             else:
                 failed += 1
                 logger.error(
-                    "Tenant %s failed: %s",
-                    item["tenant_id"][:8],
+                    "Domain %s failed: %s",
+                    item.get("domain_name", "unknown"),
                     item["result"].get("error"),
                 )
     
     logger.info("=" * 80)
-    logger.info("BATCH COMPLETE: %s/%s successful, %s failed", successful, total_tenants, failed)
+    logger.info("BATCH COMPLETE: %s/%s domains successful, %s failed", successful, total_domains, failed)
     logger.info("=" * 80)
 
     # --- Phase 3: Update batch status in a fresh session ---
     async with async_session_factory() as db:
         batch = await db.get(SetupBatch, batch_id)
         if batch:
-            # Update batch status when step 6 completes
-            # IMPORTANT: Step 6 should NOT mark the batch as complete.
-            # Instead, advance to Step 7 when all tenants succeed.
             completed_steps = batch.completed_steps or []
             if 6 not in completed_steps:
                 completed_steps.append(6)
@@ -270,27 +279,30 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
             batch.completed_steps = sorted(completed_steps)
 
             if failed == 0:
-                # All tenants succeeded - advance to Step 7
+                # All domains succeeded - advance to Step 7
                 batch.current_step = 7
                 await db.commit()
-                logger.info("Batch %s advanced to Step 7 (step 6 done, all tenants succeeded)", batch_id)
+                logger.info("Batch %s advanced to Step 7 (step 6 done, all domains succeeded)", batch_id)
             else:
-                # Some tenants failed - stay on Step 6 for retry
+                # Some domains failed - stay on Step 6 for retry
                 batch.current_step = 6
                 await db.commit()
                 logger.info("Batch %s step 6 finished with %s failures - batch NOT marked complete", batch_id, failed)
 
     return {
         "success": failed == 0,
-        "total": total_tenants,
+        "total": total_domains,
         "successful": successful,
         "failed": failed,
         "results": results,
     }
 
 
-async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
-    """Run Step 6 for a single tenant using Selenium + PowerShell + Selenium UI.
+async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_index: int = 0) -> Dict[str, Any]:
+    """Run Step 6 for a single tenant/domain using Selenium + PowerShell + Selenium UI.
+    
+    When domain_id is provided, processes that specific domain within the tenant.
+    The domain_index controls mailbox numbering offset (0→1-50, 1→51-100, etc.).
     
     BUG 6.1 FIX: Restructured to load→close→work→reopen→save pattern.
     DB sessions are opened/closed around each phase to prevent Neon idle timeouts.
@@ -299,10 +311,14 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
     # PHASE A: Load everything from DB into plain dicts (quick, ~1 second)
     # ================================================================
     tenant_data = None
+    domain_data = None  # Domain-specific data (when domain_id provided)
     batch_data = None
     mailbox_list = []
     needs_powershell = True
     needs_admin_ui = True
+
+    # Compute mailbox start index from domain_index (0→1, 1→51, 2→101, etc.)
+    mailbox_start_index = domain_index * 50 + 1
 
     async with async_session_factory() as db:
         tenant = await db.get(Tenant, tenant_id)
@@ -310,42 +326,68 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             logger.error("Tenant %s not found", tenant_id)
             return {"success": False, "error": "Tenant not found"}
 
-        logger.info("[%s] Checking current state...", tenant.custom_domain)
-        logger.info("  - mailboxes_created: %s", tenant.step6_mailboxes_created)
-        logger.info("  - delegations_done: %s", tenant.step6_delegations_done)
-        logger.info("  - passwords_set: %s", tenant.step6_passwords_set)
-        logger.info("  - complete: %s", tenant.step6_complete)
+        # Load specific Domain record when domain_id is provided
+        domain_record = None
+        working_domain = tenant.custom_domain  # fallback
+        if domain_id:
+            domain_record = await db.get(Domain, domain_id)
+            if not domain_record:
+                logger.error("Domain %s not found", domain_id)
+                return {"success": False, "error": "Domain not found"}
+            working_domain = domain_record.name
+            logger.info("[%s] Processing domain (index=%s, start_index=%s)", working_domain, domain_index, mailbox_start_index)
+        
+        logger.info("[%s] Checking current state...", working_domain)
 
-        if tenant.step6_complete:
-            logger.info("[%s] SKIPPING - already complete", tenant.custom_domain)
-            update_progress(str(tenant.id), "complete", "complete", "Step 6 already complete")
-            return {"success": True, "skipped": True}
+        # Check domain-level completion when domain_id is provided
+        if domain_record:
+            logger.info("  - domain.step6_complete: %s", domain_record.step6_complete)
+            logger.info("  - domain.step6_mailboxes_created: %s", domain_record.step6_mailboxes_created)
+            if domain_record.step6_complete:
+                logger.info("[%s] SKIPPING - domain already complete", working_domain)
+                update_progress(str(tenant.id), "complete", "complete", f"Step 6 already complete for {working_domain}")
+                return {"success": True, "skipped": True}
+        else:
+            # Legacy: check tenant-level completion
+            logger.info("  - mailboxes_created: %s", tenant.step6_mailboxes_created)
+            logger.info("  - delegations_done: %s", tenant.step6_delegations_done)
+            logger.info("  - passwords_set: %s", tenant.step6_passwords_set)
+            logger.info("  - complete: %s", tenant.step6_complete)
+            if tenant.step6_complete:
+                logger.info("[%s] SKIPPING - already complete", working_domain)
+                update_progress(str(tenant.id), "complete", "complete", "Step 6 already complete")
+                return {"success": True, "skipped": True}
 
         # RETRY FIX: Clear previous error on retry start
         if tenant.step6_error:
-            logger.info("[%s] Clearing previous error for retry: %s", tenant.custom_domain, tenant.step6_error)
+            logger.info("[%s] Clearing previous error for retry: %s", working_domain, tenant.step6_error)
             tenant.step6_error = None
             await db.commit()
 
         # BUG 6.4 FIX: Check ACTUAL mailbox state in DB, not just counter fields
+        # Filter by email domain suffix when processing a specific domain
+        base_filter = [Mailbox.tenant_id == tenant.id]
+        if domain_id:
+            base_filter.append(Mailbox.email.like(f"%@{working_domain}"))
+
         total_mailbox_count = await db.scalar(
-            select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant.id)
+            select(func.count(Mailbox.id)).where(*base_filter)
         ) or 0
         actual_created_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
-                Mailbox.tenant_id == tenant.id,
+                *base_filter,
                 Mailbox.created_in_exchange == True,
             )
         ) or 0
         actual_delegated_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
-                Mailbox.tenant_id == tenant.id,
+                *base_filter,
                 Mailbox.delegated == True,
             )
         ) or 0
         actual_password_set_count = await db.scalar(
             select(func.count(Mailbox.id)).where(
-                Mailbox.tenant_id == tenant.id,
+                *base_filter,
                 Mailbox.password_set == True,
             )
         ) or 0
@@ -356,28 +398,28 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         # DB inconsistency check
         if actual_delegated_count > actual_created_count:
             logger.warning("[%s] DB inconsistency: delegated=%s > created=%s - forcing PowerShell",
-                          tenant.custom_domain, actual_delegated_count, actual_created_count)
+                          working_domain, actual_delegated_count, actual_created_count)
             needs_powershell = True
 
         logger.info("[%s] Actual DB state: total=%s, created=%s, delegated=%s, passwords_set=%s",
-                    tenant.custom_domain, total_mailbox_count, actual_created_count,
+                    working_domain, total_mailbox_count, actual_created_count,
                     actual_delegated_count, actual_password_set_count)
         logger.info("[%s] needs_powershell=%s, needs_admin_ui=%s",
-                    tenant.custom_domain, needs_powershell, needs_admin_ui)
+                    working_domain, needs_powershell, needs_admin_ui)
 
         if needs_powershell:
-            logger.info("[%s] RUNNING PowerShell...", tenant.custom_domain)
+            logger.info("[%s] RUNNING PowerShell...", working_domain)
         else:
-            logger.info("[%s] SKIPPING PowerShell - already done", tenant.custom_domain)
+            logger.info("[%s] SKIPPING PowerShell - already done", working_domain)
 
         if needs_admin_ui:
-            logger.info("[%s] RUNNING Admin UI password reset...", tenant.custom_domain)
+            logger.info("[%s] RUNNING Admin UI password reset...", working_domain)
         else:
-            logger.info("[%s] SKIPPING Admin UI password reset - already done", tenant.custom_domain)
+            logger.info("[%s] SKIPPING Admin UI password reset - already done", working_domain)
 
         if not tenant.admin_email or not tenant.admin_password:
             message = "Missing admin credentials"
-            logger.error("[%s] %s", tenant.custom_domain, message)
+            logger.error("[%s] %s", working_domain, message)
             tenant.step6_error = message
             await db.commit()
             update_progress(str(tenant.id), "error", "failed", message)
@@ -385,7 +427,7 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
 
         if not tenant.onmicrosoft_domain:
             message = "Missing onmicrosoft domain"
-            logger.error("[%s] %s", tenant.custom_domain, message)
+            logger.error("[%s] %s", working_domain, message)
             tenant.step6_error = message
             await db.commit()
             update_progress(str(tenant.id), "error", "failed", message)
@@ -410,6 +452,22 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             "step6_delegations_done": tenant.step6_delegations_done or 0,
         }
 
+        # Serialize domain-specific data when processing a specific domain
+        if domain_record:
+            domain_data = {
+                "id": domain_record.id,
+                "name": domain_record.name,
+                "domain_index": domain_record.domain_index_in_tenant,
+                "licensed_user_upn": domain_record.licensed_user_upn,
+                "licensed_user_password": domain_record.licensed_user_password,
+                "licensed_user_created": domain_record.licensed_user_created,
+            }
+            # Use domain-level licensed user info if available (overrides tenant-level)
+            if domain_record.licensed_user_created and domain_record.licensed_user_upn:
+                tenant_data["licensed_user_upn"] = domain_record.licensed_user_upn
+                tenant_data["licensed_user_password"] = domain_record.licensed_user_password
+                tenant_data["licensed_user_created"] = domain_record.licensed_user_created
+
         batch = None
         if tenant.batch_id:
             batch = await db.get(SetupBatch, tenant.batch_id)
@@ -421,8 +479,13 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             }
 
         # Load existing mailboxes into plain dicts
+        # When domain_id is provided, only load mailboxes for this specific domain
+        mb_load_filters = [Mailbox.tenant_id == tenant.id]
+        if domain_id:
+            mb_load_filters.append(Mailbox.email.like(f"%@{working_domain}"))
+
         existing_mailbox_result = await db.execute(
-            select(Mailbox).where(Mailbox.tenant_id == tenant.id)
+            select(Mailbox).where(*mb_load_filters)
         )
         existing_mailboxes = existing_mailbox_result.scalars().all()
         mailbox_list = [
@@ -444,7 +507,8 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
     # ================================================================
 
     tid_str = str(tenant_data["id"])
-    domain = tenant_data["custom_domain"]
+    # Use working_domain (specific domain name) when domain_id provided, else tenant custom_domain
+    domain = working_domain if domain_id else tenant_data["custom_domain"]
     update_progress(tid_str, "starting", "in_progress", "Initializing...")
 
     driver = None
@@ -532,14 +596,21 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
             if not licensed_user.get("success"):
                 raise Exception(licensed_user.get("error") or "Failed to create licensed user")
 
-            # Save licensed user immediately with fresh session
+            # Save licensed user immediately with fresh session (to both Tenant and Domain)
             async with BackgroundSessionLocal() as save_db:
                 t = await save_db.get(Tenant, tenant_data["id"])
                 if t:
                     t.licensed_user_created = True
                     t.licensed_user_upn = f"me1@{domain}"
                     t.licensed_user_password = licensed_user.get("password")
-                    await save_db.commit()
+                # Also save to Domain record when domain_id is provided
+                if domain_data:
+                    d = await save_db.get(Domain, domain_data["id"])
+                    if d:
+                        d.licensed_user_created = True
+                        d.licensed_user_upn = f"me1@{domain}"
+                        d.licensed_user_password = licensed_user.get("password")
+                await save_db.commit()
             # Update local data
             tenant_data["licensed_user_created"] = True
             tenant_data["licensed_user_upn"] = f"me1@{domain}"
@@ -552,14 +623,20 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         if licensed_user.get("password"):
             tenant_data["licensed_user_password"] = licensed_user.get("password")
         
-        # Save delegate_to with fresh session
+        # Save delegate_to with fresh session (to both Tenant and Domain)
         async with BackgroundSessionLocal() as save_db:
             t = await save_db.get(Tenant, tenant_data["id"])
             if t:
                 t.licensed_user_upn = delegate_to
                 if licensed_user.get("password"):
                     t.licensed_user_password = licensed_user.get("password")
-                await save_db.commit()
+            if domain_data:
+                d = await save_db.get(Domain, domain_data["id"])
+                if d:
+                    d.licensed_user_upn = delegate_to
+                    if licensed_user.get("password"):
+                        d.licensed_user_password = licensed_user.get("password")
+            await save_db.commit()
 
         # ================================================================
         # PHASE C: Generate mailboxes in DB if needed (quick fresh session)
@@ -735,11 +812,14 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                             domain, len(mailboxes_to_process))
 
                 try:
+                    logger.info("[%s] PowerShell create_shared_mailboxes with start_index=%s",
+                                domain, mailbox_start_index)
                     ps_results = await run_with_powershell_retry(
                         "PowerShell mailbox creation",
                         lambda: ps_service.create_shared_mailboxes(
                             mailboxes=mailboxes_to_process,
                             delegate_to=delegate_to,
+                            start_index=mailbox_start_index,
                         ),
                     )
 
@@ -958,25 +1038,33 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
         step6_actually_complete = False
         missing_items = []
 
+        # Capture domain_data id for use inside closure
+        _domain_data_id = domain_data["id"] if domain_data else None
+
         async def _save_completion_check(fresh_db):
             nonlocal step6_actually_complete, missing_items
             # BUG 6.4 FIX: Always count from source of truth (Mailbox table)
+            # When domain_id is provided, filter by email domain suffix
+            completion_filters = [Mailbox.tenant_id == tenant_id_val]
+            if domain_id:
+                completion_filters.append(Mailbox.email.like(f"%@{domain}"))
+
             total_mailboxes = await fresh_db.scalar(
-                select(func.count(Mailbox.id)).where(Mailbox.tenant_id == tenant_id_val)
+                select(func.count(Mailbox.id)).where(*completion_filters)
             ) or 0
             created_count = await fresh_db.scalar(
                 select(func.count(Mailbox.id)).where(
-                    Mailbox.tenant_id == tenant_id_val, Mailbox.created_in_exchange == True,
+                    *completion_filters, Mailbox.created_in_exchange == True,
                 )
             ) or 0
             delegated_count = await fresh_db.scalar(
                 select(func.count(Mailbox.id)).where(
-                    Mailbox.tenant_id == tenant_id_val, Mailbox.delegated == True,
+                    *completion_filters, Mailbox.delegated == True,
                 )
             ) or 0
             passwords_set_count = await fresh_db.scalar(
                 select(func.count(Mailbox.id)).where(
-                    Mailbox.tenant_id == tenant_id_val, Mailbox.password_set == True,
+                    *completion_filters, Mailbox.password_set == True,
                 )
             ) or 0
 
@@ -1002,12 +1090,22 @@ async def run_step6_for_tenant(tenant_id: UUID) -> Dict[str, Any]:
                     )
 
                     if has_mailboxes and has_delegation and has_passwords:
+                        # Mark tenant-level completion (backward compatible)
                         tenant_to_update.step6_complete = True
                         tenant_to_update.step6_completed_at = datetime.utcnow()
                         tenant_to_update.status = TenantStatus.READY
                         tenant_to_update.step6_error = None
                         step6_actually_complete = True
                         logger.info("[%s] All criteria met - marking Step 6 COMPLETE", domain)
+
+                        # Also mark Domain-level completion when domain_id is provided
+                        if _domain_data_id:
+                            domain_to_update = await fresh_db.get(Domain, _domain_data_id)
+                            if domain_to_update:
+                                domain_to_update.step6_complete = True
+                                domain_to_update.step6_mailboxes_created = created_count
+                                logger.info("[%s] Domain record marked step6_complete=True, mailboxes_created=%s",
+                                            domain, created_count)
                     else:
                         if not has_mailboxes:
                             missing_items.append(f"mailboxes ({created_count}/{total_mailboxes})")

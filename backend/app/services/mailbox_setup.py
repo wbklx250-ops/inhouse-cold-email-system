@@ -81,27 +81,46 @@ def clear_progress(tenant_id: str):
 class Step6Orchestrator:
     """Orchestrates the complete Step 6 mailbox creation process."""
 
-    def __init__(self, tenant_data: Dict[str, Any], display_name: str):
+    def __init__(self, tenant_data: Dict[str, Any], display_name: str, domain_data: Dict[str, Any] = None, domain_index: int = 0):
         """
-        Initialize orchestrator for a single tenant.
+        Initialize orchestrator for a single domain within a tenant.
 
         Args:
             tenant_data: Dict with tenant info (from database)
             display_name: Display name for mailboxes (e.g., "Jack Zuvelek")
+            domain_data: Dict with domain info {"id": ..., "name": ...} (if None, falls back to tenant custom_domain)
+            domain_index: Position of this domain within its tenant (0, 1, 2...) for mailbox numbering
         """
         self.tenant_data = tenant_data
         self.tenant_id = tenant_data["id"]
         self.display_name = display_name
-        self.domain = tenant_data["custom_domain"]
+        
+        # Domain-specific info
+        if domain_data:
+            self.domain = domain_data["name"]  # The specific domain being processed
+            self.domain_id = domain_data["id"]
+        else:
+            self.domain = tenant_data["custom_domain"]
+            self.domain_id = tenant_data.get("domain_id")
+        
+        self.domain_index = domain_index
+        # Mailbox numbers for THIS domain: 1-50 for index 0, 51-100 for index 1, 101-150 for index 2
+        self.mailbox_start_index = domain_index * 50 + 1
+        
         self.onmicrosoft_domain = tenant_data["onmicrosoft_domain"]
         self.admin_email = tenant_data["admin_email"]
         self.admin_password = tenant_data["admin_password"]
         self.totp_secret = tenant_data.get("totp_secret")
         
-        # Licensed user info (for re-run idempotency)
-        self.licensed_user_created = tenant_data.get("licensed_user_created", False)
-        self.licensed_user_upn = tenant_data.get("licensed_user_upn")
-        self.licensed_user_password = tenant_data.get("licensed_user_password")
+        # Licensed user info (for re-run idempotency) — per domain
+        if domain_data:
+            self.licensed_user_created = domain_data.get("licensed_user_created", False)
+            self.licensed_user_upn = domain_data.get("licensed_user_upn")
+            self.licensed_user_password = domain_data.get("licensed_user_password")
+        else:
+            self.licensed_user_created = tenant_data.get("licensed_user_created", False)
+            self.licensed_user_upn = tenant_data.get("licensed_user_upn")
+            self.licensed_user_password = tenant_data.get("licensed_user_password")
 
         self.driver: Optional[webdriver.Chrome] = None
         self.user_ops: Optional[UserOpsSelenium] = None
@@ -322,8 +341,9 @@ class Step6Orchestrator:
             )
             mailbox_data = generate_emails_for_domain(self.display_name, self.domain, count=50)
 
-            # Add index for numbered display names
-            for i, mb in enumerate(mailbox_data, 1):
+            # Add index for numbered display names — offset by domain position within tenant
+            # e.g., domain_index=0 → 1-50, domain_index=1 → 51-100, domain_index=2 → 101-150
+            for i, mb in enumerate(mailbox_data, self.mailbox_start_index):
                 mb["index"] = i
 
             self.results["mailboxes"] = mailbox_data

@@ -5,7 +5,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Optional
 from uuid import UUID
 
-from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, Enum as SqlEnum, ForeignKey, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,8 +64,8 @@ class Domain(TimestampUUIDMixin, Base):
 
     dkim_cnames_added: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     dkim_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    dkim_selector1_cname: Mapped[str | None] = mapped_column(String(255))
-    dkim_selector2_cname: Mapped[str | None] = mapped_column(String(255))
+    dkim_selector1_cname: Mapped[str | None] = mapped_column(String(500))
+    dkim_selector2_cname: Mapped[str | None] = mapped_column(String(500))
 
     # Phase 1 tracking (before NS change)
     phase1_cname_added: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -85,6 +85,42 @@ class Domain(TimestampUUIDMixin, Base):
     # Milestone timestamps
     ns_propagated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     m365_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # === MULTI-DOMAIN PER TENANT ===
+    # Position of this domain within its tenant group (0, 1, 2)
+    domain_index_in_tenant: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # === M365 DOMAIN SETUP (per-domain tracking, moved from tenants) ===
+    domain_added_to_m365: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    m365_verification_txt: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    domain_verified_in_m365: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    domain_verified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # === DNS TRACKING (per-domain, moved from tenants) ===
+    mx_record_added: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    spf_record_added: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    autodiscover_added: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    mx_value: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    spf_value: Mapped[str | None] = mapped_column(String(500), nullable=True)
+
+    # === DKIM TRACKING (per-domain, moved from tenants) ===
+    dkim_selector1: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    dkim_selector2: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    dkim_enabled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # === STEP 5 TRACKING (per-domain, moved from tenants) ===
+    step5_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step5_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    # === LICENSED USER (per-domain, moved from tenants) ===
+    licensed_user_upn: Mapped[str | None] = mapped_column(String(255), nullable=True)  # user@customdomain.com
+    licensed_user_password: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    licensed_user_created: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    licensed_user_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # === STEP 6 TRACKING (per-domain, moved from tenants) ===
+    step6_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    step6_mailboxes_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     # FK to tenant - domain can be assigned to a tenant
     tenant_id: Mapped[UUID | None] = mapped_column(
