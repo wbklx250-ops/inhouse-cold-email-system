@@ -1,7 +1,7 @@
 """multi_domain_per_tenant
 
-Revision ID: 011
-Revises: 010
+Revision ID: 011_multi_domain
+Revises: 50013c48d54b
 Create Date: 2026-03-13
 
 Support N domains per tenant (1, 2, or 3). Move per-domain M365/DNS/DKIM/licensed-user
@@ -15,8 +15,8 @@ import sqlalchemy as sa
 
 
 # revision identifiers, used by Alembic.
-revision: str = '011'
-down_revision: Union[str, None] = '010'
+revision: str = '011_multi_domain'
+down_revision: Union[str, None] = '50013c48d54b'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
