@@ -12,6 +12,7 @@ import csv
 import io
 import logging
 import re
+import uuid as _uuid
 from typing import List, Dict, Any, Optional, Tuple
 from uuid import UUID
 from dataclasses import dataclass
@@ -277,6 +278,11 @@ class TenantImportService:
         for tenant in tenant_list:
             domain = tenant["onmicrosoft_domain"].lower()
             
+            # Sanitise microsoft_tenant_id: blank/empty → unique placeholder
+            # so multiple rows with no ID don't violate the DB unique constraint.
+            raw_tid = tenant.get("tenant_id", "").strip()
+            ms_tenant_id = raw_tid if raw_tid else f"PENDING-{_uuid.uuid4()}"
+
             # Look up credentials by domain
             cred = credentials.get(domain)
             
@@ -285,7 +291,7 @@ class TenantImportService:
                 merged.append({
                     "name": tenant["company_name"],
                     "onmicrosoft_domain": tenant["onmicrosoft_domain"],
-                    "microsoft_tenant_id": tenant["tenant_id"],
+                    "microsoft_tenant_id": ms_tenant_id,
                     "address": tenant["address"],
                     "contact_name": tenant["contact_name"],
                     "contact_email": tenant["contact_email"],
@@ -306,7 +312,7 @@ class TenantImportService:
                 merged.append({
                     "name": tenant["company_name"],
                     "onmicrosoft_domain": tenant["onmicrosoft_domain"],
-                    "microsoft_tenant_id": tenant["tenant_id"],
+                    "microsoft_tenant_id": ms_tenant_id,
                     "address": tenant["address"],
                     "contact_name": tenant["contact_name"],
                     "contact_email": tenant["contact_email"],
@@ -362,9 +368,23 @@ class TenantImportService:
         skipped = 0
         reassigned = 0
         skipped_limit = 0
+        skipped_empty = 0
         missing_pwd = 0
 
         for data in merged:
+            # Skip guard: if both microsoft_tenant_id is missing/placeholder
+            # AND onmicrosoft_domain is empty, there's nothing useful to import.
+            tid = data.get("microsoft_tenant_id", "")
+            tid_is_empty = (not tid) or tid.startswith("PENDING-")
+            domain_is_empty = not data.get("onmicrosoft_domain", "").strip()
+            if tid_is_empty and domain_is_empty:
+                logger.warning(
+                    f"Skipping row with no microsoft_tenant_id and no "
+                    f"onmicrosoft_domain: {data.get('name', '?')}"
+                )
+                skipped_empty += 1
+                continue
+
             # Stop importing once we have enough tenants for the available domains
             if imported >= needed_count:
                 skipped_limit += 1
@@ -502,7 +522,8 @@ class TenantImportService:
 
         logger.info(
             f"Tenant import pre-commit: imported={imported}, skipped_dup={skipped}, "
-            f"reassigned={reassigned}, skipped_limit={skipped_limit}, missing_pwd={missing_pwd}"
+            f"reassigned={reassigned}, skipped_limit={skipped_limit}, "
+            f"skipped_empty={skipped_empty}, missing_pwd={missing_pwd}"
         )
         await db.commit()
         logger.info(f"Tenant import: db.commit() completed successfully for batch {batch_id}")
@@ -515,6 +536,7 @@ class TenantImportService:
             "reassigned": reassigned,
             "skipped_not_needed": skipped_limit,
             "domains_needing_tenants": needed_count,
+            "skipped_empty_rows": skipped_empty,
             "missing_password": missing_pwd,
             "unmatched_tenants": len(unmatched_tenants),
             "unmatched_credentials": len(unmatched_creds),
