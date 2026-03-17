@@ -1,11 +1,14 @@
 """migrate_tenant_status_values
 
 Revision ID: 009
-Revises: 9a25dfed836a
+Revises: 008
 Create Date: 2026-01-20
 
 This migration updates existing tenant status values to use the new enum values.
 It must run AFTER the enum values have been committed (migration 008).
+
+Note: Previously depended on 9a25dfed836a (tenant model automation columns).
+Those columns are now added idempotently in migration 011_add_all_missing_columns.
 """
 from typing import Sequence, Union
 
@@ -14,7 +17,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = '009'
-down_revision: Union[str, None] = '9a25dfed836a'
+down_revision: Union[str, None] = '008'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

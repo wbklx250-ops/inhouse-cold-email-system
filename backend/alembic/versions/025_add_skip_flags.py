@@ -1,7 +1,7 @@
 """add skip flags to domains
 
 Revision ID: 025_add_skip_flags
-Revises: 50013c48d54b
+Revises: 011
 Create Date: 2026-03-17
 
 Add step5_skipped and step6_skipped boolean columns to domains table.
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = '025_add_skip_flags'
-down_revision: Union[str, None] = '50013c48d54b'
+down_revision: Union[str, None] = '011'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -227,6 +227,10 @@ def upgrade() -> None:
     op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS licensed_user_created BOOLEAN NOT NULL DEFAULT FALSE;")
     op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS licensed_user_id VARCHAR(255);")
 
+    # Skip flags (per-domain) — set when MAX_PIPELINE_RETRIES exceeded
+    op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS step5_skipped BOOLEAN DEFAULT FALSE;")
+    op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS step6_skipped BOOLEAN DEFAULT FALSE;")
+
     # Step 6 tracking (per-domain)
     op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS step6_complete BOOLEAN NOT NULL DEFAULT FALSE;")
     op.execute("ALTER TABLE domains ADD COLUMN IF NOT EXISTS step6_mailboxes_created INTEGER NOT NULL DEFAULT 0;")
