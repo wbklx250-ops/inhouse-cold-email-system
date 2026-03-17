@@ -10,10 +10,13 @@ IMPORTANT: Files are NOT in the same order - matching is done by onmicrosoft dom
 
 import csv
 import io
+import logging
 import re
 from typing import List, Dict, Any, Optional, Tuple
 from uuid import UUID
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -55,53 +58,137 @@ class TenantImportService:
         
         return None
     
+    def _find_column(self, columns: List[str], keywords: List[str]) -> Optional[str]:
+        """
+        Find a column by checking if any keyword appears in the column name.
+        Uses case-insensitive substring matching — same logic as
+        parse_tenants_csv_content() in validation_service.py.
+        """
+        columns_lower = [c.lower() for c in columns]
+        for i, col_lower in enumerate(columns_lower):
+            for keyword in keywords:
+                if keyword in col_lower:
+                    return columns[i]
+        return None
+
     def parse_tenant_csv(self, csv_content: str) -> List[Dict[str, str]]:
         """
-        Parse tenant list CSV.
-        
-        Expected columns:
-        - Company Name
-        - onmicrosoft (prefix only)
-        - Address
-        - Admin Name (contact, not M365 admin)
-        - Admin Email (contact gmail)
-        - Admin Phone
-        - UUID (Tenant ID)
+        Parse tenant list CSV with flexible column detection.
+
+        Matches the same logic as parse_tenants_csv_content() in
+        validation_service.py so both parsers handle the same CSV
+        identically.
         """
         # Handle BOM
         csv_content = csv_content.replace('\ufeff', '')
-        
+
+        logger.info(f"Raw CSV content length: {len(csv_content)}")
+        logger.info(f"CSV first 300 chars: {csv_content[:300]!r}")
+
         reader = csv.DictReader(io.StringIO(csv_content))
+        columns = [c.strip() for c in (reader.fieldnames or [])]
+
+        logger.info(f"CSV headers found: {columns}")
+
+        # --- Flexible column detection (mirrors validation_service.py) ---
+        # Onmicrosoft column
+        onmicrosoft_col = self._find_column(
+            columns, ["onmicrosoft", "domain", "username", "email", "pattern"]
+        )
+        # Fallback: scan first data row for a value containing onmicrosoft.com
+        if not onmicrosoft_col:
+            peek_reader = csv.DictReader(io.StringIO(csv_content))
+            for peek_row in peek_reader:
+                for col, val in peek_row.items():
+                    if val and "onmicrosoft.com" in val.lower():
+                        onmicrosoft_col = col
+                        break
+                break
+
+        # Tenant / company name column
+        name_col = self._find_column(columns, ["company", "name", "tenant"])
+
+        # Tenant ID column
+        id_col = self._find_column(columns, ["uuid", "tenant_id", "id"])
+
+        # Password column (may be embedded in the CSV)
+        password_col = self._find_column(columns, ["password"])
+
+        # Admin email column (may be embedded in the CSV)
+        admin_email_col = self._find_column(columns, ["admin_email", "admin email"])
+        # Avoid matching the name column again — admin_email_col should
+        # contain "email"; if _find_column matched something without "email"
+        # in it, clear it.
+        if admin_email_col and "email" not in admin_email_col.lower():
+            admin_email_col = None
+
+        # Contact / address columns (optional — not every CSV has these)
+        address_col = self._find_column(columns, ["address"])
+        contact_name_col = self._find_column(columns, ["contact_name", "contact name", "admin name"])
+        contact_email_col = self._find_column(columns, ["contact_email", "contact email", "gmail"])
+        contact_phone_col = self._find_column(columns, ["phone"])
+
+        # Provider column (optional)
+        provider_col = self._find_column(columns, ["provider"])
+
+        logger.info(
+            f"Column mapping: onmicrosoft={onmicrosoft_col}, name={name_col}, "
+            f"id={id_col}, password={password_col}, admin_email={admin_email_col}, "
+            f"address={address_col}, contact_name={contact_name_col}, "
+            f"contact_email={contact_email_col}, phone={contact_phone_col}, "
+            f"provider={provider_col}"
+        )
+
+        if not onmicrosoft_col:
+            logger.error(
+                f"Tenant CSV: could not find onmicrosoft column. Headers: {columns}"
+            )
+            return []
+
         tenants = []
-        
         for row in reader:
-            clean = {k.strip(): v.strip() for k, v in row.items()}
-            
-            # Extract onmicrosoft domain (handle both prefix and full domain)
-            onmicrosoft_raw = clean.get("onmicrosoft", "")
+            clean = {k.strip(): v.strip() for k, v in row.items() if k}
+
+            # --- Extract onmicrosoft domain ---
+            onmicrosoft_raw = clean.get(onmicrosoft_col, "").strip()
+            if not onmicrosoft_raw:
+                continue
+
             onmicrosoft_domain = self._extract_onmicrosoft_domain(onmicrosoft_raw)
-            
+
             if not onmicrosoft_domain:
-                # Try to find it in any column
+                # Fallback: scan all values for onmicrosoft.com
                 for value in clean.values():
-                    if value and 'onmicrosoft' in value.lower():
+                    if value and "onmicrosoft" in value.lower():
                         onmicrosoft_domain = self._extract_onmicrosoft_domain(value)
                         if onmicrosoft_domain:
                             break
-            
+
+            if not onmicrosoft_domain:
+                continue
+
+            # --- Build tenant dict ---
+            company_name = clean.get(name_col, "").strip() if name_col else ""
+            if not company_name:
+                # Derive from onmicrosoft prefix
+                company_name = onmicrosoft_domain.split(".")[0]
+
             tenant = {
-                "company_name": clean.get("Company Name", ""),
-                "onmicrosoft_domain": onmicrosoft_domain or "",
-                "address": clean.get("Address", ""),
-                "contact_name": clean.get("Admin Name", ""),
-                "contact_email": clean.get("Admin Email", ""),
-                "contact_phone": clean.get("Admin Phone", ""),
-                "tenant_id": clean.get("UUID", ""),
+                "company_name": company_name,
+                "onmicrosoft_domain": onmicrosoft_domain,
+                "address": clean.get(address_col, "").strip() if address_col else "",
+                "contact_name": clean.get(contact_name_col, "").strip() if contact_name_col else "",
+                "contact_email": clean.get(contact_email_col, "").strip() if contact_email_col else "",
+                "contact_phone": clean.get(contact_phone_col, "").strip() if contact_phone_col else "",
+                "tenant_id": clean.get(id_col, "").strip() if id_col else "",
+                "admin_email": clean.get(admin_email_col, "").strip() if admin_email_col else "",
+                "admin_password": clean.get(password_col, "").strip() if password_col else "",
+                "provider": clean.get(provider_col, "").strip() if provider_col else "",
             }
-            
-            if tenant["company_name"] and tenant["onmicrosoft_domain"]:
-                tenants.append(tenant)
-        
+
+            tenants.append(tenant)
+
+        logger.info(f"parse_tenant_csv: parsed {len(tenants)} tenants")
         return tenants
     
     def parse_credentials_txt(self, txt_content: str) -> Dict[str, CredentialData]:
@@ -194,7 +281,7 @@ class TenantImportService:
             cred = credentials.get(domain)
             
             if cred:
-                # Found matching credentials
+                # Found matching credentials in TXT file
                 merged.append({
                     "name": tenant["company_name"],
                     "onmicrosoft_domain": tenant["onmicrosoft_domain"],
@@ -203,14 +290,19 @@ class TenantImportService:
                     "contact_name": tenant["contact_name"],
                     "contact_email": tenant["contact_email"],
                     "contact_phone": tenant["contact_phone"],
-                    "admin_email": cred.email,  # Use email from credentials file
+                    "admin_email": cred.email,
                     "admin_password": cred.password,
+                    "provider": tenant.get("provider", ""),
                 })
                 used_domains.add(domain)
             else:
-                # No credentials found for this tenant
-                unmatched_tenants.append(tenant)
-                # Still add tenant but without password
+                # No credentials in TXT — fall back to embedded CSV columns
+                csv_email = tenant.get("admin_email", "")
+                csv_password = tenant.get("admin_password", "")
+
+                if not csv_email and not csv_password:
+                    unmatched_tenants.append(tenant)
+
                 merged.append({
                     "name": tenant["company_name"],
                     "onmicrosoft_domain": tenant["onmicrosoft_domain"],
@@ -219,8 +311,9 @@ class TenantImportService:
                     "contact_name": tenant["contact_name"],
                     "contact_email": tenant["contact_email"],
                     "contact_phone": tenant["contact_phone"],
-                    "admin_email": f"admin@{tenant['onmicrosoft_domain']}",
-                    "admin_password": "",  # No password found
+                    "admin_email": csv_email or f"admin@{tenant['onmicrosoft_domain']}",
+                    "admin_password": csv_password or "",
+                    "provider": tenant.get("provider", ""),
                 })
         
         # Find credentials that weren't matched to any tenant
@@ -254,8 +347,6 @@ class TenantImportService:
             select(func.count(Domain.id)).where(Domain.batch_id == batch_id)
         ) or 0
         needed_count = total_domains_in_batch
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"Tenant import: needed_count={needed_count}, batch_id={batch_id}")
 
         tenant_list = self.parse_tenant_csv(csv_content)
@@ -316,7 +407,7 @@ class TenantImportService:
                     if data["admin_password"]:
                         existing.admin_password = data["admin_password"]
                         existing.initial_password = data["admin_password"]
-                    existing.provider = provider or existing.provider
+                    existing.provider = provider or data.get("provider") or existing.provider
                     existing.status = TenantStatus.IMPORTED
 
                     # === CRITICAL: Reset ALL step progress flags ===
@@ -403,7 +494,7 @@ class TenantImportService:
                 admin_email=data["admin_email"],
                 admin_password=initial_pwd,       # Current password (will be updated after change)
                 initial_password=initial_pwd,     # Original password (never changes)
-                provider=provider or "Unknown",   # Required field - default if not provided
+                provider=provider or data.get("provider") or "Unknown",
                 status=TenantStatus.IMPORTED
             )
             db.add(tenant)
