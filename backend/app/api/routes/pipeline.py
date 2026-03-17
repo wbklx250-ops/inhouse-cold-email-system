@@ -197,6 +197,26 @@ async def create_and_start(
             existing.redirect_url = d.get("redirect_url", "") or existing.redirect_url
             existing.status = DomainStatus.PURCHASED
             existing.cloudflare_zone_status = existing.cloudflare_zone_status or "pending"
+
+            # CRITICAL: Reset ALL M365/pipeline state so the new batch processes this domain fresh
+            existing.domain_added_to_m365 = False
+            existing.domain_verified_in_m365 = False
+            existing.domain_verified_at = None
+            existing.dkim_enabled = False
+            existing.dkim_cnames_added = False
+            existing.dkim_enabled_at = None
+            existing.mx_record_added = False
+            existing.spf_record_added = False
+            existing.autodiscover_added = False
+            existing.step5_complete = False
+            existing.step5_retry_count = 0
+            existing.step5_skipped = False
+            existing.step6_complete = False
+            existing.step6_mailboxes_created = 0
+            existing.step6_skipped = False
+            existing.error_message = None
+            existing.domain_index_in_tenant = 0  # Will be re-assigned by auto_link_domains
+
             imported_domain_count += 1
         else:
             domain = Domain(
@@ -335,7 +355,7 @@ async def retry_failed(
         await db.execute(
             sql_update(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.first_login_completed != True,
+                Tenant.first_login_completed.is_not(True),
             ).values(step4_retry_count=0, setup_error=None)
         )
     if step == 6 or step is None:
@@ -343,8 +363,8 @@ async def retry_failed(
             sql_update(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.domain_verified_in_m365 != True,
-            ).values(step5_retry_count=0, error_message=None)
+                Domain.domain_verified_in_m365.is_not(True),
+            ).values(step5_retry_count=0, step5_skipped=False, error_message=None)
         )
     if step == 7 or step is None:
         # Reset Domain-level step6 completion (domain-based iteration)
@@ -352,21 +372,21 @@ async def retry_failed(
             sql_update(Domain).where(
                 Domain.batch_id == batch_id,
                 Domain.tenant_id.isnot(None),
-                Domain.step6_complete != True,
-            ).values(step6_complete=False, step6_mailboxes_created=0, error_message=None)
+                Domain.step6_complete.is_not(True),
+            ).values(step6_complete=False, step6_skipped=False, step6_mailboxes_created=0, error_message=None)
         )
         # Also reset Tenant-level for backward compatibility
         await db.execute(
             sql_update(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.step6_complete != True,
+                Tenant.step6_complete.is_not(True),
             ).values(step6_retry_count=0, step6_error=None)
         )
     if step == 8 or step is None:
         await db.execute(
             sql_update(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.step7_complete != True,
+                Tenant.step7_smtp_auth_enabled.is_not(True),
             ).values(step7_retry_count=0, step7_error=None)
         )
 
@@ -484,6 +504,8 @@ async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db
             autodiscover_added=False,
             licensed_user_created=False,
             error_message=None,
+            step5_skipped=False,
+            step6_skipped=False,
         )
     )
 
@@ -731,7 +753,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     select(Domain).where(
                         Domain.batch_id == batch_id,
                         Domain.cloudflare_zone_id.isnot(None),
-                        Domain.phase1_cname_added != True,
+                        Domain.phase1_cname_added.is_not(True),
                     )
                 )).scalars().all()
 
@@ -1034,7 +1056,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     select(Domain).where(
                         Domain.batch_id == batch_id,
                         Domain.cloudflare_zone_id.isnot(None),
-                        Domain.dns_records_created != True,
+                        Domain.dns_records_created.is_not(True),
                     )
                 )).scalars().all()
 
@@ -1129,8 +1151,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     tenants = (await db.execute(
                         select(Tenant).where(
                             Tenant.batch_id == batch_id,
-                            Tenant.first_login_completed != True,
-                            Tenant.step4_retry_count <= MAX_PIPELINE_RETRIES,
+                            Tenant.first_login_completed.is_not(True),
+                            (Tenant.step4_retry_count <= MAX_PIPELINE_RETRIES) | Tenant.step4_retry_count.is_(None),
                         )
                     )).scalars().all()
 
@@ -1273,8 +1295,9 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(func.count(Domain.id)).where(
                             Domain.batch_id == batch_id,
                             Domain.tenant_id.isnot(None),
-                            Domain.domain_verified_in_m365 != True,
-                            Domain.step5_retry_count <= MAX_PIPELINE_RETRIES,
+                            Domain.domain_verified_in_m365.is_not(True),
+                            Domain.step5_skipped.is_not(True),
+                            (Domain.step5_retry_count <= MAX_PIPELINE_RETRIES) | Domain.step5_retry_count.is_(None),
                         )
                     ) or 0
 
@@ -1298,14 +1321,15 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(Domain).where(
                             Domain.batch_id == batch_id,
                             Domain.tenant_id.isnot(None),
-                            Domain.domain_verified_in_m365 != True,
+                            Domain.domain_verified_in_m365.is_not(True),
+                            Domain.step5_skipped.is_not(True),
                         )
                     )).scalars().all()
                     for d in failed_domains:
                         d.step5_retry_count = (d.step5_retry_count or 0) + 1
                         if d.step5_retry_count > MAX_PIPELINE_RETRIES:
-                            d.domain_verified_in_m365 = True
-                            d.dkim_enabled = True
+                            # Use skip flag instead of lying about verification status
+                            d.step5_skipped = True
                             d.error_message = f"SKIPPED M365 setup after {MAX_PIPELINE_RETRIES} retries"
                             await log_activity(batch_id, 6, STEP_NAMES[6], "domain", str(d.id),
                                 d.name, "skipped", d.error_message)
@@ -1316,7 +1340,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                     kill_all_browsers()
                     await asyncio.sleep(15)  # Extra time for memory recovery
 
-            # Step 6 is complete when ALL domains have domain_verified_in_m365=True AND dkim_enabled=True
+            # Step 6 is complete when ALL domains are verified+dkim OR skipped
             async with SessionLocal() as db:
                 m365_ok = await db.scalar(
                     select(func.count(Domain.id)).where(
@@ -1382,7 +1406,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                             Domain.tenant_id.isnot(None),
                             Domain.domain_verified_in_m365 == True,
                             Domain.dkim_enabled == True,
-                            Domain.step6_complete != True,
+                            Domain.step6_complete.is_not(True),
+                            Domain.step6_skipped.is_not(True),
                         )
                     ) or 0
 
@@ -1399,7 +1424,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 except Exception as e:
                     logger.error(f"Step 7 attempt {attempt + 1} failed: {e}")
 
-                # On final attempt, force-complete any remaining failed domains
+                # On final attempt, skip any remaining failed domains
                 if attempt >= MAX_PIPELINE_RETRIES:
                     async with SessionLocal() as db:
                         failed_domains = (await db.execute(
@@ -1408,20 +1433,23 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                                 Domain.tenant_id.isnot(None),
                                 Domain.domain_verified_in_m365 == True,
                                 Domain.dkim_enabled == True,
-                                Domain.step6_complete != True,
+                                Domain.step6_complete.is_not(True),
+                                Domain.step6_skipped.is_not(True),
                             )
                         )).scalars().all()
                         for d in failed_domains:
-                            d.step6_complete = True
+                            # Use skip flag instead of lying about completion
+                            d.step6_skipped = True
                             d.error_message = f"SKIPPED mailbox creation after {MAX_PIPELINE_RETRIES} retries"
                             await log_activity(batch_id, 7, STEP_NAMES[7], "domain", str(d.id),
                                 d.name, "skipped", d.error_message)
-                            # Also mark the parent tenant as complete if all its domains are done
+                            # Also mark the parent tenant as complete if all its domains are done/skipped
                             if d.tenant_id:
                                 remaining = await db.scalar(
                                     select(func.count(Domain.id)).where(
                                         Domain.tenant_id == d.tenant_id,
-                                        Domain.step6_complete != True,
+                                        Domain.step6_complete.is_not(True),
+                                        Domain.step6_skipped.is_not(True),
                                     )
                                 ) or 0
                                 if remaining == 0:
@@ -1492,8 +1520,8 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         select(Tenant).where(
                             Tenant.batch_id == batch_id,
                             Tenant.step6_complete == True,
-                            Tenant.step7_complete != True,
-                            Tenant.step7_retry_count <= MAX_PIPELINE_RETRIES,
+                            Tenant.step7_smtp_auth_enabled.is_not(True),
+                            (Tenant.step7_retry_count <= MAX_PIPELINE_RETRIES) | Tenant.step7_retry_count.is_(None),
                         )
                     )).scalars().all()
 

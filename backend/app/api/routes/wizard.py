@@ -735,8 +735,8 @@ async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
             result = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    Tenant.first_login_completed == False,
-                    Tenant.step4_retry_count <= MAX_AUTO_RETRIES
+                    Tenant.first_login_completed.is_not(True),
+                    (Tenant.step4_retry_count <= MAX_AUTO_RETRIES) | Tenant.step4_retry_count.is_(None),
                 )
             )
             tenants = result.scalars().all()
@@ -806,8 +806,8 @@ async def _run_step5_with_retry(batch_id: UUID, job_id: str):
                     Tenant.batch_id == batch_id,
                     Tenant.first_login_completed == True,
                     Tenant.domain_id.isnot(None),
-                    Tenant.dkim_enabled != True,
-                    Tenant.step5_retry_count <= MAX_AUTO_RETRIES
+                    Tenant.dkim_enabled.is_not(True),
+                    (Tenant.step5_retry_count <= MAX_AUTO_RETRIES) | Tenant.step5_retry_count.is_(None),
                 )
             )
             tenants = result.scalars().all()
@@ -862,8 +862,8 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
                     ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True)),
-                    Tenant.step6_complete == False,
-                    Tenant.step6_retry_count <= MAX_AUTO_RETRIES
+                    Tenant.step6_complete.is_not(True),
+                    (Tenant.step6_retry_count <= MAX_AUTO_RETRIES) | Tenant.step6_retry_count.is_(None),
                 )
             )
             tenants = result.scalars().all()
@@ -896,7 +896,7 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
                     select(func.count(Tenant.id)).where(
                         Tenant.batch_id == batch_id,
                         Tenant.step6_started == True,
-                        Tenant.step6_complete == False,
+                        Tenant.step6_complete.is_not(True),
                         Tenant.step6_error.is_(None)
                     )
                 ) or 0
@@ -910,7 +910,7 @@ async def _run_step6_with_retry(batch_id: UUID, display_name: str, job_id: str):
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
                     Tenant.step6_error.isnot(None),
-                    Tenant.step6_complete == False
+                    Tenant.step6_complete.is_not(True),
                 )
             )
             failed_tenants = result.scalars().all()
@@ -958,8 +958,8 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
                     Tenant.step6_complete == True,
-                    Tenant.step7_complete == False,
-                    Tenant.step7_retry_count <= MAX_AUTO_RETRIES
+                    Tenant.step7_complete.is_not(True),
+                    (Tenant.step7_retry_count <= MAX_AUTO_RETRIES) | Tenant.step7_retry_count.is_(None),
                 )
             )
             tenants = result.scalars().all()
@@ -992,7 +992,7 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
                     select(func.count(Tenant.id)).where(
                         Tenant.batch_id == batch_id,
                         Tenant.step6_complete == True,
-                        Tenant.step7_complete == False,
+                        Tenant.step7_complete.is_not(True),
                         Tenant.step7_error.is_(None),
                     )
                 ) or 0
@@ -1006,7 +1006,7 @@ async def _run_step7_with_retry(batch_id: UUID, job_id: str):
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
                     Tenant.step7_error.isnot(None),
-                    Tenant.step7_complete == False
+                    Tenant.step7_complete.is_not(True),
                 )
             )
             failed_tenants = result.scalars().all()
@@ -1249,7 +1249,7 @@ async def rerun_step(
             failed_tenants = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    Tenant.first_login_completed == False
+                    Tenant.first_login_completed.is_not(True),
                 )
             )
             tenants_to_reset = failed_tenants.scalars().all()
@@ -1301,7 +1301,7 @@ async def rerun_step(
             incomplete_tenants = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    Tenant.dkim_enabled != True
+                    Tenant.dkim_enabled.is_not(True),
                 )
             )
             tenants_to_reset = incomplete_tenants.scalars().all()
@@ -1347,7 +1347,7 @@ async def rerun_step(
             incomplete_tenants = await db.execute(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
-                    Tenant.step6_complete == False
+                    Tenant.step6_complete.is_not(True),
                 )
             )
             tenants_to_reset = incomplete_tenants.scalars().all()
@@ -1395,7 +1395,7 @@ async def rerun_step(
                 select(Tenant).where(
                     Tenant.batch_id == batch_id,
                     Tenant.step6_complete == True,
-                    Tenant.step7_complete == False
+                    Tenant.step7_complete.is_not(True),
                 )
             )
             tenants_to_reset = incomplete_tenants.scalars().all()
@@ -1551,7 +1551,7 @@ async def get_batch_status(batch_id: UUID, db: RetryableSession = Depends(get_db
         select(func.count(Tenant.id)).where(
             Tenant.batch_id == batch_id,
             Tenant.step6_complete == True,
-            Tenant.step7_complete == False,
+            Tenant.step7_complete.is_not(True),
             Tenant.step7_error.isnot(None),
         )
     ) or 0
@@ -2489,7 +2489,7 @@ async def start_automation(
         tenants = (await db.execute(
             select(Tenant).where(
                 Tenant.batch_id == batch_id,
-                Tenant.first_login_completed == False
+                Tenant.first_login_completed.is_not(True),
             )
         )).scalars().all()
         
@@ -2704,7 +2704,7 @@ async def skip_all_failed_tenants(
     result = await db.execute(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
-            Tenant.first_login_completed == False,
+            Tenant.first_login_completed.is_not(True),
             Tenant.setup_error.isnot(None)
         )
     )
@@ -2963,7 +2963,7 @@ async def start_step5_automation(
             Tenant.batch_id == batch_id,
             Tenant.domain_id.isnot(None),
             Tenant.first_login_completed == True,
-            Tenant.dkim_enabled != True
+            Tenant.dkim_enabled.is_not(True),
         )
     )
     tenants = result.scalars().all()
@@ -3617,7 +3617,7 @@ async def start_step5_parallel(
             Tenant.batch_id == batch_id,
             Tenant.domain_id.isnot(None),
             Tenant.first_login_completed == True,
-            Tenant.dkim_enabled != True
+            Tenant.dkim_enabled.is_not(True),
         )
     )
     tenants = result.scalars().all()
@@ -3765,7 +3765,7 @@ async def retry_failed_tenants(
             Tenant.batch_id == batch_id,
             Tenant.domain_id.isnot(None),
             Tenant.setup_error.isnot(None),
-            Tenant.dkim_enabled != True
+            Tenant.dkim_enabled.is_not(True),
         )
     )
     failed_tenants = result.scalars().all()
@@ -3938,7 +3938,7 @@ async def start_step6_automation(
         select(func.count(Tenant.id)).where(
             Tenant.batch_id == batch_id,
             Tenant.domain_verified_in_m365 == True,
-            Tenant.step6_complete == False,
+            Tenant.step6_complete.is_not(True),
         )
     )
     eligible_count = tenant_result.scalar() or 0
@@ -4451,7 +4451,7 @@ async def rerun_step6_automation(
     tenant_result = await db.execute(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
-            Tenant.step6_complete == False,
+            Tenant.step6_complete.is_not(True),
             # Step 5 complete check - either explicit flag or implied by dkim_enabled
             ((Tenant.step5_complete == True) | (Tenant.dkim_enabled == True))
         )
@@ -4535,7 +4535,7 @@ async def retry_failed_step6_tenants(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
             Tenant.step6_error.isnot(None),
-            Tenant.step6_complete == False
+            Tenant.step6_complete.is_not(True),
         )
     )
     failed_tenants = tenant_result.scalars().all()
@@ -4603,7 +4603,7 @@ async def resume_step6_processing(
     tenant_result = await db.execute(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
-            Tenant.step6_complete == False,
+            Tenant.step6_complete.is_not(True),
             # Step 5 complete check
             ((Tenant.step5_complete == True) | (Tenant.domain_verified_in_m365 == True))
         )
@@ -4666,7 +4666,7 @@ async def reset_stuck_step6_tenants(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
             Tenant.step6_started == True,
-            Tenant.step6_complete == False
+            Tenant.step6_complete.is_not(True),
         )
     )
     stuck_tenants = tenant_result.scalars().all()
@@ -5283,7 +5283,7 @@ async def retry_step7_failed(
         select(Tenant).where(
             Tenant.batch_id == batch_id,
             Tenant.step6_complete == True,
-            Tenant.step7_complete == False,
+            Tenant.step7_complete.is_not(True),
         )
     )
     failed_tenants = result.scalars().all()

@@ -111,6 +111,7 @@ class Domain(TimestampUUIDMixin, Base):
     # === STEP 5 TRACKING (per-domain, moved from tenants) ===
     step5_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step5_retry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step5_skipped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # === LICENSED USER (per-domain, moved from tenants) ===
     licensed_user_upn: Mapped[str | None] = mapped_column(String(255), nullable=True)  # user@customdomain.com
@@ -121,6 +122,7 @@ class Domain(TimestampUUIDMixin, Base):
     # === STEP 6 TRACKING (per-domain, moved from tenants) ===
     step6_complete: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     step6_mailboxes_created: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    step6_skipped: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
 
     # FK to tenant - domain can be assigned to a tenant
     tenant_id: Mapped[UUID | None] = mapped_column(

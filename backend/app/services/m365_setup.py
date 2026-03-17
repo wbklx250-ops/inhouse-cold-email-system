@@ -187,8 +187,8 @@ async def run_step5_for_batch(
             .where(
                 Tenant.batch_id == batch_id,
                 Tenant.first_login_completed == True,
-                Domain.domain_verified_in_m365 != True,
-                Domain.step5_retry_count <= MAX_PIPELINE_RETRIES,
+                Domain.domain_verified_in_m365.is_not(True),
+                (Domain.step5_retry_count <= MAX_PIPELINE_RETRIES) | Domain.step5_retry_count.is_(None),
             )
             .order_by(Domain.domain_index_in_tenant)  # Process domain 0 before 1 before 2
         )
