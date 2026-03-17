@@ -153,7 +153,7 @@ def parse_credentials_txt_content(content: str) -> Tuple[Dict[str, Dict], List[s
         lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
 
         if not lines:
-            errors.append("Credentials file is empty")
+            # Empty/no credentials file is OK — return empty dict with no errors
             return credentials, errors
 
         # Detect format by checking first non-empty line

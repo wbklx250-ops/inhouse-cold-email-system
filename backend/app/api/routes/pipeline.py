@@ -58,7 +58,7 @@ STEP_NAMES = {
 async def validate_inputs(
     domains_csv: UploadFile = File(...),
     tenants_csv: UploadFile = File(...),
-    credentials_txt: UploadFile = File(...),
+    credentials_txt: UploadFile = File(None),
     first_name: str = Form(...),
     last_name: str = Form(...),
     domains_per_tenant: int = Form(1),
@@ -67,14 +67,15 @@ async def validate_inputs(
     Validate all input files without creating anything.
     Returns preview counts and any errors/warnings.
     Call this on file upload for instant feedback.
+    Credentials TXT is optional — batches can be created without credentials.
     """
     domains_content = (await domains_csv.read()).decode("utf-8-sig")
     tenants_content = (await tenants_csv.read()).decode("utf-8-sig")
-    creds_content = (await credentials_txt.read()).decode("utf-8-sig")
+    creds_content = (await credentials_txt.read()).decode("utf-8-sig") if credentials_txt else ""
 
     domains, domain_errors = parse_domains_csv_content(domains_content)
     tenants, tenant_errors = parse_tenants_csv_content(tenants_content)
-    credentials, cred_errors = parse_credentials_txt_content(creds_content)
+    credentials, cred_errors = parse_credentials_txt_content(creds_content) if creds_content else ({}, [])
 
     # If parsing failed, return errors immediately
     all_parse_errors = domain_errors + tenant_errors + cred_errors
@@ -100,7 +101,7 @@ async def create_and_start(
     batch_name: str = Form(...),
     domains_csv: UploadFile = File(...),
     tenants_csv: UploadFile = File(...),
-    credentials_txt: UploadFile = File(...),
+    credentials_txt: UploadFile = File(None),
     first_name: str = Form(...),
     last_name: str = Form(...),
     sequencer_platform: str = Form(""),
@@ -127,12 +128,12 @@ async def create_and_start(
     # Read file contents
     domains_content = (await domains_csv.read()).decode("utf-8-sig")
     tenants_content = (await tenants_csv.read()).decode("utf-8-sig")
-    creds_content = (await credentials_txt.read()).decode("utf-8-sig")
+    creds_content = (await credentials_txt.read()).decode("utf-8-sig") if credentials_txt else ""
 
     # Parse and validate
     domains, domain_errors = parse_domains_csv_content(domains_content)
     tenants, tenant_errors = parse_tenants_csv_content(tenants_content)
-    credentials, cred_errors = parse_credentials_txt_content(creds_content)
+    credentials, cred_errors = parse_credentials_txt_content(creds_content) if creds_content else ({}, [])
 
     all_errors = domain_errors + tenant_errors + cred_errors
     if all_errors:

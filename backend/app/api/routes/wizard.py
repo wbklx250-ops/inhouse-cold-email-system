@@ -2313,7 +2313,7 @@ async def batch_setup_redirects(batch_id: UUID, db: AsyncSession = Depends(get_d
 async def preview_tenants_import(
     batch_id: UUID,
     tenant_csv: UploadFile = File(...),
-    credentials_txt: UploadFile = File(...),
+    credentials_txt: UploadFile = File(None),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -2329,11 +2329,11 @@ async def preview_tenants_import(
     
     try:
         csv_content = (await tenant_csv.read()).decode('utf-8-sig')
-        txt_content = (await credentials_txt.read()).decode('utf-8-sig')
+        txt_content = (await credentials_txt.read()).decode('utf-8-sig') if credentials_txt else ""
         
         # Parse tenant data
         tenant_list = tenant_import_service.parse_tenant_csv(csv_content)
-        credentials = tenant_import_service.parse_credentials_txt(txt_content)
+        credentials = tenant_import_service.parse_credentials_txt(txt_content) if txt_content else {}
         merged, unmatched_tenants, unmatched_creds = tenant_import_service.merge_data(
             tenant_list, credentials
         )
@@ -2418,13 +2418,13 @@ async def preview_tenants_import(
 async def import_tenants(
     batch_id: UUID,
     tenant_csv: UploadFile = File(...),
-    credentials_txt: UploadFile = File(...),
+    credentials_txt: UploadFile = File(None),
     provider: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db)
 ):
-    """Import tenants from reseller files."""
+    """Import tenants from reseller files. Credentials TXT is optional."""
     csv_content = (await tenant_csv.read()).decode('utf-8-sig')
-    txt_content = (await credentials_txt.read()).decode('utf-8-sig')
+    txt_content = (await credentials_txt.read()).decode('utf-8-sig') if credentials_txt else ""
     
     result = await tenant_import_service.import_tenants(
         db, batch_id, csv_content, txt_content, provider

@@ -94,7 +94,7 @@ export default function NewPipelinePage() {
 
   // Validate files
   const runValidation = useCallback(async () => {
-    if (!domainsCsv || !tenantsCsv || !credentialsTxt || !firstName || !lastName) return;
+    if (!domainsCsv || !tenantsCsv || !firstName || !lastName) return;
 
     setIsValidating(true);
     setError(null);
@@ -103,7 +103,7 @@ export default function NewPipelinePage() {
       const formData = new FormData();
       formData.append("domains_csv", domainsCsv);
       formData.append("tenants_csv", tenantsCsv);
-      formData.append("credentials_txt", credentialsTxt);
+      if (credentialsTxt) formData.append("credentials_txt", credentialsTxt);
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
       formData.append("domains_per_tenant", domainsPerTenant.toString());
@@ -152,7 +152,7 @@ export default function NewPipelinePage() {
   };
 
   const handleSubmit = async () => {
-    if (!batchName || !domainsCsv || !tenantsCsv || !credentialsTxt || !firstName || !lastName) {
+    if (!batchName || !domainsCsv || !tenantsCsv || !firstName || !lastName) {
       setError("Please fill in all required fields");
       return;
     }
@@ -174,7 +174,7 @@ export default function NewPipelinePage() {
       formData.append("batch_name", batchName);
       formData.append("domains_csv", domainsCsv);
       formData.append("tenants_csv", tenantsCsv);
-      formData.append("credentials_txt", credentialsTxt);
+      if (credentialsTxt) formData.append("credentials_txt", credentialsTxt);
       formData.append("first_name", firstName);
       formData.append("last_name", lastName);
       formData.append("domains_per_tenant", domainsPerTenant.toString());
@@ -204,7 +204,7 @@ export default function NewPipelinePage() {
     }
   };
 
-  const allFilesUploaded = domainsCsv && tenantsCsv && credentialsTxt;
+  const allFilesUploaded = domainsCsv && tenantsCsv;
   const canSubmit = batchName && allFilesUploaded && firstName && lastName && validation?.valid;
 
   return (
@@ -280,10 +280,9 @@ export default function NewPipelinePage() {
             <FileUpload
               label="Credentials TXT"
               accept=".txt"
-              required
               file={credentialsTxt}
               onFile={(f) => { setCredentialsTxt(f); setValidation(null); }}
-              hint="Username: / Password: pairs from reseller"
+              hint="Optional — Username: / Password: pairs from reseller"
             />
             <FileUpload
               label="Profile Photo"
