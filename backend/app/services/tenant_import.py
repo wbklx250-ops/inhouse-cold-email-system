@@ -465,9 +465,10 @@ class TenantImportService:
                 domain.status = DomainStatus.TENANT_LINKED
                 linked += 1
 
-            # Set tenant's primary domain_id to the first domain in the group
+            # Set tenant's primary domain_id and custom_domain to the first domain in the group
             if tenant_domains:
                 tenant.domain_id = tenant_domains[0].id
+                tenant.custom_domain = tenant_domains[0].name
 
         await db.flush()
         return {"linked": linked, "domains_per_tenant": domains_per_tenant}

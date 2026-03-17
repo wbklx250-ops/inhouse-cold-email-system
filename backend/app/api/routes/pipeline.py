@@ -445,7 +445,7 @@ async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db
     if not batch:
         raise HTTPException(404, "Batch not found")
 
-    result = await db.execute(
+    tenant_result = await db.execute(
         update(Tenant).where(Tenant.batch_id == batch_id).values(
             first_login_completed=False,
             first_login_at=None,
@@ -466,10 +466,31 @@ async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db
         )
     )
 
+    # Also reset Domain-level tracking flags
+    domain_result = await db.execute(
+        update(Domain).where(Domain.batch_id == batch_id).values(
+            domain_added_to_m365=False,
+            domain_verified_in_m365=False,
+            domain_verified_at=None,
+            step5_complete=False,
+            step5_retry_count=0,
+            step6_complete=False,
+            step6_mailboxes_created=0,
+            dkim_enabled=False,
+            dkim_cnames_added=False,
+            dkim_enabled_at=None,
+            mx_record_added=False,
+            spf_record_added=False,
+            autodiscover_added=False,
+            licensed_user_created=False,
+            error_message=None,
+        )
+    )
+
     # Also reset batch-level counters
     batch.first_login_completed_count = 0
-    batch.domain_setup_completed_count = 0
-    batch.mailbox_completed_count = 0
+    batch.m365_completed = 0
+    batch.mailboxes_completed_count = 0
     batch.smtp_completed = 0
     batch.pipeline_status = "paused"
     batch.pipeline_step = 5  # Resume from Step 5 (Cloudflare steps already done)
@@ -478,8 +499,9 @@ async def reset_batch_progress(batch_id: UUID, db: AsyncSession = Depends(get_db
 
     return {
         "success": True,
-        "message": f"Reset progress for all tenants in batch. Use Resume to restart from Step 5.",
-        "tenants_reset": result.rowcount,
+        "message": f"Reset progress for all tenants and domains in batch. Use Resume to restart from Step 5.",
+        "tenants_reset": tenant_result.rowcount,
+        "domains_reset": domain_result.rowcount,
     }
 
 
@@ -1125,7 +1147,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         {
                             "tenant_id": str(t.id),
                             "admin_email": t.admin_email,
-                            "initial_password": t.admin_password,
+                            "initial_password": t.initial_password or t.admin_password,
                         }
                         for t in tenants
                     ]
