@@ -459,7 +459,7 @@ export default function NewPipelinePage() {
                   {validation.summary.domains_count} domains ÷ {validation.summary.domains_per_tenant || domainsPerTenant} per tenant = {validation.summary.tenants_count} tenants ✓
                 </p>
                 <p className="text-sm text-gray-700 font-mono">
-                  Expected mailboxes: {validation.summary.tenants_count} tenants × {validation.summary.domains_per_tenant || domainsPerTenant} domains × 50 = {validation.summary.expected_mailboxes.toLocaleString()}
+                  Expected mailboxes: {validation.summary.tenants_count} tenants × {validation.summary.domains_per_tenant || domainsPerTenant} domains × 50 = {(validation.summary.expected_mailboxes ?? 0).toLocaleString()}
                 </p>
               </div>
             )}
@@ -482,7 +482,7 @@ export default function NewPipelinePage() {
                 <p className="text-xs text-gray-500">Creds Matched</p>
               </div>
               <div className="bg-white rounded-lg p-3 shadow-sm col-span-2">
-                <p className="text-2xl font-bold text-purple-600">{validation.summary.expected_mailboxes.toLocaleString()}</p>
+                <p className="text-2xl font-bold text-purple-600">{(validation.summary.expected_mailboxes ?? 0).toLocaleString()}</p>
                 <p className="text-xs text-gray-500">Mailboxes to create</p>
               </div>
             </div>
