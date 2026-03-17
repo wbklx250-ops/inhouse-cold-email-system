@@ -256,11 +256,16 @@ class TenantImportService:
         needed_count = total_domains_in_batch
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(f"Batch {batch_id}: {needed_count} domains in batch, importing up to {needed_count} tenants")
+        logger.info(f"Tenant import: needed_count={needed_count}, batch_id={batch_id}")
 
         tenant_list = self.parse_tenant_csv(csv_content)
         credentials = self.parse_credentials_txt(credentials_content)
         merged, unmatched_tenants, unmatched_creds = self.merge_data(tenant_list, credentials)
+        logger.info(
+            f"Tenant import parse results: csv_tenants={len(tenant_list)}, "
+            f"credentials={len(credentials)}, merged={len(merged)}, "
+            f"unmatched_tenants={len(unmatched_tenants)}, unmatched_creds={len(unmatched_creds)}"
+        )
 
         imported = 0
         skipped = 0
@@ -404,7 +409,12 @@ class TenantImportService:
             db.add(tenant)
             imported += 1
 
+        logger.info(
+            f"Tenant import pre-commit: imported={imported}, skipped_dup={skipped}, "
+            f"reassigned={reassigned}, skipped_limit={skipped_limit}, missing_pwd={missing_pwd}"
+        )
         await db.commit()
+        logger.info(f"Tenant import: db.commit() completed successfully for batch {batch_id}")
 
         return {
             "total_csv": len(tenant_list),

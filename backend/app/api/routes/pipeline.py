@@ -231,15 +231,26 @@ async def create_and_start(
             db.add(domain)
             imported_domain_count += 1
 
-    await db.flush()
+    await db.flush()  # Ensure domain inserts/updates are visible to import_tenants
 
     # Import tenants with credentials using the existing service
-    result = await tenant_import_service.import_tenants(
-        db, batch_id, tenants_content, creds_content, provider="reseller"
-    )
+    try:
+        logger.info(f"Calling import_tenants for batch {batch_id} with {len(domains)} domains")
+        result = await tenant_import_service.import_tenants(
+            db, batch_id, tenants_content, creds_content, provider="reseller"
+        )
+        logger.info(f"import_tenants returned: {result}")
+    except Exception as e:
+        logger.error(f"import_tenants FAILED: {e}", exc_info=True)
+        raise
 
     # Auto-link domains to tenants (N:1 in order)
-    link_result = await tenant_import_service.auto_link_domains(db, batch_id, domains_per_tenant)
+    try:
+        link_result = await tenant_import_service.auto_link_domains(db, batch_id, domains_per_tenant)
+        logger.info(f"auto_link_domains result: {link_result}")
+    except Exception as e:
+        logger.error(f"auto_link_domains FAILED: {e}", exc_info=True)
+        raise
 
     await db.commit()
 
