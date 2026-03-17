@@ -77,12 +77,23 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
         columns = [c.strip() for c in (reader.fieldnames or [])]
         columns_lower = [c.lower() for c in columns]
 
-        # Find the onmicrosoft domain column
+        # Find the onmicrosoft domain column - check names first
         onmicrosoft_col = None
         for i, col in enumerate(columns_lower):
-            if "onmicrosoft" in col or "domain" in col:
+            if "onmicrosoft" in col or "domain" in col or "username" in col or "email" in col or "pattern" in col:
                 onmicrosoft_col = columns[i]
                 break
+
+        # Fallback: scan first data row values for onmicrosoft.com
+        if not onmicrosoft_col:
+            # Peek at rows to find which column contains onmicrosoft.com values
+            peek_reader = csv.DictReader(io.StringIO(content))
+            for peek_row in peek_reader:
+                for col, val in peek_row.items():
+                    if val and "onmicrosoft.com" in val.lower():
+                        onmicrosoft_col = col
+                        break
+                break  # Only check first data row
 
         # Find tenant name column
         name_col = None
@@ -98,6 +109,13 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 id_col = columns[i]
                 break
 
+        # Find password column
+        password_col = None
+        for i, col in enumerate(columns_lower):
+            if "password" in col:
+                password_col = columns[i]
+                break
+
         if not onmicrosoft_col:
             errors.append(f"Tenant CSV must have a column containing 'onmicrosoft' or 'domain'. Found: {', '.join(columns)}")
             return tenants, errors
@@ -108,6 +126,10 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 continue
             onmicrosoft = onmicrosoft.strip()
 
+            # If value is an email address, extract the domain part
+            if "@" in onmicrosoft:
+                onmicrosoft = onmicrosoft.split("@")[1].strip()
+
             # Normalize: add .onmicrosoft.com if just the prefix
             if not onmicrosoft.endswith(".onmicrosoft.com"):
                 onmicrosoft = f"{onmicrosoft}.onmicrosoft.com"
@@ -116,6 +138,7 @@ def parse_tenants_csv_content(content: str) -> Tuple[List[Dict], List[str]]:
                 "name": row.get(name_col, "").strip() if name_col else onmicrosoft.split(".")[0],
                 "onmicrosoft_domain": onmicrosoft,
                 "microsoft_tenant_id": row.get(id_col, "").strip() if id_col else "",
+                "password": row.get(password_col, "").strip() if password_col else "",
             })
 
     except Exception as e:
@@ -253,7 +276,12 @@ def cross_validate(
         else:
             unmatched_tenants.append(tenant["onmicrosoft_domain"])
 
-    if unmatched_tenants:
+    # Count tenants that have embedded passwords
+    tenants_with_embedded_creds = sum(1 for t in tenants if t.get("password"))
+    if matched_count == 0 and tenants_with_embedded_creds > 0:
+        matched_count = tenants_with_embedded_creds
+
+    if unmatched_tenants and tenants_with_embedded_creds == 0:
         warnings.append(f"{len(unmatched_tenants)} tenant(s) have no matching credentials")
 
     # 2. Check domain-tenant count alignment (N:1 check)
