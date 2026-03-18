@@ -418,56 +418,212 @@ def _login_with_mfa(driver, admin_email: str, admin_password: str, totp_secret: 
             "use the authenticator",
             "sign in with a code",
             "authenticator",
+            "approve sign",
+            "open your authenticator",
         ]
         mfa_detected = any(indicator in page_text for indicator in mfa_indicators)
 
-    code_input = None
+    # ---- ROBUST MFA HANDLING ----
+    # Microsoft shows DIFFERENT MFA page variants:
+    #   1. Push notification page ("Approve sign-in request") — NO otc input
+    #   2. TOTP code entry page ("Enter code") — HAS otc input
+    # We must detect which variant and switch to TOTP if needed.
+
+    totp_input = None
     if mfa_detected:
-        logger.info(f"[{domain}] MFA detected, waiting for TOTP input...")
-        for selector in [(By.ID, "idTxtBx_SAOTCC_OTC"), (By.NAME, "otc")]:
+        logger.info(f"[{domain}] MFA detected, handling MFA flow...")
+        _save_screenshot(driver, domain, "mfa_page_detected")
+
+        # STEP A: Try to find the TOTP input directly (maybe already on code page)
+        try:
+            totp_input = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.NAME, "otc"))
+            )
+            logger.info(f"[{domain}] Found TOTP input directly (otc)")
+        except Exception:
+            # Also try the ID-based selector
             try:
-                code_input = WebDriverWait(driver, 20).until(
-                    EC.presence_of_element_located(selector)
+                totp_input = WebDriverWait(driver, 3).until(
+                    EC.presence_of_element_located((By.ID, "idTxtBx_SAOTCC_OTC"))
                 )
-                break
+                logger.info(f"[{domain}] Found TOTP input directly (idTxtBx_SAOTCC_OTC)")
             except Exception:
-                continue
+                totp_input = None
+
+        # STEP B: If not on code entry page, switch to it
+        if not totp_input:
+            logger.info(f"[{domain}] TOTP input not found, looking for 'use verification code' link...")
+            _save_screenshot(driver, domain, "mfa_no_otc_input")
+
+            # Try clicking various links to switch to TOTP code entry
+            switch_selectors = [
+                # "Use a verification code" link
+                (By.XPATH, "//*[contains(text(), 'verification code')]"),
+                (By.XPATH, "//*[contains(text(), 'Verification code')]"),
+                # "I can't use my Microsoft Authenticator app right now"
+                (By.XPATH, "//*[contains(text(), \"can't use\")]"),
+                (By.XPATH, "//*[contains(text(), \"Can't use\")]"),
+                # "Sign in another way"
+                (By.XPATH, "//*[contains(text(), 'Sign in another way')]"),
+                (By.XPATH, "//*[contains(text(), 'sign in another way')]"),
+                # "Use a different verification option"
+                (By.XPATH, "//*[contains(text(), 'different verification')]"),
+                # Direct link IDs Microsoft commonly uses
+                (By.ID, "signInAnotherWay"),
+                (By.CSS_SELECTOR, "a#signInAnotherWay"),
+            ]
+
+            clicked_switch = False
+            for by, selector in switch_selectors:
+                try:
+                    elem = driver.find_element(by, selector)
+                    if elem.is_displayed():
+                        driver.execute_script("arguments[0].click()", elem)
+                        logger.info(f"[{domain}] Clicked MFA switch link: {selector}")
+                        clicked_switch = True
+                        time.sleep(3)
+                        _save_screenshot(driver, domain, "mfa_after_switch_click")
+                        break
+                except Exception:
+                    continue
+
+            if not clicked_switch:
+                logger.error(f"[{domain}] Could not find any link to switch MFA method")
+                _save_screenshot(driver, domain, "mfa_no_switch_link_ERROR")
+                try:
+                    page_body = driver.find_element(By.TAG_NAME, "body").text
+                    logger.error(f"[{domain}] Page text: {page_body[:500]}")
+                except Exception:
+                    pass
+                raise Exception("Could not switch MFA method to TOTP code entry")
+
+            # After clicking switch, we might be on a method selection page
+            # Look for TOTP / authenticator app option
+            time.sleep(2)
+            method_selectors = [
+                (By.XPATH, "//*[contains(text(), 'verification code from')]"),
+                (By.XPATH, "//*[contains(text(), 'code from your authenticator')]"),
+                (By.XPATH, "//*[contains(text(), 'authenticator app')]"),
+                (By.XPATH, "//*[contains(text(), 'TOTP')]"),
+                (By.XPATH, "//*[contains(text(), 'software token')]"),
+                (By.XPATH, "//div[contains(@data-value, 'PhoneAppOTP')]"),
+                (By.XPATH, "//div[contains(@data-value, 'OneWaySMS')]"),
+            ]
+
+            for by, selector in method_selectors:
+                try:
+                    elem = driver.find_element(by, selector)
+                    if elem.is_displayed():
+                        driver.execute_script("arguments[0].click()", elem)
+                        logger.info(f"[{domain}] Selected TOTP method: {selector}")
+                        time.sleep(3)
+                        _save_screenshot(driver, domain, "mfa_after_method_select")
+                        break
+                except Exception:
+                    continue
+
+            # Now try to find the TOTP input again
+            try:
+                totp_input = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.NAME, "otc"))
+                )
+                logger.info(f"[{domain}] Found TOTP input after switching method")
+            except Exception:
+                # Try alternative selectors
+                alt_selectors = [
+                    (By.ID, "idTxtBx_SAOTCC_OTC"),
+                    (By.CSS_SELECTOR, "input[type='tel']"),
+                    (By.CSS_SELECTOR, "input[aria-label*='code']"),
+                    (By.CSS_SELECTOR, "input[aria-label*='Code']"),
+                    (By.CSS_SELECTOR, "input[placeholder*='code']"),
+                    (By.CSS_SELECTOR, "input[autocomplete='one-time-code']"),
+                ]
+                for by, selector in alt_selectors:
+                    try:
+                        elem = driver.find_element(by, selector)
+                        if elem.is_displayed():
+                            totp_input = elem
+                            logger.info(f"[{domain}] Found TOTP input with alt selector: {selector}")
+                            break
+                    except Exception:
+                        continue
+
+                if not totp_input:
+                    _save_screenshot(driver, domain, "mfa_still_no_input_ERROR")
+                    try:
+                        page_body = driver.find_element(By.TAG_NAME, "body").text
+                        logger.error(f"[{domain}] Still no TOTP input. Page text: {page_body[:500]}")
+                    except Exception:
+                        pass
+                    raise Exception("Could not find TOTP code input after switching MFA method")
+
     else:
-        # Still check if the code input shows up even without text indicators
+        # No MFA indicators detected — still check if a code input shows up
         try:
             for selector in [(By.ID, "idTxtBx_SAOTCC_OTC"), (By.NAME, "otc")]:
                 try:
-                    code_input = WebDriverWait(driver, 10).until(
+                    totp_input = WebDriverWait(driver, 10).until(
                         EC.presence_of_element_located(selector)
                     )
                     break
                 except Exception:
                     continue
-            logger.info(f"[{domain}] MFA input found without explicit indicators")
+            if totp_input:
+                logger.info(f"[{domain}] MFA input found without explicit indicators")
         except Exception:
-            code_input = None
+            totp_input = None
 
-    if code_input:
+    # STEP C: Enter the TOTP code (if we have an input)
+    if totp_input:
         code = pyotp.TOTP(totp_secret).now()
-        code_input.clear()
-        code_input.send_keys(code)
-        # Click verify/continue
-        try:
-            verify_btn = driver.find_element(By.ID, "idSubmit_SAOTCC_Continue")
-            safe_click(driver, verify_btn, "MFA Verify")
-        except Exception:
-            code_input.send_keys(Keys.RETURN)
-        time.sleep(3)
-    else:
-        logger.info(f"[{domain}] No MFA code input detected")
+        logger.info(f"[{domain}] Entering TOTP code: {code[:2]}****")
+        totp_input.clear()
+        totp_input.send_keys(code)
+        time.sleep(1)
 
-    # Stay signed in prompt
+        # STEP D: Click verify/submit
+        verify_selectors = [
+            (By.ID, "idSubmit_SAOTCC_Continue"),
+            (By.CSS_SELECTOR, "input[type='submit']"),
+            (By.CSS_SELECTOR, "button[type='submit']"),
+            (By.XPATH, "//input[@value='Verify']"),
+            (By.XPATH, "//button[contains(text(), 'Verify')]"),
+        ]
+        verify_clicked = False
+        for by, selector in verify_selectors:
+            try:
+                btn = driver.find_element(by, selector)
+                if btn.is_displayed():
+                    safe_click(driver, btn, "MFA Verify")
+                    verify_clicked = True
+                    logger.info(f"[{domain}] Clicked verify button: {selector}")
+                    break
+            except Exception:
+                continue
+        if not verify_clicked:
+            totp_input.send_keys(Keys.RETURN)
+            logger.info(f"[{domain}] Pressed Enter to submit TOTP code")
+        time.sleep(3)
+        _save_screenshot(driver, domain, "mfa_after_verify")
+    else:
+        logger.info(f"[{domain}] No MFA code input detected — proceeding without MFA")
+
+    # Handle "Stay signed in?" prompt
+    time.sleep(2)
     try:
-        stay_signed_in = WebDriverWait(driver, 5).until(
-            EC.element_to_be_clickable((By.ID, "idBtn_Back"))
-        )
-        stay_signed_in.click()
-        time.sleep(2)
+        yes_btn = driver.find_element(By.ID, "idSIButton9")
+        if yes_btn.is_displayed():
+            yes_btn.click()
+            logger.info(f"[{domain}] Clicked 'Yes' on stay signed in")
+            time.sleep(2)
+    except Exception:
+        pass
+    try:
+        no_btn = driver.find_element(By.ID, "idBtn_Back")
+        if no_btn.is_displayed():
+            no_btn.click()
+            logger.info(f"[{domain}] Clicked 'No' on stay signed in")
+            time.sleep(2)
     except Exception:
         logger.debug(f"[{domain}] No stay signed in prompt")
 

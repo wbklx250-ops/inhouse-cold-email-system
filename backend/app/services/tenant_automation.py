@@ -283,6 +283,9 @@ class BrowserWorker:
         opts.add_argument("--disable-default-apps")
         opts.add_argument("--disable-sync")
         opts.add_argument("--disable-translate")
+        opts.add_argument("--disable-background-timer-throttling")
+        opts.add_argument("--disable-backgrounding-occluded-windows")
+        opts.add_argument("--disable-renderer-backgrounding")
         opts.add_argument("--js-flags=--max-old-space-size=256")  # Limit JS heap to 256MB
         
         # Reduce logging noise
