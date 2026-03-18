@@ -55,6 +55,7 @@ class FirstLoginResult:
     success: bool
     new_password: Optional[str] = None
     totp_secret: Optional[str] = None
+    password_changed: bool = False
     security_defaults_disabled: bool = False
     error: Optional[str] = None
     screenshots: list = None
@@ -778,6 +779,8 @@ class MicrosoftLoginAutomation:
                     self.handle_password_change(current_password, new_password)
                     current_password = new_password
                     result.new_password = new_password
+                    result.password_changed = True
+                    logger.info(f"Password was changed during login flow")
                 elif state in (LoginState.NEEDS_MFA_SETUP, LoginState.NEEDS_MFA_METHOD_SELECT):
                     extracted = self.extract_totp_only()
                     if extracted:

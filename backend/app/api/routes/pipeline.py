@@ -1209,8 +1209,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                                     if not t:
                                         continue
                                     if r.get("success"):
-                                        t.admin_password = new_password
-                                        t.password_changed = True
+                                        if r.get("password_changed"):
+                                            t.admin_password = r.get("new_password", new_password)
+                                            t.password_changed = True
+                                            logger.info(f"[Step 5] Password was CHANGED for {t.admin_email}")
+                                        else:
+                                            t.password_changed = False
+                                            logger.info(f"[Step 5] Password was NOT changed for {t.admin_email}, keeping original")
                                         t.first_login_completed = True
                                         t.first_login_at = datetime.utcnow()
                                         t.setup_error = None

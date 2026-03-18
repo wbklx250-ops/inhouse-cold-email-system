@@ -237,6 +237,7 @@ class TenantResult:
     success: bool = False
     new_password: str = None
     totp_secret: str = None
+    password_changed: bool = False
     security_defaults_disabled: bool = False
     error: str = None
 
@@ -1916,9 +1917,13 @@ class BrowserWorker:
                 else:
                     logger.info(f"[W{self.worker_id}] ✓ [PASSWORD CHANGE] Password change appears successful!")
                     result.new_password = new_pwd
+                    result.password_changed = True
+                    logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Password was CHANGED, saving new password")
             else:
                 logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] No password change required (keywords not found)")
-                result.new_password = initial_pwd
+                logger.info(f"[W{self.worker_id}] [PASSWORD CHANGE] Password was NOT changed, keeping original password")
+                # Do NOT overwrite result.new_password - leave it as None so DB keeps original
+                result.password_changed = False
             
             # MFA ENROLLMENT - Check if required
             logger.info(f"[W{self.worker_id}] 🔐 Checking if MFA enrollment is required...")
@@ -2422,6 +2427,7 @@ async def process_tenants_parallel(
             "success": r.success,
             "new_password": r.new_password,
             "totp_secret": r.totp_secret,
+            "password_changed": r.password_changed,
             "security_defaults_disabled": r.security_defaults_disabled,
             "error": r.error
         }

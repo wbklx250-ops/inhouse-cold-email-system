@@ -764,9 +764,13 @@ async def _run_step4_with_retry(batch_id: UUID, new_password: str, job_id: str):
                             t.first_login_completed = True
                             t.totp_secret = r["totp_secret"]
                             t.security_defaults_disabled = r["security_defaults_disabled"]
-                            if r["new_password"]:
-                                t.admin_password = r["new_password"]
+                            if r.get("password_changed"):
+                                t.admin_password = r.get("new_password", new_password)
                                 t.password_changed = True
+                                logger.info(f"[Step 4 auto-run] Password was CHANGED for {t.admin_email}")
+                            else:
+                                t.password_changed = False
+                                logger.info(f"[Step 4 auto-run] Password was NOT changed for {t.admin_email}, keeping original")
                             t.first_login_at = datetime.utcnow()
                             t.setup_error = None
                             auto_run_jobs[job_id]["progress"]["step4"]["completed"] += 1
@@ -2532,10 +2536,14 @@ async def start_automation(
                                 continue
                             
                             if r.get("success"):
-                                # BUG FIX 4.1: ALWAYS use the form's new_password, not r["new_password"]
-                                # If first login succeeded, the password IS new_password now.
-                                t.admin_password = new_password
-                                t.password_changed = True
+                                # BUG FIX: Only update password if it was actually changed during first login
+                                if r.get("password_changed"):
+                                    t.admin_password = r.get("new_password", new_password)
+                                    t.password_changed = True
+                                    logger.info(f"[Step 4] Password was CHANGED for {t.admin_email}")
+                                else:
+                                    t.password_changed = False
+                                    logger.info(f"[Step 4] Password was NOT changed for {t.admin_email}, keeping original")
                                 t.first_login_completed = True
                                 t.first_login_at = datetime.utcnow()
                                 t.setup_error = None
@@ -2547,7 +2555,7 @@ async def start_automation(
                                 
                                 t.security_defaults_disabled = r.get("security_defaults_disabled", False)
                                 
-                                logger.info(f"✅ Saved results for {t.admin_email}: pwd=changed, totp={bool(t.totp_secret)}")
+                                logger.info(f"✅ Saved results for {t.admin_email}: pwd_changed={r.get('password_changed')}, totp={bool(t.totp_secret)}")
                             else:
                                 t.setup_error = r.get("error", "Unknown error")
                                 logger.warning(f"❌ Tenant {t.admin_email} failed: {r.get('error')}")
@@ -2683,9 +2691,14 @@ async def retry_tenant_first_login(
                     t.totp_secret = r["totp_secret"]
                     t.security_defaults_disabled = r["security_defaults_disabled"]
                     t.setup_error = r["error"]
-                    if r["success"] and r["new_password"]:
-                        t.admin_password = r["new_password"]
-                        t.password_changed = True
+                    if r["success"]:
+                        if r.get("password_changed"):
+                            t.admin_password = r.get("new_password")
+                            t.password_changed = True
+                            logger.info(f"[Step 4 retry] Password was CHANGED for {t.admin_email}")
+                        else:
+                            t.password_changed = False
+                            logger.info(f"[Step 4 retry] Password was NOT changed for {t.admin_email}, keeping original")
                         t.first_login_at = datetime.utcnow()
                     await session.commit()
                     logger.info(" SAVED %s to DB", t.name)
