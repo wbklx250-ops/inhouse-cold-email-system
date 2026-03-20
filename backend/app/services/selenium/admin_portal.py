@@ -632,7 +632,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
     """Complete M365 domain setup following EXACT wizard flow.
     
     IMPORTANT: Each step has individual error handling for better resilience.
-    Browser is closed in finally block to ensure cleanup.
+    Browser is ALWAYS closed in finally block to ensure cleanup even on crash.
     """
     from app.services.cloudflare_sync import add_txt, add_mx, add_spf, add_cname, cleanup_before_verification, cleanup_before_dns_setup, resolve_zone_id
     
@@ -768,6 +768,7 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.error(f"[{domain}] Enter domain failed: {e}")
         result["error"] = f"Enter domain failed: {e}"
         screenshot(driver, "error_enter_domain", domain)
+        _cleanup_driver(driver)
         return result
     
     # ===== STEP 5: DETECT PAGE STATE AFTER ENTERING DOMAIN =====
@@ -867,10 +868,11 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             logger.error(f"[{domain}] TXT value not found!")
             screenshot(driver, "error_no_txt", domain)
             result["error"] = "TXT value not found"
-            logger.error(f"[{domain}] FAILED - browser left open for inspection")
+            logger.error(f"[{domain}] FAILED - cleaning up browser")
+            _cleanup_driver(driver)
             return result
         
-        txt_value = txt_match.group(0)
+        txt_value = txt_match.group(0)  
         logger.info(f"[{domain}] Found TXT: {txt_value}")
         
         # 6a: CLEANUP conflicting records, then add TXT to Cloudflare
@@ -945,7 +947,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
             screenshot(driver, "error_verify_not_clicked", domain)
             result["error"] = "Could not click Verify button"
             update_status_file(domain, "verification", "failed", "Could not click Verify button")
-            logger.error(f"[{domain}] FAILED - browser left open for inspection")
+            logger.error(f"[{domain}] FAILED - cleaning up browser")
+            _cleanup_driver(driver)
             return result
         
         # ===== VERIFICATION RESULT DETECTION WITH RETRY =====
@@ -1178,7 +1181,8 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         if not continue_clicked:
             logger.error(f"[{domain}] Could not click Continue on connect page!")
             result["error"] = "Could not click Continue on connect page"
-            logger.error(f"[{domain}] FAILED - browser left open for inspection")
+            logger.error(f"[{domain}] FAILED - cleaning up browser")
+            _cleanup_driver(driver)
             return result
         
         # Wait for DNS records page to load
@@ -1318,6 +1322,76 @@ def setup_domain_complete_via_admin_portal(domain, zone_id, admin_email, admin_p
         logger.warning(f"[{domain}] Could not expand DKIM CNAME: {e}")
     
     screenshot(driver, "13_all_expanded", domain)
+    
+    # ===== FIX 3: DNS PAGE TEXT VALIDATION =====
+    # After expanding all sections, verify we have enough page content.
+    # Fully expanded DNS page should be ~3000+ chars. If < 2500, sections
+    # likely didn't expand — retry expanding and scroll to force render.
+    page_text_check = driver.find_element(By.TAG_NAME, "body").text
+    logger.info(f"[{domain}] DNS page text length after expansion: {len(page_text_check)}")
+    
+    if len(page_text_check) < 2500:
+        logger.warning(f"[{domain}] Page text too short ({len(page_text_check)} chars) — sections may not have expanded. Retrying...")
+        
+        # Scroll full page to force lazy-render
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(2)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+        
+        # Re-expand all sections (MX, CNAME, TXT)
+        for section_name in ["MX", "CNAME", "TXT"]:
+            try:
+                btn = driver.find_element(By.XPATH, f"//button[contains(@aria-label, 'Expand') and contains(@aria-label, '{section_name}')]")
+                driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+                time.sleep(0.3)
+                driver.execute_script("arguments[0].click();", btn)
+                logger.info(f"[{domain}] Re-expanded {section_name} section")
+                time.sleep(1)
+            except Exception:
+                pass
+        
+        # Re-expand Advanced options
+        try:
+            adv = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Advanced')] | //*[contains(text(), 'Advanced options')]")
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", adv)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", adv)
+            logger.info(f"[{domain}] Re-expanded Advanced options")
+            time.sleep(1)
+        except Exception:
+            pass
+        
+        # Re-check DKIM checkbox and expand DKIM CNAME
+        try:
+            dkim_label = driver.find_element(By.XPATH, "//*[contains(text(), 'DomainKeys Identified Mail')]")
+            driver.execute_script("arguments[0].click();", dkim_label)
+            time.sleep(3)
+        except Exception:
+            pass
+        
+        try:
+            btn = driver.find_element(By.XPATH, "//button[contains(@aria-label, 'Expand') and contains(@aria-label, 'CNAME')]")
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", btn)
+            time.sleep(0.3)
+            driver.execute_script("arguments[0].click();", btn)
+            time.sleep(1)
+        except Exception:
+            pass
+        
+        # Final scroll to render everything
+        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        time.sleep(1)
+        driver.execute_script("window.scrollTo(0, 0);")
+        time.sleep(1)
+        
+        page_text_recheck = driver.find_element(By.TAG_NAME, "body").text
+        logger.info(f"[{domain}] DNS page text length after retry: {len(page_text_recheck)}")
+        screenshot(driver, "13b_retry_expanded", domain)
+        
+        if len(page_text_recheck) < 2500:
+            logger.error(f"[{domain}] Page text STILL too short ({len(page_text_recheck)} chars). Logging full text for debug:")
+            logger.error(f"[{domain}] PAGE TEXT: {page_text_recheck}")
     
     # ===== STEP 8e: EXTRACT DNS VALUES =====
     logger.info(f"[{domain}] Step 8e: Extracting DNS values")

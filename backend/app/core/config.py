@@ -35,11 +35,11 @@ class Settings(BaseSettings):
     # Selenium
     screenshot_dir: str = "/tmp/screenshots"  # Directory for browser screenshots
     
-    # Parallel Processing for Step 5
+    # Parallel Processing for Step 5/6
     # Controls how many browser instances run simultaneously
-    # Reduced from 3 to 2 to prevent Chrome resource exhaustion crashes
-    # Each headless Chrome uses ~200-300MB RAM, so 2 = ~600MB RAM needed
-    max_parallel_browsers: int = 2
+    # 6 workers × ~300MB per Chrome = ~1.8GB RAM needed
+    # Railway has upgraded memory to support this
+    max_parallel_browsers: int = 6
     
     # Step 5 Browser Display Mode
     # False = visible browsers (useful for debugging/testing)

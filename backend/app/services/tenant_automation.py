@@ -288,6 +288,8 @@ class BrowserWorker:
         opts.add_argument("--disable-backgrounding-occluded-windows")
         opts.add_argument("--disable-renderer-backgrounding")
         opts.add_argument("--js-flags=--max-old-space-size=256")  # Limit JS heap to 256MB
+        opts.add_argument("--renderer-process-limit=1")        # Limit renderer processes
+        opts.add_argument("--no-first-run")                    # Skip first-run wizards
         
         # Reduce logging noise
         opts.add_argument("--log-level=3")
