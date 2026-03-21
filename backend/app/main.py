@@ -20,6 +20,11 @@ logging.basicConfig(
     ],
 )
 
+# Silence SQLAlchemy SQL echo — floods logs and hides useful output.
+# To temporarily re-enable for SQL debugging, set env var SQL_ECHO=1
+if not os.getenv("SQL_ECHO"):
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text, func, select
