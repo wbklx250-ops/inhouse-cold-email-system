@@ -52,7 +52,9 @@ def prepare_database_url(url: str) -> tuple[str, dict]:
     if "ssl" in query_params:
         ssl_val = query_params.pop("ssl")[0]
         ssl_required = ssl_val.lower() in ("true", "1", "require")
-    
+    # libpq-only (Neon may add it); asyncpg does not use this in the URL query string
+    query_params.pop("channel_binding", None)
+
     # Rebuild URL without SSL params
     new_query = urlencode(query_params, doseq=True)
     cleaned_url = urlunparse((
