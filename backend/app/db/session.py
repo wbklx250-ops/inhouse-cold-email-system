@@ -42,6 +42,13 @@ def prepare_database_url(url: str) -> tuple[str, dict]:
         tuple: (cleaned_url, connect_args)
     """
     parsed = urlparse(url)
+    # Plain postgresql:// defaults to sync psycopg2; create_async_engine needs asyncpg.
+    s = parsed.scheme.lower()
+    if s in ("postgresql", "postgres"):
+        parsed = parsed._replace(scheme="postgresql+asyncpg")
+    elif s == "postgresql+psycopg2":
+        parsed = parsed._replace(scheme="postgresql+asyncpg")
+
     query_params = parse_qs(parsed.query)
     
     # Check if SSL is required

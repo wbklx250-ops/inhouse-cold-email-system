@@ -3,6 +3,7 @@ import os
 import ssl
 import sys
 from logging.config import fileConfig
+from urllib.parse import urlparse, urlunparse
 
 from dotenv import load_dotenv
 from alembic import context
@@ -41,6 +42,17 @@ if config.config_file_name is not None:
 target_metadata = Base.metadata
 
 
+def _ensure_asyncpg_scheme(url: str) -> str:
+    """Plain postgresql:// selects sync psycopg2; Alembic online mode uses create_async_engine."""
+    parsed = urlparse(url)
+    s = parsed.scheme.lower()
+    if s in ("postgresql", "postgres"):
+        parsed = parsed._replace(scheme="postgresql+asyncpg")
+    elif s == "postgresql+psycopg2":
+        parsed = parsed._replace(scheme="postgresql+asyncpg")
+    return urlunparse(parsed)
+
+
 def run_migrations_offline() -> None:
     """Run migrations in 'offline' mode.
 
@@ -77,7 +89,7 @@ async def run_async_migrations() -> None:
     and associate a connection with the context.
     """
     # Get the database URL and strip the sslmode parameter for asyncpg
-    db_url = config.get_main_option("sqlalchemy.url")
+    db_url = _ensure_asyncpg_scheme(config.get_main_option("sqlalchemy.url"))
     # Remove sslmode from URL as asyncpg handles SSL differently
     if "?" in db_url:
         base_url = db_url.split("?")[0]
