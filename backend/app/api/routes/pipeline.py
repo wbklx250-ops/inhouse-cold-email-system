@@ -347,6 +347,70 @@ async def confirm_nameservers(
     return {"success": True, "message": "Nameservers confirmed. Pipeline resuming."}
 
 
+@router.post("/{batch_id}/skip-failed-domains")
+async def skip_failed_domains(
+    batch_id: UUID,
+    step: int = 6,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Mark all failed/stuck domains for a given step as 'skipped' so the pipeline can continue.
+
+    This is for domains that CANNOT complete a step (e.g., domain stuck in old tenant)
+    and need to be excluded from further processing.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    skipped_count = 0
+
+    if step == 6:
+        # Step 6 = M365 Domain Setup & DKIM
+        # Find domains that DON'T have domain_verified_in_m365=True AND aren't already skipped
+        result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365.is_not(True),
+                Domain.step5_skipped.is_not(True),
+            )
+        )
+        failed_domains = result.scalars().all()
+
+        for d in failed_domains:
+            d.step5_skipped = True
+            d.error_message = "MANUALLY SKIPPED - domain cannot be released from old tenant"
+            skipped_count += 1
+
+    elif step == 7:
+        # Step 7 = Mailbox Creation
+        result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365 == True,
+                Domain.dkim_enabled == True,
+                Domain.step6_complete.is_not(True),
+                Domain.step6_skipped.is_not(True),
+            )
+        )
+        failed_domains = result.scalars().all()
+
+        for d in failed_domains:
+            d.step6_skipped = True
+            d.error_message = "MANUALLY SKIPPED"
+            skipped_count += 1
+
+    await db.commit()
+
+    return {
+        "success": True,
+        "message": f"Skipped {skipped_count} failed domains at step {step}",
+        "skipped_count": skipped_count,
+    }
+
+
 @router.post("/{batch_id}/retry-failed")
 async def retry_failed(
     batch_id: UUID,
@@ -1366,6 +1430,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                         Domain.dkim_enabled == True,
                     )
                 ) or 0
+                m365_skipped = await db.scalar(
+                    select(func.count(Domain.id)).where(
+                        Domain.batch_id == batch_id,
+                        Domain.tenant_id.isnot(None),
+                        Domain.step5_skipped == True,
+                    )
+                ) or 0
                 batch = await db.get(SetupBatch, batch_id)
                 if batch:
                     batch.m365_completed = m365_ok
@@ -1374,7 +1445,7 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["6"]["completed"] = m365_ok
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "completed"
-            logger.info(f"Step 6 complete: {m365_ok} domains M365 configured")
+            logger.info(f"Step 6 complete: {m365_ok} domains M365 configured, {m365_skipped} skipped")
 
             # === Clean up all Chrome processes before Step 7 ===
             logger.info("Cleaning up browser processes between Step 6 and Step 7...")
