@@ -277,18 +277,12 @@ class BrowserWorker:
         opts.add_argument("--window-size=1280,900")
         opts.add_argument("--disable-blink-features=AutomationControlled")
         
-        # CRITICAL: Memory management for containerized environments (Railway ~1GB RAM)
-        opts.add_argument("--single-process")               # Reduces memory footprint
+        # Stability options
         opts.add_argument("--disable-extensions")
         opts.add_argument("--disable-background-networking")
         opts.add_argument("--disable-default-apps")
         opts.add_argument("--disable-sync")
         opts.add_argument("--disable-translate")
-        opts.add_argument("--disable-background-timer-throttling")
-        opts.add_argument("--disable-backgrounding-occluded-windows")
-        opts.add_argument("--disable-renderer-backgrounding")
-        opts.add_argument("--js-flags=--max-old-space-size=256")  # Limit JS heap to 256MB
-        opts.add_argument("--renderer-process-limit=1")        # Limit renderer processes
         opts.add_argument("--no-first-run")                    # Skip first-run wizards
         
         # Reduce logging noise

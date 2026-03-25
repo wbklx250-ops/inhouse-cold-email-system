@@ -52,6 +52,7 @@ from app.api.routes import (
     domain_lookup_router,
     pipeline_router,
     step8_endpoints_router,
+    domain_checker_router,
 )
 from app.db.session import get_db_session
 from app.core.config import get_settings
@@ -157,6 +158,7 @@ app.include_router(domain_removal_router)
 app.include_router(domain_lookup_router)
 app.include_router(pipeline_router)
 app.include_router(step8_endpoints_router)
+app.include_router(domain_checker_router)
 
 
 @app.get("/", tags=["root"])

@@ -6,6 +6,7 @@ Neon is a serverless PostgreSQL provider with specific connection requirements:
 - Async engine uses explicit pooling settings for higher concurrency
 - Retry logic handles transient connection drops in serverless environments
 """
+import os
 import ssl
 import asyncio
 import logging
@@ -86,7 +87,7 @@ engine = create_async_engine(
     pool_timeout=60,
     pool_recycle=120,       # Neon kills idle connections at ~5 min; recycle at 2 min to stay safe
     pool_pre_ping=True,     # Verify connection is alive before checkout
-    echo=settings.debug,
+    echo=bool(os.getenv("SQL_ECHO")),
     connect_args=connect_args,
 )
 
@@ -97,7 +98,7 @@ engine = create_async_engine(
 _background_engine = create_async_engine(
     database_url,
     poolclass=NullPool,     # No connection pooling — always fresh
-    echo=settings.debug,
+    echo=bool(os.getenv("SQL_ECHO")),
     connect_args=connect_args,
 )
 
@@ -196,7 +197,7 @@ sync_connect_args = {"sslmode": "require"} if connect_args.get("ssl") else {}
 sync_engine = create_engine(
     database_url.replace("postgresql+asyncpg", "postgresql+psycopg2"),
     poolclass=NullPool,  # Don't pool connections locally - Neon handles this
-    echo=settings.debug,
+    echo=bool(os.getenv("SQL_ECHO")),
     connect_args=sync_connect_args,
 )
 

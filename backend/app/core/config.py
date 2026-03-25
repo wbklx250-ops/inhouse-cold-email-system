@@ -51,6 +51,11 @@ class Settings(BaseSettings):
     # True = headless mode (REQUIRED for production/Railway - no display available!)
     step6_headless: bool = True
 
+    # Domain Checker parallel browsers
+    # Lighter than Step 5 (read-only), so can be slightly more aggressive
+    # 3 = safe default (~1.1GB RAM), 4-5 for larger Railway instances
+    checker_parallel_browsers: int = 2
+
     # Headless stability delays (seconds)
     # Increase in headless to avoid racing Microsoft login screens
     headless_delay_seconds: float = 1.5

@@ -10,6 +10,7 @@ from app.api.routes.domain_removal import router as domain_removal_router
 from app.api.routes.domain_lookup import router as domain_lookup_router
 from app.api.routes.pipeline import router as pipeline_router
 from app.api.routes.step8_endpoints import router as step8_endpoints_router
+from app.api.routes.domain_checker import router as domain_checker_router
 
 __all__ = [
     "domains_router",
@@ -24,4 +25,5 @@ __all__ = [
     "domain_lookup_router",
     "pipeline_router",
     "step8_endpoints_router",
+    "domain_checker_router",
 ]
