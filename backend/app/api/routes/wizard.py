@@ -4036,39 +4036,26 @@ async def export_mailboxes_csv(
 
     display_name = f"{batch.persona_first_name or ''} {batch.persona_last_name or ''}".strip()
 
-    # Get all tenants with their mailboxes
+    # Get ALL mailboxes for the batch, sorted by domain then email
     result = await db.execute(
-        select(Tenant)
-        .where(Tenant.batch_id == batch_id)
-        .options(selectinload(Tenant.mailboxes))
+        select(Mailbox).where(Mailbox.batch_id == batch_id)
     )
-    tenants = result.scalars().all()
+    mailboxes = list(result.scalars().all())
+    mailboxes.sort(key=lambda mb: (mb.email.split('@')[1] if '@' in mb.email else '', mb.email))
 
     # Build CSV
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["DisplayName", "EmailAddress", "Password"])
 
-    for tenant in tenants:
-        # First row: Licensed user (me1)
-        if tenant.licensed_user_upn:
-            writer.writerow(
-                [
-                    display_name or "Licensed User",
-                    tenant.licensed_user_upn,
-                    tenant.licensed_user_password or "#Sendemails1",
-                ]
-            )
-
-        # Mailboxes
-        for mailbox in tenant.mailboxes:
-            writer.writerow(
-                [
-                    mailbox.display_name,
-                    mailbox.email,
-                    mailbox.password,
-                ]
-            )
+    for mailbox in mailboxes:
+        writer.writerow(
+            [
+                mailbox.display_name,
+                mailbox.email,
+                mailbox.password,
+            ]
+        )
 
     output.seek(0)
 

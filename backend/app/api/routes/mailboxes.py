@@ -579,7 +579,8 @@ async def export_credentials(
         query = query.where(Mailbox.tenant_id == tenant_id)
     
     result = await db.execute(query)
-    mailboxes = result.scalars().all()
+    mailboxes = list(result.scalars().all())
+    mailboxes.sort(key=lambda mb: (mb.email.split('@')[1] if '@' in mb.email else '', mb.email))
     
     # Generate CSV
     output = StringIO()
@@ -609,6 +610,7 @@ async def export_mailbox_credentials(
         query = query.where(Mailbox.tenant_id == tenant_id)
     result = await db.execute(query)
     mailboxes = list(result.scalars().all())
+    mailboxes.sort(key=lambda mb: (mb.email.split('@')[1] if '@' in mb.email else '', mb.email))
 
     # Build CSV
     output = StringIO()

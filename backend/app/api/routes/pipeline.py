@@ -42,6 +42,14 @@ pipeline_jobs = {}
 MAX_PIPELINE_RETRIES = 4   # Max retries per tenant per step
 STEP5_MAX_WORKERS = 2      # Max parallel browsers for first login (Railway memory limit)
 
+def _fmt_err(exc: Exception) -> str:
+    """Format exception for logging — never returns empty string."""
+    msg = str(exc)
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return f"{type(exc).__name__} (no message)"
+
+
 STEP_NAMES = {
     1: "Create Cloudflare Zones",
     2: "Update Nameservers",
@@ -663,6 +671,12 @@ async def retry_failed(
     if not batch:
         raise HTTPException(404, "Batch not found")
 
+    # === GUARD: Reject if pipeline is already running ===
+    if batch.pipeline_status == "running":
+        job_id = str(batch_id)
+        if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
+            raise HTTPException(409, "Pipeline is already running. Pause first before retrying.")
+
     # Reset retry counts for the target step(s) using bulk update
     from sqlalchemy import update as sql_update
 
@@ -749,6 +763,15 @@ async def resume_pipeline(
     batch = await db.get(SetupBatch, batch_id)
     if not batch:
         raise HTTPException(404, "Batch not found")
+
+    # === GUARD: Reject if pipeline is already running ===
+    job_id = str(batch_id)
+    if batch.pipeline_status == "running":
+        if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
+            logger.warning(f"Resume rejected for batch {batch_id} — pipeline already running")
+            raise HTTPException(409, "Pipeline is already running. Pause first before resuming.")
+        # DB says running but in-memory doesn't — stale DB state from crash, allow resume
+        logger.warning(f"DB says running but no in-memory job for batch {batch_id} — allowing resume")
 
     # Determine which step to resume from
     resume_step = batch.pipeline_step or 1
@@ -944,6 +967,12 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
     Supports resuming from any step via start_from_step parameter.
     """
     job_id = str(batch_id)
+
+    # Guard: if another instance is already running for this batch, exit immediately
+    if job_id in pipeline_jobs and pipeline_jobs[job_id].get("status") == "running":
+        logger.warning(f"Pipeline already running for batch {batch_id} — duplicate task exiting")
+        return
+
     logger.info(f"🚀 Pipeline started for batch {batch_id} from step {start_from_step}")
 
     # Initialize in-memory job tracker if not exists
@@ -1098,13 +1127,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             logger.info(f"Step 1: {zones_created} new zones created, {total_with_zones} total zones ready")
 
           except Exception as step_error:
-            logger.error(f"Step 1 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 1 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 1, STEP_NAMES[1], status="error", message=str(step_error))
+            await log_activity(batch_id, 1, STEP_NAMES[1], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["1"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 1, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 1, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 1 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1257,14 +1286,14 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
 
           except Exception as step_error:
-            logger.error(f"Step 2-3 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 2-3 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 2, STEP_NAMES[2], status="error", message=str(step_error))
+            await log_activity(batch_id, 2, STEP_NAMES[2], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["2"]["status"] = "error"
                 pipeline_jobs[job_id]["steps"]["3"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 2, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 2, "error": _fmt_err(step_error)})
 
         elif start_from_step <= 3:
             # Skipping step 2 but need step 3 (NS propagation check)
@@ -1344,13 +1373,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 await log_activity(batch_id, 3, STEP_NAMES[3], status="completed", message=f"{total_propagated}/{total_zones} propagated")
 
             except Exception as step_error:
-                logger.error(f"Step 3 CRASHED (continuing to next step): {step_error}")
+                logger.error(f"Step 3 CRASHED (continuing to next step): {_fmt_err(step_error)}")
                 import traceback
                 logger.error(traceback.format_exc())
-                await log_activity(batch_id, 3, STEP_NAMES[3], status="error", message=str(step_error))
+                await log_activity(batch_id, 3, STEP_NAMES[3], status="error", message=_fmt_err(step_error))
                 if job_id in pipeline_jobs:
                     pipeline_jobs[job_id]["steps"]["3"]["status"] = "error"
-                    pipeline_jobs[job_id]["errors"].append({"step": 3, "error": str(step_error)})
+                    pipeline_jobs[job_id]["errors"].append({"step": 3, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Steps 2-3 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1429,13 +1458,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             logger.info(f"Step 4: {dns_done} new DNS configured, {total_dns_done} total ready")
 
           except Exception as step_error:
-            logger.error(f"Step 4 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 4 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 4, STEP_NAMES[4], status="error", message=str(step_error))
+            await log_activity(batch_id, 4, STEP_NAMES[4], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["4"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 4, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 4, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 4 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1580,13 +1609,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(10)
 
           except Exception as step_error:
-            logger.error(f"Step 5 CRASHED: {step_error}")
+            logger.error(f"Step 5 CRASHED: {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 5, STEP_NAMES[5], status="error", message=str(step_error))
+            await log_activity(batch_id, 5, STEP_NAMES[5], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["5"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 5, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 5, "error": _fmt_err(step_error)})
             kill_all_browsers()
         else:
             logger.info(f"Skipping Step 5 (starting from step {start_from_step})")
@@ -1693,13 +1722,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(5)
 
           except Exception as step_error:
-            logger.error(f"Step 6 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 6 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 6, STEP_NAMES[6], status="error", message=str(step_error))
+            await log_activity(batch_id, 6, STEP_NAMES[6], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["6"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 6, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 6, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 6 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1815,13 +1844,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(5)
 
           except Exception as step_error:
-            logger.error(f"Step 7 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 7 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 7, STEP_NAMES[7], status="error", message=str(step_error))
+            await log_activity(batch_id, 7, STEP_NAMES[7], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["7"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 7, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 7, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 7 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1930,13 +1959,13 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
             await asyncio.sleep(5)
 
           except Exception as step_error:
-            logger.error(f"Step 8 CRASHED (continuing to next step): {step_error}")
+            logger.error(f"Step 8 CRASHED (continuing to next step): {_fmt_err(step_error)}")
             import traceback
             logger.error(traceback.format_exc())
-            await log_activity(batch_id, 8, STEP_NAMES[8], status="error", message=str(step_error))
+            await log_activity(batch_id, 8, STEP_NAMES[8], status="error", message=_fmt_err(step_error))
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["8"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 8, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 8, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 8 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1953,10 +1982,10 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 pipeline_jobs[job_id]["steps"]["9"]["status"] = "completed"
             await log_activity(batch_id, 9, STEP_NAMES[9], status="completed", message="Credentials available for download")
           except Exception as step_error:
-            logger.error(f"Step 9 CRASHED: {step_error}")
+            logger.error(f"Step 9 CRASHED: {_fmt_err(step_error)}")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["9"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 9, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 9, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 9 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -1983,10 +2012,10 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
                 if job_id in pipeline_jobs:
                     pipeline_jobs[job_id]["steps"]["10"]["status"] = "skipped"
           except Exception as step_error:
-            logger.error(f"Step 10 CRASHED: {step_error}")
+            logger.error(f"Step 10 CRASHED: {_fmt_err(step_error)}")
             if job_id in pipeline_jobs:
                 pipeline_jobs[job_id]["steps"]["10"]["status"] = "error"
-                pipeline_jobs[job_id]["errors"].append({"step": 10, "error": str(step_error)})
+                pipeline_jobs[job_id]["errors"].append({"step": 10, "error": _fmt_err(step_error)})
         else:
             logger.info(f"Skipping Step 10 (starting from step {start_from_step})")
             if job_id in pipeline_jobs:
@@ -2013,15 +2042,15 @@ async def run_pipeline(batch_id: UUID, start_from_step: int = 1):
         await log_activity(batch_id, 10, "Pipeline Complete", status="completed", message="All steps finished")
 
     except Exception as e:
-        logger.error(f"💥 Pipeline CRASHED: {e}")
+        logger.error(f"💥 Pipeline CRASHED: {_fmt_err(e)}")
         import traceback
         logger.error(traceback.format_exc())
 
-        await _update_pipeline(batch_id, 0, "error", f"Pipeline error: {str(e)}")
+        await _update_pipeline(batch_id, 0, "error", f"Pipeline error: {_fmt_err(e)}")
 
         if job_id in pipeline_jobs:
             pipeline_jobs[job_id]["status"] = "error"
-            pipeline_jobs[job_id]["error"] = str(e)
+            pipeline_jobs[job_id]["error"] = _fmt_err(e)
 
         async with SessionLocal() as db:
             batch = await db.get(SetupBatch, batch_id)

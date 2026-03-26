@@ -38,6 +38,15 @@ from app.services.selenium.user_ops import UserOpsSelenium
 
 logger = logging.getLogger(__name__)
 
+
+def _format_error(exc: Exception) -> str:
+    """Format exception for logging — never returns empty string."""
+    msg = str(exc)
+    if msg:
+        return f"{type(exc).__name__}: {msg}"
+    return f"{type(exc).__name__} (no message)"
+
+
 _progress_store: Dict[str, Dict[str, Any]] = {}
 
 
@@ -231,13 +240,13 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
                 logger.error(
                     "[%s] Domain exception: %s",
                     domain_name,
-                    str(e),
+                    _format_error(e),
                 )
                 return {
                     "domain_id": str(domain_id),
                     "tenant_id": str(tenant_id),
                     "domain_name": domain_name,
-                    "result": {"success": False, "error": str(e)},
+                    "result": {"success": False, "error": _format_error(e)},
                 }
 
     tasks = [
@@ -250,7 +259,7 @@ async def run_step6_for_batch(batch_id: UUID, display_name: str) -> Dict[str, An
         if isinstance(item, Exception):
             failed += 1
             results.append(
-                {"domain_id": "unknown", "tenant_id": "unknown", "result": {"success": False, "error": str(item)}}
+                {"domain_id": "unknown", "tenant_id": "unknown", "result": {"success": False, "error": _format_error(item)}}
             )
         else:
             results.append(item)
@@ -903,7 +912,7 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 finally:
                     pass
             except Exception as e:
-                logger.error("[%s] PHASE 1 FAILED: %s", domain, e)
+                logger.error("[%s] PHASE 1 FAILED: %s", domain, _format_error(e))
                 import traceback
                 logger.error(traceback.format_exc())
                 raise
@@ -1026,7 +1035,7 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                                 domain, password_set_count, accounts_enabled_count)
                     logger.info("[%s] === PHASE 2: Admin UI DONE ===", domain)
             except Exception as e:
-                logger.error("[%s] PHASE 2 FAILED: %s", domain, e)
+                logger.error("[%s] PHASE 2 FAILED: %s", domain, _format_error(e))
                 import traceback
                 logger.error(traceback.format_exc())
                 # Don't fail the whole step — mailboxes are created, passwords can be retried
@@ -1134,7 +1143,7 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
             update_progress(tid_str, "incomplete", "failed", error_detail)
             return {"success": False, "error": error_detail}
     except Exception as exc:
-        message = str(exc)
+        message = _format_error(exc)
         logger.error("[%s] Step 6 failed: %s", domain, message)
         try:
             async def _save_error(err_db):
@@ -1145,7 +1154,7 @@ async def run_step6_for_tenant(tenant_id: UUID, domain_id: UUID = None, domain_i
                 _save_error, description=f"{domain} error save",
             )
         except Exception as db_err:
-            logger.error("[%s] CRITICAL: Could not save error to DB either: %s", domain, db_err)
+            logger.error("[%s] CRITICAL: Could not save error to DB either: %s", domain, _format_error(db_err))
         update_progress(tid_str, "error", "failed", message)
         return {"success": False, "error": message}
     finally:

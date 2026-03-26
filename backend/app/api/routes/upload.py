@@ -525,9 +525,9 @@ async def export_pending_csv(
         select(Mailbox)
         .options(selectinload(Mailbox.tenant))
         .where(and_(*filters))
-        .order_by(Mailbox.email)
     )
-    mailboxes = result.scalars().all()
+    mailboxes = list(result.scalars().all())
+    mailboxes.sort(key=lambda mb: (mb.email.split('@')[1] if '@' in mb.email else '', mb.email))
 
     if not mailboxes:
         raise HTTPException(status_code=404, detail="No pending mailboxes found")
