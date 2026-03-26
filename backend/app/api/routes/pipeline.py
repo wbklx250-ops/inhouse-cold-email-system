@@ -7,9 +7,11 @@ import os
 import random
 import time
 from datetime import datetime
+from typing import List, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, UploadFile, File, Form, HTTPException, BackgroundTasks
+from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, update
@@ -408,6 +410,244 @@ async def skip_failed_domains(
         "success": True,
         "message": f"Skipped {skipped_count} failed domains at step {step}",
         "skipped_count": skipped_count,
+    }
+
+
+# --- Pydantic model for skip-domains request ---
+class SkipDomainsRequest(BaseModel):
+    domain_names: Optional[List[str]] = None  # Specific domains to skip by name
+    skip_all_failed: bool = False  # Or skip ALL failed domains for this step
+    reason: str = "Cannot be released from old tenant"
+
+
+@router.post("/{batch_id}/skip-domains")
+async def skip_domains(
+    batch_id: UUID,
+    request: SkipDomainsRequest,
+    step: int = 6,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Skip specific domains (or all failed) at a given pipeline step.
+
+    Two modes:
+    1. Provide domain_names list -> skip exactly those domains
+    2. Set skip_all_failed=True -> skip every domain that hasn't completed this step
+
+    After skipping, the pipeline can be resumed and will proceed with only the successful domains.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    skipped = []
+    not_found = []
+    already_done = []
+
+    if step == 6:
+        # Step 6 = M365 Domain Setup & DKIM
+        if request.skip_all_failed:
+            # Find ALL domains that haven't completed M365 setup and aren't already skipped
+            result = await db.execute(
+                select(Domain).where(
+                    Domain.batch_id == batch_id,
+                    Domain.tenant_id.isnot(None),
+                    Domain.domain_verified_in_m365.is_not(True),
+                    Domain.step5_skipped.is_not(True),
+                )
+            )
+            domains_to_skip = result.scalars().all()
+            for d in domains_to_skip:
+                d.step5_skipped = True
+                d.error_message = f"SKIPPED: {request.reason}"
+                skipped.append(d.name)
+
+        elif request.domain_names:
+            # Skip specific domains by name
+            for domain_name in request.domain_names:
+                clean_name = domain_name.strip().lower()
+                if not clean_name:
+                    continue
+
+                result = await db.execute(
+                    select(Domain).where(
+                        Domain.batch_id == batch_id,
+                        Domain.name == clean_name,
+                    )
+                )
+                domain = result.scalar_one_or_none()
+
+                if not domain:
+                    not_found.append(clean_name)
+                elif domain.domain_verified_in_m365 and domain.dkim_enabled:
+                    already_done.append(clean_name)
+                elif domain.step5_skipped:
+                    already_done.append(clean_name)
+                else:
+                    domain.step5_skipped = True
+                    domain.error_message = f"SKIPPED: {request.reason}"
+                    skipped.append(clean_name)
+        else:
+            raise HTTPException(400, "Provide domain_names list or set skip_all_failed=True")
+
+    elif step == 7:
+        # Step 7 = Mailbox Creation
+        if request.skip_all_failed:
+            result = await db.execute(
+                select(Domain).where(
+                    Domain.batch_id == batch_id,
+                    Domain.tenant_id.isnot(None),
+                    Domain.domain_verified_in_m365 == True,
+                    Domain.dkim_enabled == True,
+                    Domain.step6_complete.is_not(True),
+                    Domain.step6_skipped.is_not(True),
+                )
+            )
+            domains_to_skip = result.scalars().all()
+            for d in domains_to_skip:
+                d.step6_skipped = True
+                d.error_message = f"SKIPPED: {request.reason}"
+                skipped.append(d.name)
+
+        elif request.domain_names:
+            for domain_name in request.domain_names:
+                clean_name = domain_name.strip().lower()
+                if not clean_name:
+                    continue
+                result = await db.execute(
+                    select(Domain).where(
+                        Domain.batch_id == batch_id,
+                        Domain.name == clean_name,
+                    )
+                )
+                domain = result.scalar_one_or_none()
+                if not domain:
+                    not_found.append(clean_name)
+                elif domain.step6_complete:
+                    already_done.append(clean_name)
+                elif domain.step6_skipped:
+                    already_done.append(clean_name)
+                else:
+                    domain.step6_skipped = True
+                    domain.error_message = f"SKIPPED: {request.reason}"
+                    skipped.append(clean_name)
+        else:
+            raise HTTPException(400, "Provide domain_names list or set skip_all_failed=True")
+    else:
+        raise HTTPException(400, f"Skip not supported for step {step}")
+
+    await db.commit()
+
+    await log_activity(
+        batch_id, step, STEP_NAMES.get(step, f"Step {step}"),
+        status="skipped",
+        message=f"Skipped {len(skipped)} domains: {request.reason}"
+    )
+
+    return {
+        "success": True,
+        "skipped": skipped,
+        "skipped_count": len(skipped),
+        "not_found": not_found,
+        "already_done": already_done,
+        "message": f"Skipped {len(skipped)} domains. {len(not_found)} not found, {len(already_done)} already completed/skipped."
+    }
+
+
+@router.get("/{batch_id}/failed-domains")
+async def get_failed_domains(
+    batch_id: UUID,
+    step: int = 6,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Get all domains that are stuck/failed at a given step.
+    Returns domain names, their error messages, and current status flags.
+    """
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    if step == 6:
+        # Domains that haven't completed M365 setup
+        failed_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365.is_not(True),
+                Domain.step5_skipped.is_not(True),
+            ).order_by(Domain.name)
+        )
+        succeeded_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365 == True,
+                Domain.dkim_enabled == True,
+            ).order_by(Domain.name)
+        )
+        skipped_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.step5_skipped == True,
+            ).order_by(Domain.name)
+        )
+    elif step == 7:
+        failed_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.domain_verified_in_m365 == True,
+                Domain.dkim_enabled == True,
+                Domain.step6_complete.is_not(True),
+                Domain.step6_skipped.is_not(True),
+            ).order_by(Domain.name)
+        )
+        succeeded_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.step6_complete == True,
+            ).order_by(Domain.name)
+        )
+        skipped_result = await db.execute(
+            select(Domain).where(
+                Domain.batch_id == batch_id,
+                Domain.tenant_id.isnot(None),
+                Domain.step6_skipped == True,
+            ).order_by(Domain.name)
+        )
+    else:
+        raise HTTPException(400, f"Step {step} not supported")
+
+    failed = failed_result.scalars().all()
+    succeeded = succeeded_result.scalars().all()
+    skipped_list = skipped_result.scalars().all()
+
+    return {
+        "step": step,
+        "step_name": STEP_NAMES.get(step, f"Step {step}"),
+        "failed": [
+            {
+                "id": str(d.id),
+                "name": d.name,
+                "error": d.error_message,
+                "retry_count": d.step5_retry_count if step == 6 else 0,
+                "domain_added": d.domain_added_to_m365 or False,
+                "domain_verified": d.domain_verified_in_m365 or False,
+                "dkim_enabled": d.dkim_enabled or False,
+            }
+            for d in failed
+        ],
+        "succeeded": [{"id": str(d.id), "name": d.name} for d in succeeded],
+        "skipped": [{"id": str(d.id), "name": d.name, "error": d.error_message} for d in skipped_list],
+        "summary": {
+            "failed_count": len(failed),
+            "succeeded_count": len(succeeded),
+            "skipped_count": len(skipped_list),
+            "total": len(failed) + len(succeeded) + len(skipped_list),
+        }
     }
 
 
