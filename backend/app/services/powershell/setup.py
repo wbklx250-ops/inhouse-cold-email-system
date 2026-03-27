@@ -16,9 +16,7 @@ logger = logging.getLogger(__name__)
 # Required PowerShell modules for M365 operations
 REQUIRED_MODULES = [
     "MSOnline",
-    "ExchangeOnlineManagement",
-    "Microsoft.Graph.Authentication",
-    "Microsoft.Graph.Users",
+    "ExchangeOnlineManagement"
 ]
 
 # Auto-detect PowerShell path based on OS
