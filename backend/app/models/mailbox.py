@@ -112,6 +112,11 @@ class Mailbox(TimestampUUIDMixin, Base):
     smartlead_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     smartlead_upload_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     
+    # Sequencer upload tracking (PlusVibe.ai)
+    plusvibe_uploaded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    plusvibe_uploaded_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    plusvibe_upload_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    
     # Initial password for mailbox (used by uploaders)
     initial_password: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
 

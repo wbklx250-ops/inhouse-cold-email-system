@@ -58,7 +58,7 @@ export default function SequencerUploaderPage() {
             Sequencer Upload
           </h1>
           <p className="mt-2 text-gray-600">
-            Automatically upload mailboxes to your email sequencer (Instantly.ai or Smartlead.ai) using OAuth automation.
+            Automatically upload mailboxes to Instantly.ai, Smartlead.ai, or PlusVibe.ai using OAuth automation.
           </p>
         </div>
 

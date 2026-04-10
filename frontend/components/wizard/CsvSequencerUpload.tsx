@@ -25,7 +25,7 @@ interface InstantlyAccount {
 
 export default function CsvSequencerUpload() {
   const [files, setFiles] = useState<File[]>([]);
-  const [sequencer, setSequencer] = useState<"instantly" | "smartlead">("instantly");
+  const [sequencer, setSequencer] = useState<"instantly" | "smartlead" | "plusvibe">("instantly");
   const [accounts, setAccounts] = useState<InstantlyAccount[]>([]);
   const [useExistingAccount, setUseExistingAccount] = useState(true);
   const [selectedAccountId, setSelectedAccountId] = useState("");
@@ -33,6 +33,7 @@ export default function CsvSequencerUpload() {
   const [instantlyPassword, setInstantlyPassword] = useState("");
   const [smartleadApiKey, setSmartleadApiKey] = useState("");
   const [smartleadOAuthUrl, setSmartleadOAuthUrl] = useState("");
+  const [plusvibeOAuthUrl, setPlusvibeOAuthUrl] = useState("");
   const [configureSettings, setConfigureSettings] = useState(true);
   const [maxEmailPerDay, setMaxEmailPerDay] = useState(6);
   const [waitMins, setWaitMins] = useState(60);
@@ -72,8 +73,10 @@ export default function CsvSequencerUpload() {
     try {
       const k = localStorage.getItem("smartlead_api_key");
       const u = localStorage.getItem("smartlead_oauth_url");
+      const pv = localStorage.getItem("plusvibe_oauth_url");
       if (k) setSmartleadApiKey(k);
       if (u) setSmartleadOAuthUrl(u);
+      if (pv) setPlusvibeOAuthUrl(pv);
     } catch (_) {}
   }, []);
 
@@ -146,7 +149,7 @@ export default function CsvSequencerUpload() {
         formData.append("instantly_email", instantlyEmail);
         formData.append("instantly_password", instantlyPassword);
       }
-    } else {
+    } else if (sequencer === "smartlead") {
       if (!smartleadApiKey || !smartleadOAuthUrl) { setError("Enter Smartlead API key and OAuth URL"); return; }
       formData.append("smartlead_api_key", smartleadApiKey);
       formData.append("smartlead_oauth_url", smartleadOAuthUrl);
@@ -159,6 +162,12 @@ export default function CsvSequencerUpload() {
       try {
         localStorage.setItem("smartlead_api_key", smartleadApiKey);
         localStorage.setItem("smartlead_oauth_url", smartleadOAuthUrl);
+      } catch (_) {}
+    } else {
+      if (!plusvibeOAuthUrl) { setError("Enter PlusVibe OAuth connect URL"); return; }
+      formData.append("plusvibe_oauth_url", plusvibeOAuthUrl);
+      try {
+        localStorage.setItem("plusvibe_oauth_url", plusvibeOAuthUrl);
       } catch (_) {}
     }
 
@@ -250,6 +259,10 @@ export default function CsvSequencerUpload() {
                 <input type="radio" checked={sequencer === "smartlead"} onChange={() => setSequencer("smartlead")} disabled={isRunning} className="mr-2" />
                 <span className="text-sm text-gray-700">🚀 Smartlead.ai</span>
               </label>
+              <label className="flex items-center">
+                <input type="radio" checked={sequencer === "plusvibe"} onChange={() => setSequencer("plusvibe")} disabled={isRunning} className="mr-2" />
+                <span className="text-sm text-gray-700">✨ PlusVibe.ai</span>
+              </label>
             </div>
           </div>
 
@@ -313,6 +326,17 @@ export default function CsvSequencerUpload() {
             </div>
           )}
 
+          {sequencer === "plusvibe" && (
+            <div className="rounded-lg border bg-white p-4 space-y-4">
+              <label className="block text-sm font-medium text-gray-700 mb-2">PlusVibe.ai</label>
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">Microsoft OAuth connect URL *</label>
+                <input type="url" value={plusvibeOAuthUrl} onChange={(e) => setPlusvibeOAuthUrl(e.target.value)} placeholder="https://..." className="w-full px-3 py-2 border rounded-lg font-mono text-xs" disabled={isRunning} />
+                <p className="text-xs text-gray-500 mt-1">From PlusVibe when adding an Outlook / Microsoft 365 mailbox.</p>
+              </div>
+            </div>
+          )}
+
           {/* Workers */}
           <div className="rounded-lg border bg-white p-4 space-y-3">
             <div>
@@ -324,6 +348,9 @@ export default function CsvSequencerUpload() {
               <input type="checkbox" checked={skipExisting} onChange={(e) => setSkipExisting(e.target.checked)} disabled={isRunning} className="mr-2" />
               <span className="text-sm text-gray-700">Skip already-uploaded emails (dedup)</span>
             </label>
+            {sequencer === "plusvibe" && (
+              <p className="text-xs text-amber-700">PlusVibe CSV upload does not query their API for duplicates yet — dedup checkbox only applies to Instantly and Smartlead.</p>
+            )}
           </div>
 
           {/* Start Button */}
@@ -333,7 +360,7 @@ export default function CsvSequencerUpload() {
                 <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24"><circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" /><path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" /></svg>
                 Starting Upload...
               </span>
-            ) : `Upload ${files.length} CSV${files.length !== 1 ? "s" : ""} to ${sequencer === "instantly" ? "Instantly" : "Smartlead"}`}
+            ) : `Upload ${files.length} CSV${files.length !== 1 ? "s" : ""} to ${sequencer === "instantly" ? "Instantly" : sequencer === "smartlead" ? "Smartlead" : "PlusVibe"}`}
           </button>
         </>
       )}
@@ -364,7 +391,7 @@ export default function CsvSequencerUpload() {
           {allComplete && (
             <div className="rounded-lg border border-green-200 bg-green-50 p-4">
               <p className="text-lg font-semibold text-green-700">Upload Complete! 🎉</p>
-              <p className="mt-1 text-sm text-green-600">{job.uploaded} mailboxes uploaded to {job.sequencer === "instantly" ? "Instantly.ai" : "Smartlead.ai"}.{job.skipped > 0 && ` ${job.skipped} skipped (duplicates).`}{job.failed > 0 && ` ${job.failed} failed.`}</p>
+              <p className="mt-1 text-sm text-green-600">{job.uploaded} mailboxes uploaded to {job.sequencer === "instantly" ? "Instantly.ai" : job.sequencer === "smartlead" ? "Smartlead.ai" : "PlusVibe.ai"}.{job.skipped > 0 && ` ${job.skipped} skipped (duplicates).`}{job.failed > 0 && ` ${job.failed} failed.`}</p>
             </div>
           )}
 

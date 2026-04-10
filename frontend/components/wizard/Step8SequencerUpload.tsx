@@ -37,7 +37,7 @@ interface Props {
 }
 
 export default function Step8SequencerUpload({ batchId, onComplete, suppressAutoComplete }: Props) {
-  const [sequencer, setSequencer] = useState<"instantly" | "smartlead">("instantly");
+  const [sequencer, setSequencer] = useState<"instantly" | "smartlead" | "plusvibe">("instantly");
   const [status, setStatus] = useState<Step8Status | null>(null);
   const [accounts, setAccounts] = useState<InstantlyAccount[]>([]);
   const [isRunning, setIsRunning] = useState(false);
@@ -53,6 +53,8 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
   // Smartlead configuration state
   const [smartleadApiKey, setSmartleadApiKey] = useState("");
   const [smartleadOAuthUrl, setSmartleadOAuthUrl] = useState("");
+  // PlusVibe configuration (Microsoft OAuth connect URL from dashboard)
+  const [plusvibeOAuthUrl, setPlusvibeOAuthUrl] = useState("");
   const [configureSettings, setConfigureSettings] = useState(true);
   const [maxEmailPerDay, setMaxEmailPerDay] = useState(6);
   const [waitMins, setWaitMins] = useState(60);
@@ -81,9 +83,12 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
 
   const fetchStatus = useCallback(async () => {
     try {
-      const endpoint = sequencer === "instantly" 
-        ? `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/status`
-        : `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/smartlead/status`;
+      const endpoint =
+        sequencer === "instantly"
+          ? `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/status`
+          : sequencer === "smartlead"
+            ? `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/smartlead/status`
+            : `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/plusvibe/status`;
       
       const res = await fetch(endpoint);
       if (res.ok) {
@@ -140,8 +145,10 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
     try {
       const savedApiKey = localStorage.getItem("smartlead_api_key");
       const savedOAuthUrl = localStorage.getItem("smartlead_oauth_url");
+      const savedPlusVibeUrl = localStorage.getItem("plusvibe_oauth_url");
       if (savedApiKey) setSmartleadApiKey(savedApiKey);
       if (savedOAuthUrl) setSmartleadOAuthUrl(savedOAuthUrl);
+      if (savedPlusVibeUrl) setPlusvibeOAuthUrl(savedPlusVibeUrl);
     } catch (_) {}
   }, []);
 
@@ -219,7 +226,7 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         setError("Network error starting upload");
         setIsRunning(false);
       }
-    } else {
+    } else if (sequencer === "smartlead") {
       // Validate Smartlead inputs
       if (!smartleadApiKey || !smartleadOAuthUrl) {
         setError("Please enter Smartlead API Key and OAuth URL");
@@ -264,6 +271,39 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         setError("Network error starting upload");
         setIsRunning(false);
       }
+    } else {
+      if (!plusvibeOAuthUrl) {
+        setError("Please enter your PlusVibe Microsoft OAuth connect URL");
+        return;
+      }
+
+      setIsRunning(true);
+      try {
+        try {
+          localStorage.setItem("plusvibe_oauth_url", plusvibeOAuthUrl);
+        } catch (_) {}
+
+        const res = await fetch(
+          `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/plusvibe/start`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              oauth_url: plusvibeOAuthUrl,
+              num_workers: numWorkers,
+              skip_uploaded: skipUploaded,
+            }),
+          }
+        );
+        const data = await res.json();
+        if (!data.success) {
+          setError(data.error || data.message || "Failed to start upload");
+          setIsRunning(false);
+        }
+      } catch (err) {
+        setError("Network error starting upload");
+        setIsRunning(false);
+      }
     }
   };
 
@@ -271,11 +311,49 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
     setError(null);
     setIsRunning(true);
     try {
-      const endpoint = sequencer === "instantly"
-        ? `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/retry-failed`
-        : `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/smartlead/retry-failed`;
-        
-      const res = await fetch(endpoint, { method: "POST" });
+      let endpoint = `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/retry-failed`;
+      let body: string | undefined;
+
+      if (sequencer === "instantly") {
+        const payload: Record<string, unknown> = {
+          num_workers: numWorkers,
+          skip_uploaded: true,
+        };
+        if (useExistingAccount && selectedAccountId) {
+          payload.account_id = selectedAccountId;
+        } else {
+          payload.instantly_email = instantlyEmail;
+          payload.instantly_password = instantlyPassword;
+        }
+        body = JSON.stringify(payload);
+      } else if (sequencer === "smartlead") {
+        endpoint = `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/smartlead/retry-failed`;
+        body = JSON.stringify({
+          api_key: smartleadApiKey,
+          oauth_url: smartleadOAuthUrl,
+          num_workers: numWorkers,
+          skip_uploaded: true,
+          configure_settings: configureSettings,
+          max_email_per_day: maxEmailPerDay,
+          time_to_wait_in_mins: waitMins,
+          total_warmup_per_day: warmupPerDay,
+          daily_rampup: rampup,
+          reply_rate_percentage: replyRate,
+        });
+      } else {
+        endpoint = `${API_BASE}/api/v1/wizard/batches/${batchId}/step8/plusvibe/retry-failed`;
+        body = JSON.stringify({
+          oauth_url: plusvibeOAuthUrl,
+          num_workers: numWorkers,
+          skip_uploaded: true,
+        });
+      }
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body,
+      });
       const data = await res.json();
       if (!data.success) {
         setError(data.error || data.message || "Failed to retry");
@@ -443,6 +521,16 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
               className="mr-2"
             />
             <span className="text-sm text-gray-700">🚀 Smartlead.ai</span>
+          </label>
+          <label className="flex items-center">
+            <input
+              type="radio"
+              checked={sequencer === "plusvibe"}
+              onChange={() => setSequencer("plusvibe")}
+              disabled={isRunning}
+              className="mr-2"
+            />
+            <span className="text-sm text-gray-700">✨ PlusVibe.ai</span>
           </label>
         </div>
       </div>
@@ -826,6 +914,36 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
         </div>
       )}
 
+      {sequencer === "plusvibe" && (
+        <div className="rounded-lg border bg-white p-4 space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">
+              PlusVibe.ai configuration
+            </label>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-medium text-gray-700 mb-1">
+                  Microsoft OAuth connect URL *
+                  <span className="text-gray-500 font-normal"> (from PlusVibe inbox / email account setup)</span>
+                </label>
+                <input
+                  type="url"
+                  value={plusvibeOAuthUrl}
+                  onChange={(e) => setPlusvibeOAuthUrl(e.target.value)}
+                  placeholder="https://..."
+                  className="w-full px-3 py-2 border rounded-lg font-mono text-xs"
+                  disabled={isRunning}
+                />
+                <p className="text-xs text-gray-500 mt-1">
+                  Paste the same style of Microsoft OAuth URL PlusVibe gives you when adding an M365 / Outlook mailbox.
+                  Sending limits and warmup are configured in PlusVibe after accounts appear.
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Shared Configuration Options */}
       <div className="rounded-lg border bg-white p-4 space-y-3">
         <div>
@@ -862,10 +980,19 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
       <div className="rounded-lg border border-blue-200 bg-blue-50 p-4 text-sm text-blue-700">
         <p className="font-medium">What this does:</p>
         <p className="mt-1">
-          1) {sequencer === "instantly" ? "Logs into your Instantly.ai account" : "Uses Smartlead OAuth URL"} using Selenium WebDriver
+          1){" "}
+          {sequencer === "instantly"
+            ? "Logs into your Instantly.ai account"
+            : sequencer === "smartlead"
+              ? "Uses your Smartlead Microsoft OAuth URL"
+              : "Uses your PlusVibe Microsoft OAuth connect URL"}{" "}
+          using Selenium WebDriver
         </p>
         <p className="mt-1">
-          2) {sequencer === "instantly" ? "Navigates to the email accounts page and uploads each mailbox" : "Processes Microsoft OAuth for each mailbox"}
+          2){" "}
+          {sequencer === "instantly"
+            ? "Navigates to the email accounts page and uploads each mailbox"
+            : "Runs Microsoft sign-in and consent for each mailbox"}
         </p>
         <p className="mt-1">
           3) Uses parallel workers to process multiple mailboxes simultaneously
@@ -985,8 +1112,20 @@ export default function Step8SequencerUpload({ batchId, onComplete, suppressAuto
             Upload Complete! 🎉
           </p>
           <p className="mt-1 text-sm text-green-600">
-            All {status.total} mailboxes have been successfully uploaded to {sequencer === "instantly" ? "Instantly.ai" : "Smartlead.ai"}.
-            You can now manage them from your {sequencer === "instantly" ? "Instantly" : "Smartlead"} dashboard.
+            All {status.total} mailboxes have been successfully uploaded to{" "}
+            {sequencer === "instantly"
+              ? "Instantly.ai"
+              : sequencer === "smartlead"
+                ? "Smartlead.ai"
+                : "PlusVibe.ai"}
+            .
+            You can now manage them from your{" "}
+            {sequencer === "instantly"
+              ? "Instantly"
+              : sequencer === "smartlead"
+                ? "Smartlead"
+                : "PlusVibe"}{" "}
+            dashboard.
           </p>
         </div>
       )}

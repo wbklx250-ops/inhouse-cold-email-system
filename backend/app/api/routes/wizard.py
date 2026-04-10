@@ -6962,6 +6962,211 @@ async def retry_step8_smartlead_failed(
 
 
 # =============================================================================
+# PLUSVIBE UPLOAD ENDPOINTS (Step 8 — Microsoft OAuth connect URL)
+# =============================================================================
+
+
+class PlusVibeStartRequest(BaseModel):
+    """Request for starting PlusVibe.ai mailbox upload."""
+
+    oauth_url: str
+    num_workers: int = 2
+    skip_uploaded: bool = True
+
+
+@router.get("/batches/{batch_id}/step8/plusvibe/status")
+async def get_step8_plusvibe_status(
+    batch_id: UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Get Step 8 (PlusVibe upload) status for batch."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    mailboxes_total = await db.scalar(
+        select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    ) or 0
+
+    mailboxes_uploaded = await db.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.plusvibe_uploaded == True,
+        )
+    ) or 0
+
+    mailboxes_failed = await db.scalar(
+        select(func.count(Mailbox.id)).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.plusvibe_uploaded == False,
+            Mailbox.plusvibe_upload_error.isnot(None),
+        )
+    ) or 0
+
+    mailboxes_pending = mailboxes_total - mailboxes_uploaded - mailboxes_failed
+
+    job_id = f"plusvibe_{batch_id}"
+    job_status = step8_jobs.get(job_id, {})
+
+    return {
+        "batch_id": str(batch_id),
+        "batch_name": batch.name,
+        "sequencer": "plusvibe",
+        "summary": {
+            "total": mailboxes_total,
+            "uploaded": mailboxes_uploaded,
+            "failed": mailboxes_failed,
+            "pending": mailboxes_pending,
+        },
+        "job": job_status if job_status else None,
+    }
+
+
+@router.post("/batches/{batch_id}/step8/plusvibe/start")
+async def start_step8_plusvibe_upload(
+    batch_id: UUID,
+    request: PlusVibeStartRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Start Step 8: upload batch mailboxes to PlusVibe via Microsoft OAuth URL."""
+    if request.num_workers < 1 or request.num_workers > 5:
+        raise HTTPException(400, "num_workers must be between 1 and 5")
+
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    job_id = f"plusvibe_{batch_id}"
+    if job_id in step8_jobs and step8_jobs[job_id].get("status") == "running":
+        return {
+            "success": False,
+            "message": "PlusVibe upload already in progress for this batch",
+            "job_id": job_id,
+            "started_at": step8_jobs[job_id].get("started_at"),
+        }
+
+    mailboxes_query = select(func.count(Mailbox.id)).where(Mailbox.batch_id == batch_id)
+    if request.skip_uploaded:
+        mailboxes_query = mailboxes_query.where(Mailbox.plusvibe_uploaded == False)
+
+    eligible_count = await db.scalar(mailboxes_query) or 0
+
+    if eligible_count == 0:
+        return {
+            "success": False,
+            "message": "No mailboxes to upload (all already uploaded or none exist)",
+            "eligible_count": 0,
+        }
+
+    step8_jobs[job_id] = {
+        "status": "running",
+        "sequencer": "plusvibe",
+        "batch_id": str(batch_id),
+        "batch_name": batch.name,
+        "started_at": datetime.utcnow().isoformat(),
+        "completed_at": None,
+        "total": eligible_count,
+        "uploaded": 0,
+        "failed": 0,
+        "skipped": 0,
+        "current_mailbox": None,
+        "error": None,
+        "num_workers": request.num_workers,
+        "errors": [],
+    }
+
+    async def run_upload():
+        try:
+            from app.services.plusvibe import run_plusvibe_upload_for_batch
+
+            summary = await run_plusvibe_upload_for_batch(
+                batch_id=str(batch_id),
+                oauth_url=request.oauth_url,
+                num_workers=request.num_workers,
+                skip_uploaded=request.skip_uploaded,
+            )
+
+            step8_jobs[job_id]["status"] = "completed"
+            step8_jobs[job_id]["uploaded"] = summary["uploaded"]
+            step8_jobs[job_id]["failed"] = summary["failed"]
+            step8_jobs[job_id]["skipped"] = summary.get("skipped", 0)
+            step8_jobs[job_id]["errors"] = summary.get("errors", [])
+            step8_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+
+            logger.info(
+                f"PlusVibe Step 8 upload completed for batch {batch_id}: "
+                f"{summary['uploaded']}/{summary['total']} uploaded"
+            )
+
+        except Exception as e:
+            step8_jobs[job_id]["status"] = "failed"
+            step8_jobs[job_id]["error"] = str(e)
+            step8_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+            logger.error(f"PlusVibe Step 8 upload failed for batch {batch_id}: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
+
+    background_tasks.add_task(run_upload)
+
+    logger.info(
+        f"PlusVibe Step 8 upload started for batch {batch_id}: "
+        f"{eligible_count} mailboxes, {request.num_workers} workers"
+    )
+
+    return {
+        "success": True,
+        "message": f"Started PlusVibe upload for {eligible_count} mailbox(es)",
+        "job_id": job_id,
+        "eligible_count": eligible_count,
+        "num_workers": request.num_workers,
+        "skip_uploaded": request.skip_uploaded,
+        "estimated_minutes": round(eligible_count / request.num_workers * 0.5),
+    }
+
+
+@router.post("/batches/{batch_id}/step8/plusvibe/retry-failed")
+async def retry_step8_plusvibe_failed(
+    batch_id: UUID,
+    request: PlusVibeStartRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
+    """Retry PlusVibe Step 8 upload for failed mailboxes only."""
+    batch = await db.get(SetupBatch, batch_id)
+    if not batch:
+        raise HTTPException(404, "Batch not found")
+
+    failed_result = await db.execute(
+        select(Mailbox).where(
+            Mailbox.batch_id == batch_id,
+            Mailbox.plusvibe_uploaded == False,
+            Mailbox.plusvibe_upload_error.isnot(None),
+        )
+    )
+    failed_mailboxes = failed_result.scalars().all()
+
+    if not failed_mailboxes:
+        return {
+            "success": False,
+            "message": "No failed mailboxes to retry",
+            "failed_count": 0,
+        }
+
+    for mailbox in failed_mailboxes:
+        mailbox.plusvibe_upload_error = None
+    await db.commit()
+
+    logger.info(
+        f"Retrying PlusVibe Step 8 for {len(failed_mailboxes)} failed mailboxes in batch {batch_id}"
+    )
+
+    request.skip_uploaded = True
+    return await start_step8_plusvibe_upload(batch_id, request, background_tasks, db)
+
+
+# =============================================================================
 # CSV-BASED SEQUENCER UPLOAD (Upload from CSV files, no batch required)
 # =============================================================================
 
@@ -6972,7 +7177,7 @@ csv_upload_jobs = {}
 async def csv_sequencer_upload(
     background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(..., description="One or more CSV files with email,password columns"),
-    sequencer: str = Form("instantly", description="Sequencer: 'instantly' or 'smartlead'"),
+    sequencer: str = Form("instantly", description="Sequencer: 'instantly', 'smartlead', or 'plusvibe'"),
     # Instantly fields
     account_id: Optional[str] = Form(None),
     instantly_email: Optional[str] = Form(None),
@@ -6980,6 +7185,8 @@ async def csv_sequencer_upload(
     # Smartlead fields
     smartlead_api_key: Optional[str] = Form(None),
     smartlead_oauth_url: Optional[str] = Form(None),
+    # PlusVibe fields
+    plusvibe_oauth_url: Optional[str] = Form(None),
     configure_settings: bool = Form(True),
     max_email_per_day: int = Form(6),
     time_to_wait_in_mins: int = Form(60),
@@ -6992,7 +7199,7 @@ async def csv_sequencer_upload(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Upload mailboxes from CSV files to a sequencer (Instantly or Smartlead).
+    Upload mailboxes from CSV files to a sequencer (Instantly, Smartlead, or PlusVibe).
     
     Accepts multiple CSV files. Each CSV must have at minimum 'email' and 'password' columns.
     Optional columns: first_name, last_name, display_name.
@@ -7020,8 +7227,11 @@ async def csv_sequencer_upload(
     elif sequencer == "smartlead":
         if not smartlead_api_key or not smartlead_oauth_url:
             raise HTTPException(400, "Smartlead API key and OAuth URL are required")
+    elif sequencer == "plusvibe":
+        if not plusvibe_oauth_url:
+            raise HTTPException(400, "PlusVibe OAuth URL is required")
     else:
-        raise HTTPException(400, "Invalid sequencer. Must be 'instantly' or 'smartlead'")
+        raise HTTPException(400, "Invalid sequencer. Must be 'instantly', 'smartlead', or 'plusvibe'")
     
     # Parse all CSV files
     all_mailboxes = []
@@ -7246,8 +7456,8 @@ async def csv_sequencer_upload(
                 logger.error(traceback.format_exc())
         
         background_tasks.add_task(run_csv_instantly_upload)
-    
-    else:  # smartlead
+
+    elif sequencer == "smartlead":
         async def run_csv_smartlead_upload():
             try:
                 from app.services.smartlead import SmartleadOAuthUploader, SmartleadAPI, process_smartlead_mailbox_sync
@@ -7346,9 +7556,86 @@ async def csv_sequencer_upload(
                 logger.error(f"[CSV Upload] Smartlead upload failed: {e}")
                 import traceback
                 logger.error(traceback.format_exc())
-        
+
         background_tasks.add_task(run_csv_smartlead_upload)
-    
+
+    elif sequencer == "plusvibe":
+        async def run_csv_plusvibe_upload():
+            try:
+                from app.services.plusvibe import PlusVibeOAuthUploader, process_plusvibe_mailbox_sync
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import uuid
+
+                mailbox_list = []
+                for mb in all_mailboxes:
+                    mb_id = str(uuid.uuid4())
+                    mailbox_list.append({"id": mb_id, "email": mb["email"], "password": mb["password"]})
+
+                if not mailbox_list:
+                    csv_upload_jobs[job_id]["status"] = "completed"
+                    csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                    return
+
+                actual_workers = min(num_workers, len(mailbox_list))
+
+                with ThreadPoolExecutor(max_workers=actual_workers) as executor:
+                    uploaders = [
+                        PlusVibeOAuthUploader(headless=True, worker_id=i) for i in range(actual_workers)
+                    ]
+
+                    futures = {}
+                    for idx, mb_data in enumerate(mailbox_list):
+                        upl = uploaders[idx % len(uploaders)]
+                        fut = executor.submit(
+                            process_plusvibe_mailbox_sync, upl, mb_data, plusvibe_oauth_url
+                        )
+                        futures[fut] = mb_data
+
+                    for fut in as_completed(futures):
+                        result = fut.result()
+                        mb_data = futures[fut]
+                        csv_upload_jobs[job_id]["current_email"] = mb_data["email"]
+
+                        if result["success"]:
+                            csv_upload_jobs[job_id]["uploaded"] += 1
+                            csv_upload_jobs[job_id]["results"].append({
+                                "email": mb_data["email"],
+                                "status": "uploaded",
+                                "error": None,
+                            })
+                        else:
+                            csv_upload_jobs[job_id]["failed"] += 1
+                            csv_upload_jobs[job_id]["errors"].append(
+                                f"{mb_data['email']}: {result['error']}"
+                            )
+                            csv_upload_jobs[job_id]["results"].append({
+                                "email": mb_data["email"],
+                                "status": "failed",
+                                "error": result["error"],
+                            })
+
+                csv_upload_jobs[job_id]["status"] = "completed"
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                csv_upload_jobs[job_id]["current_email"] = None
+                logger.info(
+                    f"[CSV Upload] PlusVibe upload complete: {csv_upload_jobs[job_id]['uploaded']} uploaded, "
+                    f"{csv_upload_jobs[job_id]['failed']} failed"
+                )
+
+            except Exception as e:
+                csv_upload_jobs[job_id]["status"] = "failed"
+                csv_upload_jobs[job_id]["error"] = str(e)
+                csv_upload_jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                logger.error(f"[CSV Upload] PlusVibe upload failed: {e}")
+                import traceback
+
+                logger.error(traceback.format_exc())
+
+        background_tasks.add_task(run_csv_plusvibe_upload)
+
+    else:
+        raise HTTPException(400, "Invalid sequencer")
+
     logger.info(f"[CSV Upload] Started {sequencer} upload for {len(all_mailboxes)} mailboxes from {len(files)} CSV file(s)")
     
     return {

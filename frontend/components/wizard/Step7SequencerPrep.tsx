@@ -48,7 +48,7 @@ export default function Step7SequencerPrep({ batchId, onComplete, suppressAutoCo
   const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
   const sequencerOptions = [
     { key: "instantly", label: "Instantly.ai" },
-    { key: "plusvibe", label: "PlusVibe" },
+    { key: "plusvibe", label: "PlusVibe.ai" },
     { key: "smartlead", label: "Smartlead.ai" },
   ];
 

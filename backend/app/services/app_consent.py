@@ -39,7 +39,7 @@ KNOWN_APPS = {
         "patch_scopes": False,
     },
     "plusvibe": {
-        "name": "PlusVibe",
+        "name": "PlusVibe.ai",
         "client_id": "1766ec29-af23-4877-80cf-f688adeb5b62",
         "patch_scopes": False,
     },
